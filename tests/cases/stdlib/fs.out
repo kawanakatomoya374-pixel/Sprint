@@ -1,0 +1,9 @@
+true false false
+["héllo", "world"]
+["B.txt", "a.txt", "b.txt"]
+IOError read true
+IOError
+IOError
+PermissionError
+PermissionError
+false

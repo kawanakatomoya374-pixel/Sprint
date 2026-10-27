@@ -1,0 +1,25 @@
+## 15. 標準ライブラリ
+
+節ごとのファイル（`15-stdlib/`）:
+
+- [15.0 共通規則](15-stdlib/00-common.md)
+- [15.1 prelude（importなしで使える）](15-stdlib/01-prelude.md)
+- [15.2 math](15-stdlib/02-math.md)
+- [15.3 str](15-stdlib/03-str.md)
+- [15.4 coroutine](15-stdlib/04-coroutine.md)
+- [15.5 io](15-stdlib/05-io.md)
+- [15.6 table](15-stdlib/06-table.md)
+- [15.7 fs](15-stdlib/07-fs.md)
+- [15.8 time](15-stdlib/08-time.md)
+- [15.9 sys](15-stdlib/09-sys.md)
+- [15.10 json](15-stdlib/10-json.md)
+- [15.11 random](15-stdlib/11-random.md)
+- [15.12 gc](15-stdlib/12-gc.md)
+- [15.15 ffi（2.2、同梱module）](15-stdlib/15-ffi.md)
+- [15.13 gfx（2.1）](15-stdlib/13-gfx.md)
+- [15.14 gui（2.1、2.2〜2.4で拡張。同梱module）](15-stdlib/14-gui.md)
+- [15.16 itertools（2.3、同梱module）](15-stdlib/16-itertools.md)
+- [15.17 strutil（2.3、同梱module）](15-stdlib/17-strutil.md)
+- [15.18 guiplus（2.4、同梱module）](15-stdlib/18-guiplus.md)
+- [15.19 window / vfs / proc / wm（2.6、同梱module）](15-stdlib/19-os.md)
+- [15.20 typed（2.29、型付き配列）](15-stdlib/20-typed.md)

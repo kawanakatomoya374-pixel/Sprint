@@ -1,0 +1,10 @@
+let t = 0
+func tick():
+    t += 1
+    return t
+
+tick()
+tick()
+import sys
+sys.exit(7)
+print("not reached")

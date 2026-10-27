@@ -1,0 +1,9 @@
+683306
+true false true false nil 3 false nil
+nil 0 x 0.0
+[true, true, true] [false, false, true]
+[false, true, false, true, true] [false, true, false, true, true]
+[1, 2, 2] [nil, 3, nil]
+1501 true true
+TypeError
+TypeError

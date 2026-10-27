@@ -1,0 +1,4 @@
+6765 [1, 2, 3] 6
+{"a": 1, "b": [1, 2]} 3.5 3 1024 false true
+caught IndexError
+10 ["a", "b", "c"] xxx

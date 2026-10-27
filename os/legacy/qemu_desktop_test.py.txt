@@ -1,0 +1,118 @@
+#!/usr/bin/env python3
+"""Boot build/os/sprintos.iso in QEMU (no display), drive it with the keyboard and mouse through the QEMU
+monitor, and check what the OS reports on the serial port. Screenshots go to build/os/shots/."""
+import os, socket, subprocess, sys, time, zlib, struct
+
+ISO = sys.argv[1]
+OUT = os.path.join(os.path.dirname(ISO), "shots")
+os.makedirs(OUT, exist_ok=True)
+SER = os.path.join(OUT, "serial.log")
+SOCK = os.path.join(OUT, "mon.sock")
+for f in (SER, SOCK):
+    if os.path.exists(f):
+        os.remove(f)
+q = subprocess.Popen(["qemu-system-x86_64", "-m", "256", "-cdrom", ISO, "-display", "none", "-no-reboot",
+                      "-serial", "file:" + SER, "-monitor", "unix:%s,server,nowait" % SOCK],
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+fails = []
+
+def serial():
+    try:
+        return open(SER, errors="replace").read()
+    except OSError:
+        return ""
+
+def wait_for(text, timeout=30):
+    end = time.time() + timeout
+    while time.time() < end:
+        if text in serial():
+            return True
+        time.sleep(0.1)
+    return False
+
+def check(cond, what):
+    print(("ok   " if cond else "FAIL ") + what)
+    if not cond:
+        fails.append(what)
+
+mon = None
+for i in range(100):
+    try:
+        mon = socket.socket(socket.AF_UNIX)
+        mon.connect(SOCK)
+        break
+    except OSError:
+        time.sleep(0.1)
+mon.settimeout(5)
+
+def hmp(cmd):
+    mon.sendall((cmd + "\n").encode())
+    time.sleep(0.12)
+    try:
+        mon.recv(65536)
+    except OSError:
+        pass
+
+pos = [512, 384]   # the OS starts the pointer in the middle of the screen
+
+def move_to(x, y):
+    """relative moves only (a PS/2 mouse has no absolute mode); every step is small so nothing is clamped"""
+    for axis, target in ((0, x), (1, y)):
+        while pos[axis] != target:
+            d = max(-100, min(100, target - pos[axis]))
+            hmp("mouse_move %d 0" % d if axis == 0 else "mouse_move 0 %d" % d)
+            pos[axis] += d
+    time.sleep(0.2)
+
+def click():
+    hmp("mouse_button 1")
+    time.sleep(0.05)
+    hmp("mouse_button 0")
+
+def keys(*ks):
+    for k in ks:
+        hmp("sendkey " + k)
+        time.sleep(0.05)
+
+def shot(name):
+    ppm = os.path.join(OUT, name + ".ppm")
+    hmp("screendump " + ppm)
+    time.sleep(0.5)
+    d = open(ppm, "rb").read()
+    parts = d.split(b"\n", 3)
+    w, h = map(int, parts[1].split())
+    px = parts[3]
+    raw = b"".join(b"\x00" + px[y * w * 3:(y + 1) * w * 3] for y in range(h))
+    def ch(t, b):
+        return struct.pack(">I", len(b)) + t + b + struct.pack(">I", zlib.crc32(t + b))
+    open(os.path.join(OUT, name + ".png"), "wb").write(
+        b"\x89PNG\r\n\x1a\n" + ch(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)) + ch(b"IDAT", zlib.compress(raw)) + ch(b"IEND", b""))
+    os.remove(ppm)
+    return px
+
+try:
+    check(wait_for("[os] ready"), "the OS boots to the desktop")
+    px0 = shot("desktop")
+    # open the terminal by double-clicking its icon
+    move_to(45, 30)
+    click(); click()
+    check(wait_for("[os] open Terminal"), "double click on an icon opens a window")
+    time.sleep(0.5)
+    move_to(300, 250)
+    click()
+    keys("l", "s", "ret")
+    check(wait_for("$ ls => "), "keyboard input reaches the terminal")
+    keys("m", "o", "t", "d", "ret")
+    check(wait_for("Welcome to Sprint OS."), "shell commands run (motd reads /etc/motd)")
+    keys("u", "n", "a", "m", "e", "ret")
+    check(wait_for("SprintOS"), "uname runs as a process")
+    px1 = shot("terminal")
+    check(px1 != px0, "the screen changed after opening the window")
+finally:
+    q.terminate()
+    q.wait()
+print("serial log:", SER)
+if fails:
+    print("FAILED:", fails)
+    sys.exit(1)
+print("all OS boot tests passed")

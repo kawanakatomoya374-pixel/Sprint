@@ -1,0 +1,18 @@
+2000997
+16.0
+caught TypeError
+caught ArithmeticError
+5150
+5.0
+[2.5, -1.0, 4.0, 1002, 3.5, 0.25]
+[false, true, true, true]
+caught ArithmeticError
+caught IndexError
+[true, false, 9, 4]
+[3, 6, 101, 7]
+111 118
+[-4, -3, 3, 2, 3.0]
+9 6 10 9
+3
+2.5
+[true, 2, 1, 5]

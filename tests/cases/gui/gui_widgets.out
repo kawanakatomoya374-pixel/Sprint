@@ -1,0 +1,17 @@
+true false
+false true 1
+0 ["tab=1", "tab=0"]
+true true
+false blue true
+green
+false
+false green
+abX|yz|cd [1, 2]
+[0, 2]
+abX|y|cd
+true 7
+true true true
+0 true
+[0] true
+[0, -1] true
+true

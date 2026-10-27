@@ -1,0 +1,28 @@
+true false true true
+true false true true
+true 1
+false 2
+{"x": 1, "y": 2} {"x": 1, "y": 5}
+3
+7
+1 2
+3 4
+5 6
+[12]
+20 nil nil nil
+nil bc
+nil 0
+{"x": 3, "y": 5} d
+2 1
+[7, 0, 9]
+10 20
+got 1
+elif
+false is not nil: false
+1
+2
+3
+0
+a\nb c\td x\y
+TypeError
+nil

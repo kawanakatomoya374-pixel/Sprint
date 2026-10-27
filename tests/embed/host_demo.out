@@ -1,0 +1,4 @@
+["#1 is odd", "#2 is even", "#3 is odd", "#4 is even"]
+10.0
+caught TypeError describe() expects an int, got string
+host got: script says: all done

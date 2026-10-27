@@ -1,0 +1,15 @@
+[1, 2, 3] true
+suspended
+1 suspended
+2
+nil dead
+RuntimeError
+1
+caught Oops inside dead
+cleanup ran
+dead
+a!
+b!
+done
+nil
+running

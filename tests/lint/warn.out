@@ -1,0 +1,10 @@
+tests/lint/warn.sp:1:1: warning[L001]: unused import 'gfx'
+tests/lint/warn.sp:2:1: warning[L001]: unused import 'math'
+tests/lint/warn.sp:7:5: warning[L002]: unused variable 't'
+tests/lint/warn.sp:7:21: warning[L004]: duplicate table key 'x'
+tests/lint/warn.sp:9:9: warning[L002]: unused variable 'unused'
+tests/lint/warn.sp:12:9: warning[L003]: unreachable code
+tests/lint/warn.sp:20:7: warning[L002]: unused class 'Foo'
+tests/lint/warn.sp:26:5: warning[L002]: unused variable 's'
+tests/lint/warn.sp:34:5: warning[L002]: unused variable 'z'
+tests/lint/warn.sp:37:8: warning[L006]: empty catch block silently discards the error

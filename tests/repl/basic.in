@@ -1,0 +1,37 @@
+1 + 2
+let x = 10
+func add(a, b):
+    return a + b
+
+add(x, 5)
+x = add(x, 1)
+x
+class P:
+    let n = 0
+    func init(self, n):
+        self.n = n
+    func twice(self):
+        return self.n * 2
+
+let p = P(21)
+p.twice()
+[1, "a", {k: 2}]
+"hello"
+print("side effect")
+let x = "shadowed"
+x
+add(1, 2)
+nope
+throw error("Boom", "bad")
+x + 
+let y = [1,
+  2,
+  3]
+y
+for i in range(3):
+    print(i)
+
+import math
+math.sqrt(16.0)
+_
+f"x={x}"

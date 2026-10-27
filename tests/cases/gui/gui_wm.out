@@ -1,0 +1,13 @@
+Terminal>Notes true false
+Notes>Terminal true false
+["/ $ mkdir /x", "/ $ hello a b", "hello a,b", "/ $ ls /", "bin  x"] ls /
+130 85 none
+resize_h
+170 100
+max 0 0 320 180
+normal 130 85 170 100
+true max Notes
+false Terminal
+["Files"]
+Notes>Terminal 5
+true true

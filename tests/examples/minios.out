@@ -1,0 +1,22 @@
+Sprint terminal - type help
+/ $ mkdir /home/user
+/ $ cd /home/user
+/home/user $ write notes.txt remember the milk
+/home/user $ cat notes.txt
+remember the milk
+/home/user $ ls
+notes.txt
+/home/user $ clock
+uptime 1 ms
+/home/user $ count
+tick 0
+tick 1
+tick 2
+/home/user $ tree /
+/bin
+/bin/clock
+/bin/count
+/home
+/home/user
+/home/user/notes.txt
+frames: 1 pointer: arrow

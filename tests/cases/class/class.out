@@ -1,0 +1,13 @@
+25 14 1 2
+Point(3, 4) Point(1, 2) p3
+Point3 true false nil
+<class Point> class instance
+25 5
+10 105
+true false false
+matched 1 10
+NameError
+NameError
+TypeError
+TypeError
+6 3 0

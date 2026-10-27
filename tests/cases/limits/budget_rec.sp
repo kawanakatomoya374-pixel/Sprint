@@ -1,0 +1,3 @@
+func f(n):
+    return f(n + 1)
+f(0)

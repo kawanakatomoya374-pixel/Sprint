@@ -1,0 +1,14 @@
+64 48 255 true
+16711680 65280 8949912 8421631 16776960
+380129
+17 34 0
+66051 16711680 65280 255 8355711
+true true
+ValueError color must be in 0..0xFFFFFF (see gfx.rgb)
+TypeError x must be an int, not float (use // for integer division)
+IndexError pixel (64, 0) outside the 64x48 canvas
+ValueError canvas size must be 1..16384 per side and at most 16777216 pixels
+ValueError alpha must be in 0..255
+NameError 'canvas' has no method 'nope'
+ValueError rgb components must be in 0..255
+IOError

@@ -1,0 +1,6 @@
+["fig", "kiwi", "apple", "pear", "date"]
+[9, 5, 3, 3, 1]
+[[0, "x"], [0, "y"], [1, "b"], [1, "a"]]
+0 2002 2000
+CmpErr [3, 2, 1]
+RuntimeError true

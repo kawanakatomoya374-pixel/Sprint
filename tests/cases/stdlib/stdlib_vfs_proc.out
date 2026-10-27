@@ -1,0 +1,32 @@
+/a/c c.txt /a/b / /b
+["bin"] echo hi! 8 true false false
+["/usr", "/usr/b2", "/usr/b2/hello", "/usr/bin", "/usr/bin/hello"]
+<OSError: directory not empty: /usr>
+<OSError: is a directory: /usr>
+<OSError: already exists: /usr>
+<OSError: no such directory: /nodir>
+<OSError: not a directory: /usr/bin/hello>
+<OSError: cannot copy into itself>
+[]
+x /
+[[1, "w", "sleep"], [2, "srv", "wait_msg"]] ["a0", "got hi"]
+false true
+7 3 16 ["a0", "got hi", "a1", "parent done", "child of 3", "a2"]
+[] false
+true false -9 0
+/ $ mkdir /a/b => 
+/ $ write /a/b/f x y => 
+/ $ cat /a/b/f => x y
+/ $ hello 1 2 => hello 1+2
+/ $ ls /a => b
+/ $ cd /a => 
+/a $ pwd => /a
+/a $ cp b/f g => 
+/a $ ls => b  g
+/a $ tree / => /a|/a/b|/a/b/f|/a/g|/bin|/bin/hello
+/a $ rm b => rm: <OSError: directory not empty: /a/b>
+/a $ rm -r b => 
+/a $ ls => g
+/a $ cat /nope => cat: <OSError: no such file: /nope>
+/a $ zz => zz: command not found
+/a $ help => ls cd pwd cat echo write mkdir rm cp mv ps kill tree hello

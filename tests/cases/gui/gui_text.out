@@ -1,0 +1,32 @@
+hello world true
+hello world
+bye 3 false
+byehello world
+bye
+hello world
+bye
+byehello world 6
+al
+0 false
+5
+ beta
+alpha  gamma
+alpha  
+  
+two
+one two three
+ two
+one
+abcde
+abcde
+10 18
+0
+one two|three four
+|five one two|three four
+|fiveone two|three four [2, 10]
+|five
+five
+24 60
+0
+[true, true, true, "Left"] [true, false, false, "+"] [false, false, false, "+"] [false, false, false, "Enter"]
+["save", "run"]

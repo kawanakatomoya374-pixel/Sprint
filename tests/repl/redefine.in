@@ -1,0 +1,37 @@
+func f():
+    return 1
+
+func g():
+    return f() + 10
+
+g()
+func f():
+    return 2
+
+g()
+let n = 1
+func bump():
+    n += 1
+    return n
+
+bump()
+let n = 100
+bump()
+class A:
+    func hi(self):
+        return "A"
+
+let a = A()
+class B extends A:
+    override func hi(self):
+        return "B>" .. super.hi()
+
+B().hi()
+const K = 5
+const K = 6
+K
+import gui
+let app = gui.App(40, 30, "t")
+app.width
+x = 3
+:names

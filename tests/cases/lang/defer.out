@@ -1,0 +1,20 @@
+body 0
+log iter 0
+log iter 1
+body 2
+log iter 2
+late
+log a-end
+ret-a
+log b2
+log b1
+caught Boom
+log inner
+c caught first
+0
+E1 E2
+f threw E2
+log loop defer
+log loop defer
+after loop 2
+log p-defer

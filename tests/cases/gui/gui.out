@@ -1,0 +1,18 @@
+["A", "B"] false
+2 false
+true
+true
+10
+0
+true
+hll 3
+> hll
+z 2
+["A", "B", "cb=true", "sl=6", "sl=10", "sl=0", "ti=hllo!", "ti=hll!", "ti=hll", "ti=> hll", "lb=y", "lb=z"]
+true
+true true true
+[-50, 110, -110, -210]
+false 3 true
+true 475538
+ValueError unknown event type: bogus
+25 15 37 16

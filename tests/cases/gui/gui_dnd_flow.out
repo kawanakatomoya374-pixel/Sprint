@@ -1,0 +1,17 @@
+188 76 false false
+[4, 4, 4, 28, 28, 28, 52]
+[1, 1, 1, 1, 1, 1, 1] [7]
+100 76 [2, 2, 2, 1]
+true true
+true true 52 [true]
+false [true, false]
+false [66, 16] [true, false, true, false]
+green
+false
+true green true true
+["green"] ["green"] false 1
+true blue true
+["green"]
+false ["green"]
+[1] false
+[1]
