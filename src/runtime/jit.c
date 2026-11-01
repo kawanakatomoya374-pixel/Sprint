@@ -1637,6 +1637,7 @@ static int nat_result_ty(const NativeDesc *nd, JC *c, int pf, int argc) {
 /* call a pure native through the helper: the callee entry is at pf, the argc arguments follow it */
 typedef int (*NatHelper)(VM *, SpValue *, unsigned, SpValue *, NativeFn, unsigned);
 static int jh_ffi(VM *vm, SpValue *argv, unsigned argc, SpValue *dst, NativeFn fn, unsigned want);
+static int jh_tostr(VM *vm, SpValue *argv, unsigned argc, SpValue *dst, NativeFn fn, unsigned want);
 static int emit_nat_h(JC *c, uint32_t pc, int pf, int argc, const NativeDesc *nd, int rty, NatHelper helper);
 static int emit_nat(JC *c, uint32_t pc, int pf, int argc, const NativeDesc *nd, int rty) {
     return emit_nat_h(c, pc, pf, argc, nd, rty, jh_nat);
@@ -2113,6 +2114,11 @@ static int do_call(JC *c, uint32_t pc, int len, uint32_t *skip) {
             return emit_nat(c, pc, pf, 1, nd, TY_FLT);
         }
         if (argc == 1 && strcmp(nd->name, "to_int") == 0) return emit_nat(c, pc, pf, 1, nd, TY_INT);
+        if (argc == 1 && strcmp(nd->name, "to_string") == 0) {
+            if (!emit_nat_h(c, pc, pf, 1, nd, TY_UNK, jh_tostr)) return 0;
+            c->st[c->dep - 1].hint = &g_hint_string;
+            return 1;
+        }
         if (ffi_jit_safe(nd)) return emit_nat(c, pc, pf, argc, nd, TY_UNK);
         FAIL("call of a builtin");
     }
@@ -2439,6 +2445,20 @@ static int jh_nat(VM *vm, SpValue *argv, unsigned argc, SpValue *dst, NativeFn f
     if (want != 0xffu && (unsigned)r.type != want) return 0;
     *dst = r;
     return 1;
+}
+/* to_string(x) for the scalar types: no user code can run (an instance could carry its own to_string), the result is a new string
+ * (ST_hnat publishes the live stack first, so a collection triggered by the allocation is safe) */
+static int jh_tostr(VM *vm, SpValue *argv, unsigned argc, SpValue *dst, NativeFn fn, unsigned want) {
+    if (argc != 1) return 0;
+    switch (argv[0].type) {
+    case T_NIL: case T_BOOL: case T_INT: case T_FLOAT: case T_STRING:
+        return jh_nat(vm, argv, argc, dst, fn, want);
+    case T_UNINIT: case T_ARRAY: case T_TABLE: case T_FUNCTION: case T_CLASS: case T_INSTANCE: case T_MODULE:
+    case T_ITERATOR: case T_COROUTINE: case T_ERROR: case T_NATIVE: case T_CELL:
+        return 0;
+    default:
+        return 0;
+    }
 }
 /* A call of a prepared numeric-only ffi function whose callee was only known as a hint (a module variable): the callee is
  * checked at run time, and anything else (another function, one that is not jit-safe) is left to the interpreter. */
