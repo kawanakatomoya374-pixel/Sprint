@@ -1422,6 +1422,24 @@ static int trace_build_ir(Proto *p, const SpValue *locals, uint32_t stack_depth,
         goto done;
     }
 
+    /* The TraceJIT backend keeps f64 values in general registers and moves them through XMM0/XMM1 around every operation,
+     * which measured 2x slower than the region JIT on float loops. Until f64 values are register-allocated in XMM registers
+     * (docs/design/tiered-jit.md, phase 2) such loops are left to the region JIT. SPRINT_TRACE_JIT_F64=1 lifts the gate for
+     * backend development and the trace regression tests. */
+    {
+        static int f64_gate = -1;
+        if (f64_gate < 0) { const char *e = getenv("SPRINT_TRACE_JIT_F64"); f64_gate = !(e && e[0] && e[0] != '0'); }
+        if (f64_gate) {
+            for (size_t i = 0U; i < ir->count; i++) {
+                const SpTIROp o = ir->inst[i].op;
+                if (o == SP_TIR_FADD || o == SP_TIR_FSUB || o == SP_TIR_FMUL || o == SP_TIR_FDIV || o == SP_TIR_FNEG) {
+                    if (trace_debug_env()) fprintf(stderr, "trace-jit: f64 trace left to the region JIT (slower in the trace backend)\n");
+                    goto done;
+                }
+            }
+        }
+    }
+
     build_stage = 7;
     phi_local = (int32_t *)malloc(((size_t)ir->nvalues + 1U) * sizeof *phi_local);
     if (!phi_local) goto done;

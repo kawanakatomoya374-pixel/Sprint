@@ -258,7 +258,7 @@ test-jit: $(BUILD)/sprint $(FFI_LIBS) test-trace-snapshot
 
 # TraceJIT records a complete loop iteration before compiling the hot trace.
 test-trace-jit: $(BUILD)/sprint $(FFI_LIBS) test-trace-snapshot test-trace-snapshot-budget test-trace-side test-trace-side-cache
-	@SPRINT_JIT_THRESHOLD=2 SPRINT_TRACE_JIT=1 SPRINT=$(BUILD)/sprint sh tests/run_tests.sh
+	@SPRINT_JIT_THRESHOLD=2 SPRINT_TRACE_JIT=1 SPRINT_TRACE_JIT_F64=1 SPRINT=$(BUILD)/sprint sh tests/run_tests.sh
 .PHONY: test-trace-jit
 
 # Run the in-file TraceIR verifier/optimizer invariant suite under the strict diagnostics.
@@ -280,7 +280,7 @@ test-trace-snapshot-san: | $(BUILD)
 
 test-trace-side: $(BUILD)/sprint
 	# Keep the region JIT cold so this test exercises TraceJIT linking and Side Trace dispatch.
-	@SPRINT_JIT_THRESHOLD=10000 SPRINT_TRACE_JIT=1 SPRINT_TRACE_JIT_DEBUG=1 $(BUILD)/sprint run tests/cases/jit/jit_trace_side.sp > $(BUILD)/trace-side.log 2>&1
+	@SPRINT_JIT_THRESHOLD=10000 SPRINT_TRACE_JIT=1 SPRINT_TRACE_JIT_F64=1 SPRINT_TRACE_JIT_DEBUG=1 $(BUILD)/sprint run tests/cases/jit/jit_trace_side.sp > $(BUILD)/trace-side.log 2>&1
 	@grep -Eq 'trace-jit: side-record-request polymorphic_loop@' $(BUILD)/trace-side.log
 	@grep -q 'trace-jit: native-link linked_side@32 -> @69' $(BUILD)/trace-side.log
 	@grep -q 'trace-jit: result slot=1 kind=2 owner=linked_side@69' $(BUILD)/trace-side.log
@@ -296,14 +296,14 @@ test-trace-side: $(BUILD)/sprint
 	@grep -q 'trace-jit: side-hit ref_loop@' $(BUILD)/trace-side.log
 	@tail -n 18 $(BUILD)/trace-side.log > $(BUILD)/trace-side.out
 	@cmp $(BUILD)/trace-side.out tests/cases/jit/jit_trace_side.out && echo 'trace-side: Root + Side-of-Side depth 1/2/3 + bounded branching + linked MISS verified'
-	@SPRINT_GC_STRESS=1 SPRINT_JIT_THRESHOLD=10000 SPRINT_TRACE_JIT=1 $(BUILD)/sprint run tests/cases/jit/jit_trace_side.sp > $(BUILD)/trace-side-gc.log 2>&1
+	@SPRINT_GC_STRESS=1 SPRINT_JIT_THRESHOLD=10000 SPRINT_TRACE_JIT=1 SPRINT_TRACE_JIT_F64=1 $(BUILD)/sprint run tests/cases/jit/jit_trace_side.sp > $(BUILD)/trace-side-gc.log 2>&1
 	@tail -n 18 $(BUILD)/trace-side-gc.log > $(BUILD)/trace-side-gc.out
 	@cmp $(BUILD)/trace-side-gc.out tests/cases/jit/jit_trace_side.out && echo 'trace-side: reference values survive GC-stress allocations after native restore'
 .PHONY: test-trace-side
 
 # Stress root/side cache admission, parent-child eviction and re-entry across 70 loop sites.
 test-trace-side-cache: $(BUILD)/sprint
-	@SPRINT_JIT_THRESHOLD=10000 SPRINT_TRACE_JIT=1 SPRINT_TRACE_JIT_DEBUG=1 $(BUILD)/sprint run tests/cases/jit/jit_trace_cache.sp > $(BUILD)/trace-side-cache.log 2>&1
+	@SPRINT_JIT_THRESHOLD=10000 SPRINT_TRACE_JIT=1 SPRINT_TRACE_JIT_F64=1 SPRINT_TRACE_JIT_DEBUG=1 $(BUILD)/sprint run tests/cases/jit/jit_trace_cache.sp > $(BUILD)/trace-side-cache.log 2>&1
 	@grep -q 'trace-jit: side-record-request many@' $(BUILD)/trace-side-cache.log
 	@test $$(grep -c 'trace-jit: side-compiled many@' $(BUILD)/trace-side-cache.log) -ge 20
 	@grep -q 'trace-jit: side-hit many@' $(BUILD)/trace-side-cache.log
@@ -314,7 +314,7 @@ test-trace-side-cache: $(BUILD)/sprint
 .PHONY: test-trace-side-cache
 
 test-trace-snapshot-budget: $(BUILD)/sprint
-	@set +e; SPRINT_JIT_THRESHOLD=2 SPRINT_TRACE_JIT=1 SPRINT_TRACE_JIT_DEBUG=1 $(BUILD)/sprint run --max-instr 2000 tests/runtime/snapshot_budget.sp > $(BUILD)/snapshot-budget.log 2>&1; status=$$?; set -e; \
+	@set +e; SPRINT_JIT_THRESHOLD=2 SPRINT_TRACE_JIT=1 SPRINT_TRACE_JIT_F64=1 SPRINT_TRACE_JIT_DEBUG=1 $(BUILD)/sprint run --max-instr 2000 tests/runtime/snapshot_budget.sp > $(BUILD)/snapshot-budget.log 2>&1; status=$$?; set -e; \
 	  test $$status -eq 124 && grep -q 'snapshot slot=.*kind=3' $(BUILD)/snapshot-budget.log && \
 	  grep -q 'TimeoutError: instruction limit exceeded' $(BUILD)/snapshot-budget.log && \
 	  echo "snapshot-budget: budget exit restored and limit error preserved"
