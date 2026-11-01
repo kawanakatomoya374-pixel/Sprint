@@ -94,15 +94,20 @@ for f in tests/ffi/*.sp; do
     b=${f%.sp}
     case "$f" in *ffi_cxx.sp) [ -f build/libcxxtest.so ] || continue ;; esac
     [ -f build/libctest.so ] || { fail=$((fail+1)); echo "FAIL $f (build/libctest.so missing)"; continue; }
-    out=$(ASAN_OPTIONS=detect_leaks=0 "$SPRINT" run --allow-ffi "$f" 2>/dev/null); rc=$?
+    out=$(ASAN_OPTIONS=detect_leaks=0 "$SPRINT" run --allow-ffi --allow-asm "$f" 2>/dev/null); rc=$?
     if [ "$out" = "$(cat "$b.out")" ] && [ "$rc" = 0 ]; then pass=$((pass+1))
     else fail=$((fail+1)); echo "FAIL $f (rc=$rc)"; fi
-    q=$(ASAN_OPTIONS=detect_leaks=0 "$SPRINT" run --allow-ffi --no-quicken "$f" 2>/dev/null)
+    q=$(ASAN_OPTIONS=detect_leaks=0 "$SPRINT" run --allow-ffi --allow-asm --no-quicken "$f" 2>/dev/null)
     if [ "$q" = "$out" ]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL quicken-diff $f"; fi
 done
 # without --allow-ffi (or with --deterministic) every ffi call is refused
 out=$("$SPRINT" run --deterministic --allow-ffi tests/cases/stdlib/ffi_denied.sp 2>/dev/null)
 if [ "$out" = "$(cat tests/cases/stdlib/ffi_denied.out)" ]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL ffi deterministic denial"; fi
+# machine code needs --allow-asm on top of --allow-ffi, and is refused in deterministic mode even with both
+for fl in "--allow-ffi" "--deterministic --allow-ffi --allow-asm"; do
+    out=$("$SPRINT" run $fl tests/cases/stdlib/asm_denied.sp 2>/dev/null)
+    if [ "$out" = "$(cat tests/cases/stdlib/asm_denied.out)" ]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL asm denial ($fl)"; fi
+done
 # differential: fused opcodes must not change any observable behaviour
 for f in tests/cases/*/*.sp examples/basics/*.sp examples/gfx/*.sp examples/gui/*.sp examples/os/*.sp; do
     b=${f%.sp}; args=""; [ -f "$b.args" ] && args=$(cat "$b.args")

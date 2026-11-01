@@ -10,7 +10,7 @@
 
 static int usage(FILE *f) {
     (void)fputs("usage: sprint run [--json] [--deterministic] [--max-heap N] [--max-instr N]\n"
-                "                  [--no-quicken] [--no-jit] [--allow-read=DIR] [--allow-write=DIR] [--allow-random] [--allow-ffi] [--allow-all] [--deny-clock]\n"
+                "                  [--no-quicken] [--no-jit] [--allow-read=DIR] [--allow-write=DIR] [--allow-random] [--allow-ffi] [--allow-asm] [--allow-all] [--deny-clock]\n"
                 "                  FILE [ARGS...]\n"
                 "       sprint check [--json] FILE\n"
                 "       sprint compile [-o OUT.spc] FILE\n"
@@ -52,7 +52,7 @@ typedef struct Opts {
     uint64_t max_heap, max_instr;
     const char *allow_r[MAX_ALLOW], *allow_w[MAX_ALLOW];
     int nr, nw;
-    int allow_random, allow_ffi, deny_clock, allow_all, no_quicken, no_jit;
+    int allow_random, allow_ffi, allow_asm, deny_clock, allow_all, no_quicken, no_jit;
     const char *out;
 } Opts;
 
@@ -89,6 +89,7 @@ static int cmd_file(const char *cmd, int argc, char **argv) {
         else if (strcmp(argv[i], "--allow-clock") == 0) o.deny_clock = 0;
         else if (strcmp(argv[i], "--deny-clock") == 0) o.deny_clock = 1;
         else if (strcmp(argv[i], "--allow-ffi") == 0) o.allow_ffi = 1;
+        else if (strcmp(argv[i], "--allow-asm") == 0) o.allow_asm = 1;
         else if (strcmp(argv[i], "--allow-all") == 0) o.allow_all = 1;
         else if (strcmp(argv[i], "--no-quicken") == 0) o.no_quicken = 1;
         else if (strcmp(argv[i], "--no-jit") == 0) o.no_jit = 1;
@@ -129,6 +130,7 @@ static int cmd_file(const char *cmd, int argc, char **argv) {
     int caps = CAP_STDIO_READ | CAP_STDIO_WRITE | (o.deny_clock ? 0 : CAP_CLOCK);
     if (o.allow_random || o.allow_all) caps |= CAP_RANDOM;
     if (o.allow_ffi) caps |= CAP_FFI; /* deliberately not part of --allow-all */
+    if (o.allow_asm) caps |= CAP_ASM; /* likewise: running machine code is a separate, stronger grant */
     VM *vm = vm_new(&lim, caps);
     vm->deterministic = o.deterministic;
     vm->no_quicken = o.no_quicken;

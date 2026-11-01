@@ -63,7 +63,8 @@ enum {
     SP_CAP_STDIO_READ = 1u << 0, SP_CAP_STDIO_WRITE = 1u << 1,
     SP_CAP_FS_READ    = 1u << 2, SP_CAP_FS_WRITE    = 1u << 3,
     SP_CAP_CLOCK      = 1u << 4, SP_CAP_RANDOM      = 1u << 5,
-    SP_CAP_FFI        = 1u << 6 /* foreign function interface (SPEC 15.15); never with deterministic mode */
+    SP_CAP_FFI        = 1u << 6, /* foreign function interface (SPEC 15.15); never with deterministic mode */
+    SP_CAP_ASM        = 1u << 7  /* ffi.asm: run machine code (docs/design/ffi-v2.md); never with deterministic mode */
 };
 
 /* new_size == 0 frees; ptr == NULL allocates. Reserved: this implementation

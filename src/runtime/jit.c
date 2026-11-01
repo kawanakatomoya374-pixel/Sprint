@@ -1634,12 +1634,18 @@ static int nat_result_ty(const NativeDesc *nd, JC *c, int pf, int argc) {
 }
 
 /* call a pure native through the helper: the callee entry is at pf, the argc arguments follow it */
+typedef int (*NatHelper)(VM *, SpValue *, unsigned, SpValue *, NativeFn, unsigned);
+static int jh_ffi(VM *vm, SpValue *argv, unsigned argc, SpValue *dst, NativeFn fn, unsigned want);
+static int emit_nat_h(JC *c, uint32_t pc, int pf, int argc, const NativeDesc *nd, int rty, NatHelper helper);
 static int emit_nat(JC *c, uint32_t pc, int pf, int argc, const NativeDesc *nd, int rty) {
+    return emit_nat_h(c, pc, pf, argc, nd, rty, jh_nat);
+}
+static int emit_nat_h(JC *c, uint32_t pc, int pf, int argc, const NativeDesc *nd, int rty, NatHelper helper) {
     if (!flush_regs(c) || !flush_from(c, pf, c->dep)) return 0;
     c->xe = gexit(c);
     if (c->xe < 0) FAIL("out of memory");
     c->hq2 = (uint64_t)(uintptr_t)nd->fn;
-    EM(ST_hnat, soff(c, pf), soff(c, pf + 1), argc, soff(c, c->dep), rty == TY_UNK ? 0xff : (int32_t)tag_of(rty), (uint64_t)(uintptr_t)jh_nat);
+    EM(ST_hnat, soff(c, pf), soff(c, pf + 1), argc, soff(c, c->dep), rty == TY_UNK ? 0xff : (int32_t)tag_of(rty), (uint64_t)(uintptr_t)helper);
     c->dep -= argc + 1;
     Ent *r = push(c, EK_MEM, rty, 0);
     if (!r) return 0;
@@ -2054,8 +2060,15 @@ static int do_call(JC *c, uint32_t pc, int len, uint32_t *skip) {
                 return do_call_len(c, pc, len, skip);
             return emit_nat(c, pc, pf, 1, nd, TY_INT);
         }
+        /* to_float / to_int never allocate or touch VM state, and an error leaves nothing changed (the interpreter repeats
+         * the call to report it), like the pure math natives */
+        if (argc == 1 && strcmp(nd->name, "to_float") == 0) return emit_nat(c, pc, pf, 1, nd, TY_FLT);
+        if (argc == 1 && strcmp(nd->name, "to_int") == 0) return emit_nat(c, pc, pf, 1, nd, TY_INT);
+        if (ffi_jit_safe(nd)) return emit_nat(c, pc, pf, argc, nd, TY_UNK);
         FAIL("call of a builtin");
     }
+    if (f->kind != EK_K && f->hint && f->hint->type == T_FUNCTION && AS_FUNC(*f->hint)->nat && ffi_jit_safe(AS_FUNC(*f->hint)->nat))
+        return emit_nat_h(c, pc, pf, argc, AS_FUNC(*f->hint)->nat, TY_UNK, jh_ffi);
     if (f->kind != EK_K && f->hint && f->hint->type == T_CLASS) return do_construct(c, pc, len, argc, AS_CLASS(*f->hint));
     if (!flush_from(c, c->d0, c->dep)) return 0;
     int x = exit_for(c, pc, c->dep);
@@ -2373,6 +2386,14 @@ static int jh_nat(VM *vm, SpValue *argv, unsigned argc, SpValue *dst, NativeFn f
     if (want != 0xffu && (unsigned)r.type != want) return 0;
     *dst = r;
     return 1;
+}
+/* A call of a prepared numeric-only ffi function whose callee was only known as a hint (a module variable): the callee is
+ * checked at run time, and anything else (another function, one that is not jit-safe) is left to the interpreter. */
+static int jh_ffi(VM *vm, SpValue *argv, unsigned argc, SpValue *dst, NativeFn fn, unsigned want) {
+    if (argv[-1].type != T_FUNCTION) return 0;
+    const SFunc *f = AS_FUNC(argv[-1]);
+    if (!f->nat || f->nat->fn != fn || !ffi_jit_safe(f->nat)) return 0;
+    return jh_nat(vm, argv, argc, dst, fn, want);
 }
 /* String methods never mutate their receiver or external VM state. They may allocate a result;
  * ST_hnat publishes the complete live stack before entering this helper, so those allocations

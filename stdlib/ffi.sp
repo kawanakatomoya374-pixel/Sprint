@@ -680,6 +680,14 @@ export func callback(decl, fn):
     live[to_string(a)] = fn
     return Callback(a)
 
+func _plain(pr):
+    if pr.variadic or pr.sret or pr.ret_st != nil or pr.ret_val != nil:
+        return false
+    for i in range(len(pr.args)):
+        if pr.byval[i] or pr.fnp[i] != nil or pr.args[i] == "p" or pr.args[i] == "s":
+            return false
+    return true
+
 func make_fn(address, pr):
     let sig = pr.sig
     let name = pr.name
@@ -689,6 +697,10 @@ func make_fn(address, pr):
     let sret = pr.sret
     let byval = pr.byval
     let nfixed = len(pr.args)
+    # Plain scalar signatures (no pointers, structs, callbacks or varargs) need no Sprint-side argument conversion:
+    # call the prepared native function directly (signature parsed once, no wrapper frame or argument array).
+    if _plain(pr):
+        return _ffi.prep(address, sig)
     func call(...args):
         let conv = []
         let temps = []
@@ -722,6 +734,11 @@ func make_fn(address, pr):
 func release_all(temps):
     for a in temps:
         _ffi.release_callback(a)
+
+# machine code of the host ISA as a C-ABI function: ffi.asm([0x48, 0x89, 0xf8, 0xc3], "int64_t(int64_t)").
+# Needs --allow-asm (separate from --allow-ffi; never with --deterministic). See docs/design/ffi-v2.md.
+export func asm(code, decl):
+    return _ffi.asm(code, proto_from(decl).sig)
 
 # function from a raw address: ffi.fn_at(p, "int(int, int)")
 export func fn_at(address, decl):

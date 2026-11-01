@@ -539,7 +539,7 @@ typedef struct Limits {
 } Limits;
 
 enum { CAP_STDIO_READ = 1, CAP_STDIO_WRITE = 2, CAP_FS_READ = 4, CAP_FS_WRITE = 8,
-       CAP_CLOCK = 16, CAP_RANDOM = 32, CAP_FFI = 64 };
+       CAP_CLOCK = 16, CAP_RANDOM = 32, CAP_FFI = 64, CAP_ASM = 128 };
 
 enum { FK_NORMAL = 0, FK_DEFER_RUN = 1, FK_DEFER_UNWIND = 2, FK_BOUNDARY = 3, FK_CTOR = 4 /* init run by the construction fast path; uev holds the new instance */ };
 
@@ -789,6 +789,7 @@ size_t sp_fmt_int(char *buf, int64_t v);
 extern const NativeDesc math_fns[];
 extern const int math_fns_count;
 int math_fast1(const NativeDesc *d, double x, double *out);
+int ffi_jit_safe(const NativeDesc *d); /* prepared numeric-only ffi function: compiled code may call it (lib_ffi.c) */
 int math_pure_native(const NativeDesc *d);
 int table_get_sstr(const STable *t, const SString *key, SpValue *out);
 int64_t table_find_sstr(const STable *t, const SString *key); /* entry index or -1 */

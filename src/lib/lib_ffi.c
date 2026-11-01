@@ -14,6 +14,8 @@
 #include <dlfcn.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
 #if defined(__x86_64__)
 #define FFI_STRUCT_BY_VALUE 1
@@ -475,6 +477,8 @@ typedef int64_t (*FnI)(int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, ...
 typedef double (*FnD)(int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, ...);
 
 /* call(address, sig, args_array) */
+static int do_call(VM *vm, int64_t addr, const Sig *psig, const SpValue *items, int64_t nargs, SpValue *ret);
+
 static int f_call(VM *vm, int argc, SpValue *argv, SpValue *ret) {
     (void)argc;
     if (need_cap(vm)) return 1;
@@ -485,21 +489,24 @@ static int f_call(VM *vm, int argc, SpValue *argv, SpValue *ret) {
     if (argv[2].type != T_ARRAY) return vm_set_error(vm, E_TYPE, "arguments must be an array");
     Sig sig;
     if (parse_sig(vm, AS_STR(argv[1]), &sig)) return 1;
-    SArray *args = AS_ARRAY(argv[2]);
-    int64_t nargs = args->len;
-    if (nargs < sig.nargs || (!sig.variadic && nargs > sig.nargs))
-        return vm_set_error(vm, E_TYPE, "ffi call expects %s%d argument%s, got %lld", sig.variadic ? "at least " : "", sig.nargs, sig.nargs == 1 ? "" : "s", (long long)nargs);
+    return do_call(vm, addr, &sig, AS_ARRAY(argv[2])->items, AS_ARRAY(argv[2])->len, ret);
+}
+
+/* The call itself, shared by f_call (signature parsed per call) and prepared functions (parsed once, see prep). */
+static int do_call(VM *vm, int64_t addr, const Sig *psig, const SpValue *items, int64_t nargs, SpValue *ret) {
+    if (nargs < psig->nargs || (!psig->variadic && nargs > psig->nargs))
+        return vm_set_error(vm, E_TYPE, "ffi call expects %s%d argument%s, got %lld", psig->variadic ? "at least " : "", psig->nargs, psig->nargs == 1 ? "" : "s", (long long)nargs);
     if (nargs > MAX_ARGS) return vm_set_error(vm, E_VALUE, "too many ffi arguments");
     int64_t ia[MAX_INT_ARGS] = {0};
     double da[MAX_FP_ARGS] = {0};
     int ni = 0, nd = 0;
     for (int i = 0; i < (int)nargs; i++) {
-        SpValue v = args->items[i];
+        SpValue v = items[i];
         CType t;
-        if (i < sig.nargs) t = sig.args[i];
+        if (i < psig->nargs) t = psig->args[i];
         else t = v.type == T_FLOAT ? C_F64 : v.type == T_STRING ? C_STR : C_I64; /* variadic extras: default promotions */
         if (t == C_STRUCT) {
-            const SInfo *si = &sig.ainfo[i];
+            const SInfo *si = &psig->ainfo[i];
             if (v.type != T_INT || v.as.i == 0) return vm_set_error(vm, E_TYPE, "argument %d: a struct by value needs the address of the struct", i + 1);
             const unsigned char *src = (const unsigned char *)(uintptr_t)v.as.i;
             int need_i = 0, need_d = 0;
@@ -542,9 +549,9 @@ static int f_call(VM *vm, int argc, SpValue *argv, SpValue *ret) {
     int64_t ri = 0;
     double rd = 0;
     unsigned char sret[16] = {0};
-    if (sig.ret == C_STRUCT) {
+    if (psig->ret == C_STRUCT) {
 #if FFI_STRUCT_BY_VALUE
-        const SInfo *si = &sig.rinfo;
+        const SInfo *si = &psig->rinfo;
         typedef struct { int64_t a, b; } RII;
         typedef struct { double a, b; } RDD;
         typedef struct { int64_t a; double b; } RID;
@@ -579,7 +586,7 @@ static int f_call(VM *vm, int argc, SpValue *argv, SpValue *ret) {
             memcpy(sret, &r, 16);
         }
 #endif
-    } else if (is_fp(sig.ret)) {
+    } else if (is_fp(psig->ret)) {
         FnD f;
         memcpy(&f, &fp, sizeof f);
         rd = f(ia[0], ia[1], ia[2], ia[3], ia[4], ia[5], da[0], da[1], da[2], da[3], da[4], da[5], da[6], da[7]);
@@ -591,8 +598,8 @@ static int f_call(VM *vm, int argc, SpValue *argv, SpValue *ret) {
     int failed = g_cb_failed;
     g_cb_failed = saved;
     if (failed) return 1; /* the callback's error is already pending */
-    switch (sig.ret) {
-    case C_STRUCT: *ret = v_obj(T_STRING, vm_new_string(vm, (const char *)sret, (size_t)sig.rinfo.size)); break;
+    switch (psig->ret) {
+    case C_STRUCT: *ret = v_obj(T_STRING, vm_new_string(vm, (const char *)sret, (size_t)psig->rinfo.size)); break;
     case C_VOID: *ret = v_nil(); break;
     case C_F32: { uint64_t bits; memcpy(&bits, &rd, 8); uint32_t lo = (uint32_t)bits; float f; memcpy(&f, &lo, 4); *ret = v_float((double)f); break; }
     case C_F64: *ret = v_float(rd); break;
@@ -620,8 +627,175 @@ static int f_abi(VM *vm, int argc, SpValue *argv, SpValue *ret) {
     return 0;
 }
 
+/* ---- prepared functions ------------------------------------------------------------
+ * prep(address, sig) parses the signature once and returns a native function that calls the address directly: no Sprint
+ * wrapper, no argument array, no per-call parse. The descriptor is the function's NativeDesc (d is the first member), found
+ * again through argv[-1], the callee slot every native call site leaves below its arguments. Descriptors are cached by
+ * (address, signature), so repeatedly preparing the same function allocates nothing. */
+typedef struct PrepFn {
+    NativeDesc d; /* must stay first */
+    int64_t addr;
+    Sig sig;
+    char *key;
+    int jit_ok; /* numeric-only signature: see ffi_jit_safe */
+} PrepFn;
+static PrepFn **g_prep;
+static size_t g_nprep, g_capprep;
+
+/* Numeric-only signatures (jit_ok) take this short path: arguments of the expected kind are moved straight into the
+ * register arrays; anything unexpected (a wrong count or type, an out-of-range float for an int...) goes to do_call, which
+ * reports it with the usual message. */
+static int prep_invoke(VM *vm, int argc, SpValue *argv, SpValue *ret) {
+    const PrepFn *p = (const PrepFn *)(const void *)AS_FUNC(argv[-1])->nat;
+    if (need_cap(vm)) return 1;
+    const Sig *sg = &p->sig;
+    if (p->jit_ok && argc == sg->nargs) {
+        int64_t ia[MAX_INT_ARGS] = {0};
+        double da[MAX_FP_ARGS] = {0};
+        int ni = 0, nd = 0, ok = 1;
+        for (int i = 0; i < argc && ok; i++) {
+            const SpValue v = argv[i];
+            switch (sg->args[i]) {
+            case C_F64:
+                if (nd == MAX_FP_ARGS) ok = 0;
+                else if (v.type == T_FLOAT) da[nd++] = v.as.f;
+                else if (v.type == T_INT) da[nd++] = (double)v.as.i;
+                else ok = 0;
+                break;
+            case C_I64: case C_U64:
+                if (ni == MAX_INT_ARGS || v.type != T_INT) ok = 0;
+                else ia[ni++] = v.as.i;
+                break;
+            default: ok = 0; break; /* narrower ints and float: the general converter */
+            }
+        }
+        if (ok) {
+            void *fp = (void *)(uintptr_t)p->addr;
+            int saved = g_cb_failed;
+            g_cb_failed = 0;
+            int64_t ri = 0;
+            double rd = 0;
+            const int fpret = is_fp(sg->ret);
+            if (fpret) { FnD f; memcpy(&f, &fp, sizeof f); rd = f(ia[0], ia[1], ia[2], ia[3], ia[4], ia[5], da[0], da[1], da[2], da[3], da[4], da[5], da[6], da[7]); }
+            else { FnI f; memcpy(&f, &fp, sizeof f); ri = f(ia[0], ia[1], ia[2], ia[3], ia[4], ia[5], da[0], da[1], da[2], da[3], da[4], da[5], da[6], da[7]); }
+            const int failed = g_cb_failed;
+            g_cb_failed = saved;
+            if (failed) return 1;
+            switch (sg->ret) {
+            case C_F64: *ret = v_float(rd); return 0;
+            case C_I64: case C_U64: *ret = v_int(ri); return 0;
+            case C_I32: *ret = v_int((int32_t)ri); return 0;
+            case C_VOID: *ret = v_nil(); return 0;
+            default: break;
+            }
+            /* other return kinds: finish through the shared conversion below */
+            switch (sg->ret) {
+            case C_F32: { uint64_t bits; memcpy(&bits, &rd, 8); uint32_t lo = (uint32_t)bits; float f; memcpy(&f, &lo, 4); *ret = v_float((double)f); return 0; }
+            case C_I8: *ret = v_int((int8_t)ri); return 0;
+            case C_U8: *ret = v_int((uint8_t)ri); return 0;
+            case C_I16: *ret = v_int((int16_t)ri); return 0;
+            case C_U16: *ret = v_int((uint16_t)ri); return 0;
+            case C_U32: *ret = v_int((uint32_t)ri); return 0;
+            default: *ret = v_int(ri); return 0;
+            }
+        }
+    }
+    return do_call(vm, p->addr, sg, argv, argc, ret);
+}
+
+/* May compiled code call this native directly? Only for numeric-only signatures: every error is raised while the arguments
+ * are converted, before the foreign function runs (so the interpreter can safely repeat the call to report it), nothing
+ * is allocated (no GC while the compiled frame is unsynchronised) and C cannot re-enter Sprint (no pointer arguments, so
+ * no callback address can be passed). */
+int ffi_jit_safe(const NativeDesc *d) {
+    return d->fn == prep_invoke && ((const PrepFn *)(const void *)d)->jit_ok;
+}
+
+static int make_prepared(VM *vm, int64_t addr, const SString *sigs, SpValue *ret, int share) {
+    Sig sig;
+    if (parse_sig(vm, sigs, &sig)) return 1;
+    PrepFn *p = NULL;
+    if (share)
+        for (size_t i = 0; i < g_nprep; i++)
+            if (g_prep[i]->addr == addr && strlen(g_prep[i]->key) == sigs->len && memcmp(g_prep[i]->key, sigs->data, sigs->len) == 0) { p = g_prep[i]; break; }
+    if (!p) {
+        p = calloc(1, sizeof *p);
+        char *key = malloc(sigs->len + 1);
+        if (!p || !key) { free(p); free(key); return vm_set_error(vm, E_MEMORY, "out of memory"); }
+        memcpy(key, sigs->data, sigs->len);
+        key[sigs->len] = 0;
+        /* argument counts are checked by do_call so that the messages stay those of the unprepared path */
+        p->d = (NativeDesc){"ffi function", 0, -1, prep_invoke};
+        p->addr = addr;
+        p->sig = sig;
+        p->key = key;
+        p->jit_ok = !sig.variadic && sig.ret != C_STRUCT && sig.ret != C_STR;
+        for (int i = 0; i < sig.nargs; i++)
+            if (sig.args[i] == C_PTR || sig.args[i] == C_STR || sig.args[i] == C_STRUCT) p->jit_ok = 0;
+        if (share) {
+            if (g_nprep == g_capprep) {
+                size_t nc = g_capprep ? g_capprep * 2 : 16;
+                PrepFn **np = realloc(g_prep, nc * sizeof *np);
+                if (!np) { free(key); free(p); return vm_set_error(vm, E_MEMORY, "out of memory"); }
+                g_prep = np;
+                g_capprep = nc;
+            }
+            g_prep[g_nprep++] = p;
+        }
+    }
+    *ret = v_obj(T_FUNCTION, vm_new_native(vm, &p->d));
+    return 0;
+}
+
+static int f_prep(VM *vm, int argc, SpValue *argv, SpValue *ret) {
+    (void)argc;
+    if (need_cap(vm)) return 1;
+    int64_t addr = 0;
+    if (a_int64(vm, argv[0], "address", &addr)) return 1;
+    if (addr == 0) return vm_set_error(vm, E_VALUE, "null function pointer");
+    if (argv[1].type != T_STRING) return vm_set_error(vm, E_TYPE, "signature must be a string");
+    return make_prepared(vm, addr, AS_STR(argv[1]), ret, 1);
+}
+
+/* asm(code, sig): machine code of the host ISA, run as a C-ABI function. Needs the separate `asm` capability: running
+ * arbitrary machine code is a stronger grant than calling symbols that already exist. The code is copied into its own
+ * mapping that is writable while it is filled and executable (never both) afterwards; mappings live until the process
+ * ends, and the total is capped. */
+static size_t g_asm_total;
+static int f_asm(VM *vm, int argc, SpValue *argv, SpValue *ret) {
+    (void)argc;
+    if (!FFI_SUPPORTED) return vm_set_error(vm, E_RUNTIME, "asm is not supported on this platform (x86-64 and AArch64 only)");
+    if (!(vm->caps & CAP_ASM) || vm->deterministic)
+        return vm_set_error(vm, E_PERM, "asm is not permitted (run with --allow-asm; it is never available with --deterministic)");
+    if (argv[1].type != T_STRING) return vm_set_error(vm, E_TYPE, "signature must be a string");
+    /* the code is a string of bytes or an array of ints 0..255 */
+    size_t len = 0;
+    if (argv[0].type == T_STRING) len = AS_STR(argv[0])->len;
+    else if (argv[0].type == T_ARRAY) {
+        const SArray *ca = AS_ARRAY(argv[0]);
+        for (int64_t i = 0; i < ca->len; i++)
+            if (ca->items[i].type != T_INT || ca->items[i].as.i < 0 || ca->items[i].as.i > 255)
+                return vm_set_error(vm, E_VALUE, "machine code array element %lld is not a byte (0..255)", (long long)i);
+        len = (size_t)ca->len;
+    } else return vm_set_error(vm, E_TYPE, "machine code must be a string or an array of bytes, not %s", type_name(argv[0]));
+    if (len == 0) return vm_set_error(vm, E_VALUE, "machine code is empty");
+    size_t page = (size_t)sysconf(_SC_PAGESIZE), size = (len + page - 1) / page * page;
+    if (size > ((size_t)1 << 20) || g_asm_total + size > ((size_t)64 << 20)) return vm_set_error(vm, E_VALUE, "too much machine code");
+    void *mem = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (mem == MAP_FAILED) return vm_set_error(vm, E_MEMORY, "cannot map memory for machine code");
+    if (argv[0].type == T_STRING) memcpy(mem, AS_STR(argv[0])->data, len);
+    else for (size_t i = 0; i < len; i++) ((unsigned char *)mem)[i] = (unsigned char)AS_ARRAY(argv[0])->items[i].as.i;
+#if defined(__aarch64__)
+    __builtin___clear_cache((char *)mem, (char *)mem + len);
+#endif
+    if (mprotect(mem, size, PROT_READ | PROT_EXEC) != 0) { munmap(mem, size); return vm_set_error(vm, E_MEMORY, "cannot make machine code executable"); }
+    g_asm_total += size;
+    return make_prepared(vm, (int64_t)(uintptr_t)mem, AS_STR(argv[1]), ret, 0);
+}
+
 const NativeDesc lib_ffi_fns[] = {
     {"open", 1, 1, f_open}, {"sym", 2, 2, f_sym}, {"call", 3, 3, f_call}, {"alloc", 1, 1, cb_alloc},
     {"peek", 2, 2, f_peek}, {"poke", 3, 3, f_poke}, {"string_at", 1, 2, f_string_at}, {"copy_in", 2, 2, f_copy_in},
     {"callback", 2, 2, f_callback}, {"release_callback", 1, 1, f_release_callback}, {"abi", 0, 0, f_abi},
+    {"prep", 2, 2, f_prep}, {"asm", 2, 2, f_asm},
     {NULL, 0, 0, NULL}};

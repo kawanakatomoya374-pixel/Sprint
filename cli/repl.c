@@ -21,7 +21,7 @@ typedef struct Session {
 } Session;
 
 typedef struct ReplOpts {
-    int deterministic, no_quicken, allow_random, allow_all, deny_clock, allow_ffi;
+    int deterministic, no_quicken, allow_random, allow_all, deny_clock, allow_ffi, allow_asm;
     uint64_t max_heap, max_instr;
     const char *allow_r[MAX_ALLOW], *allow_w[MAX_ALLOW];
     int nr, nw;
@@ -175,6 +175,7 @@ static int session_open(Session *S, const ReplOpts *o) {
     int caps = CAP_STDIO_READ | CAP_STDIO_WRITE | (o->deny_clock ? 0 : CAP_CLOCK);
     if (o->allow_random || o->allow_all) caps |= CAP_RANDOM;
     if (o->allow_ffi) caps |= CAP_FFI;
+    if (o->allow_asm) caps |= CAP_ASM;
     S->vm = vm_new(&lim, caps);
     S->vm->deterministic = o->deterministic;
     S->vm->no_quicken = o->no_quicken;
@@ -240,6 +241,7 @@ int tool_repl(int argc, char **argv, int *usage_error) {
         else if (strcmp(argv[i], "--no-quicken") == 0) o.no_quicken = 1;
         else if (strcmp(argv[i], "--allow-random") == 0) o.allow_random = 1;
         else if (strcmp(argv[i], "--allow-ffi") == 0) o.allow_ffi = 1;
+        else if (strcmp(argv[i], "--allow-asm") == 0) o.allow_asm = 1;
         else if (strcmp(argv[i], "--allow-all") == 0) o.allow_all = 1;
         else if (strcmp(argv[i], "--deny-clock") == 0) o.deny_clock = 1;
         else if (strcmp(argv[i], "--max-heap") == 0 && i + 1 < argc) { o.max_heap = strtoull(argv[++i], &end, 10); if (*end) { *usage_error = 1; return 2; } }
