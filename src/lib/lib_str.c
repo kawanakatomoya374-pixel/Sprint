@@ -339,3 +339,34 @@ const NativeDesc string_methods[] = {
     {"upper", 1, 1, sm_upper}, {"lower", 1, 1, sm_lower}, {"replace", 3, 3, sm_replace},
     {"repeat", 2, 2, sm_repeat}, {"char_count", 1, 1, sm_char_count}, {"char_at", 2, 2, sm_char_at},
     {"is_boundary", 2, 2, sm_is_boundary}, {"codepoints", 1, 1, sm_codepoints}, {NULL, 0, 0, NULL}};
+
+/* The JIT resolves a constant method name once, then guards the receiver at the call site. */
+const NativeDesc *lib_string_method(const SString *name) {
+    if (!name) return NULL;
+    for (const NativeDesc *d = string_methods; d->name; d++) {
+        size_t n = strlen(d->name);
+        if (n == name->len && memcmp(d->name, name->data, n) == 0) return d;
+    }
+    return NULL;
+}
+
+int lib_string_method_id(const SString *name) {
+    if (!name) return -1;
+    int id = 0;
+    for (const NativeDesc *d = string_methods; d->name; d++, id++) {
+        size_t n = strlen(d->name);
+        if (n == name->len && memcmp(d->name, name->data, n) == 0) return id;
+    }
+    return -1;
+}
+
+int lib_invoke_string_method_id(VM *vm, SpValue recv, unsigned id, int argc, SpValue *argv, SpValue *ret) {
+    const size_t method_count = sizeof(string_methods) / sizeof(string_methods[0]) - 1U;
+    if ((size_t)id >= method_count || recv.type != T_STRING)
+        return vm_set_error(vm, E_TYPE, "invalid quickened string method");
+    const NativeDesc *d = &string_methods[id];
+    if (argc < d->min_args || argc > d->max_args)
+        return vm_set_error(vm, E_TYPE, "%s.%s() called with %d argument%s", type_name(recv), d->name,
+                            argc - 1, argc - 1 == 1 ? "" : "s");
+    return d->fn(vm, argc, argv, ret);
+}

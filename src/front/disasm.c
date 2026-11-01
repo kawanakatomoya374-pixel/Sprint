@@ -16,9 +16,23 @@ int op_len(int op) {
     case OP_JUMP: case OP_JUMP_IF_FALSE: case OP_JUMP_IF_TRUE: case OP_JUMP_IF_FALSE_OR_POP:
     case OP_JUMP_IF_TRUE_OR_POP: case OP_CLOSURE: case OP_TRY_BEGIN:
         return 5;
-    case OP_INVOKE: case OP_INVOKE_SPREAD: case OP_DEFER_INVOKE: case OP_RAISE_ERR: return 4;
+    case OP_INVOKE: case OP_INVOKE_SPREAD: case OP_DEFER_INVOKE: case OP_RAISE_ERR:
+    case OP_Q_INVOKE_STR_SLICE: case OP_Q_INVOKE_STR_FIND: case OP_Q_INVOKE_STR_CONTAINS:
+    case OP_Q_INVOKE_STR_STARTS_WITH: case OP_Q_INVOKE_STR_ENDS_WITH: case OP_Q_INVOKE_STR_COUNT:
+    case OP_Q_INVOKE_STR_SPLIT: case OP_Q_INVOKE_STR_SPLIT_LINES: case OP_Q_INVOKE_STR_TRIM:
+    case OP_Q_INVOKE_STR_TRIM_START: case OP_Q_INVOKE_STR_TRIM_END: case OP_Q_INVOKE_STR_UPPER:
+    case OP_Q_INVOKE_STR_LOWER: case OP_Q_INVOKE_STR_REPLACE: case OP_Q_INVOKE_STR_REPEAT:
+    case OP_Q_INVOKE_STR_CHAR_COUNT: case OP_Q_INVOKE_STR_CHAR_AT: case OP_Q_INVOKE_STR_IS_BOUNDARY:
+    case OP_Q_INVOKE_STR_CODEPOINTS: return 4;
     case OP_FOR_NEXT: return 8;
     case OP_RANGE_NEXT: return 7;
+    case OP_Q_ACC_I: case OP_Q_ACC_IM:
+    case OP_Q_ACC_I_MOD: case OP_Q_ACC_I_MUL: case OP_Q_ACC_I_SUB:
+    case OP_Q_ACC_IM_MOD: case OP_Q_ACC_IM_MUL: case OP_Q_ACC_IM_SUB:
+        return 14;
+    case OP_Q_ACC_L: case OP_Q_ACC_LM:
+    case OP_Q_LLI_ADD_ST: case OP_Q_LLI_SUB_ST:
+        return 10;
     case OP_NOP: case OP_NIL: case OP_TRUE: case OP_FALSE: case OP_POP: case OP_DUP: case OP_DUP2:
     case OP_ADD: case OP_SUB: case OP_MUL: case OP_DIV: case OP_FLOOR_DIV: case OP_MOD:
     case OP_POW: case OP_NEG: case OP_BAND: case OP_BOR: case OP_BXOR: case OP_BNOT:
@@ -55,6 +69,20 @@ static const char *op_name(int op) {
     case OP_NEW_ARRAY: return "NEW_ARRAY"; case OP_NEW_TABLE: return "NEW_TABLE";
     case OP_CLOSURE: return "CLOSURE"; case OP_CALL: return "CALL"; case OP_CALL_SPREAD: return "CALL_SPREAD";
     case OP_INVOKE: return "INVOKE"; case OP_INVOKE_SPREAD: return "INVOKE_SPREAD";
+    case OP_Q_INVOKE_STR_SLICE: case OP_Q_INVOKE_STR_FIND: case OP_Q_INVOKE_STR_CONTAINS:
+    case OP_Q_INVOKE_STR_STARTS_WITH: case OP_Q_INVOKE_STR_ENDS_WITH: case OP_Q_INVOKE_STR_COUNT:
+    case OP_Q_INVOKE_STR_SPLIT: case OP_Q_INVOKE_STR_SPLIT_LINES: case OP_Q_INVOKE_STR_TRIM:
+    case OP_Q_INVOKE_STR_TRIM_START: case OP_Q_INVOKE_STR_TRIM_END: case OP_Q_INVOKE_STR_UPPER:
+    case OP_Q_INVOKE_STR_LOWER: case OP_Q_INVOKE_STR_REPLACE: case OP_Q_INVOKE_STR_REPEAT:
+    case OP_Q_INVOKE_STR_CHAR_COUNT: case OP_Q_INVOKE_STR_CHAR_AT: case OP_Q_INVOKE_STR_IS_BOUNDARY:
+    case OP_Q_INVOKE_STR_CODEPOINTS: return "Q_INVOKE_STR";
+    case OP_Q_ACC_I: case OP_Q_ACC_IM:
+    case OP_Q_ACC_I_MOD: case OP_Q_ACC_I_MUL: case OP_Q_ACC_I_SUB:
+    case OP_Q_ACC_IM_MOD: case OP_Q_ACC_IM_MUL: case OP_Q_ACC_IM_SUB:
+    case OP_Q_ACC_L: case OP_Q_ACC_LM:
+        return "Q_ACC";
+    case OP_Q_LLI_ADD_ST: case OP_Q_LLI_SUB_ST:
+        return "Q_LLI_STORE";
     case OP_RETURN: return "RETURN"; case OP_RETURN_NIL: return "RETURN_NIL";
     case OP_FOR_PREP: return "FOR_PREP"; case OP_FOR_NEXT: return "FOR_NEXT";
     case OP_RANGE_PREP: return "RANGE_PREP"; case OP_RANGE_NEXT: return "RANGE_NEXT";

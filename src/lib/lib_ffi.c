@@ -195,7 +195,7 @@ static int store_scalar(VM *vm, CType t, void *p, SpValue v) {
 static int cb_alloc(VM *vm, int argc, SpValue *argv, SpValue *ret) {
     (void)argc;
     if (need_cap(vm)) return 1;
-    int64_t n;
+    int64_t n = 0;
     if (a_int64(vm, argv[0], "size", &n)) return 1;
     if (n < 0 || n > ((int64_t)1 << 30)) return vm_set_error(vm, E_VALUE, "buffer size must be 0..2^30");
     SNativeObj *o = vm_new_native_obj(vm, &cbuf_class, sizeof(CBuf) + (size_t)n + 1);
@@ -229,7 +229,7 @@ static int bm_get(VM *vm, int argc, SpValue *argv, SpValue *ret) {
     (void)argc;
     CBuf *b = self_buf(vm, argv[0]);
     CType t;
-    int64_t off;
+    int64_t off = 0;
     if (!b || a_type(vm, argv[1], &t) || a_int64(vm, argv[2], "offset", &off) || buf_range(vm, b, off, type_size(t))) return 1;
     *ret = load_scalar(t, b->b + off);
     return 0;
@@ -238,7 +238,7 @@ static int bm_set(VM *vm, int argc, SpValue *argv, SpValue *ret) {
     (void)argc; (void)ret;
     CBuf *b = self_buf(vm, argv[0]);
     CType t;
-    int64_t off;
+    int64_t off = 0;
     if (!b || a_type(vm, argv[1], &t) || a_int64(vm, argv[2], "offset", &off) || buf_range(vm, b, off, type_size(t))) return 1;
     return store_scalar(vm, t, b->b + off, argv[3]);
 }
@@ -259,7 +259,7 @@ static int bm_str(VM *vm, int argc, SpValue *argv, SpValue *ret) {
 static int bm_put(VM *vm, int argc, SpValue *argv, SpValue *ret) {
     (void)argc; (void)ret;
     CBuf *b = self_buf(vm, argv[0]);
-    int64_t off;
+    int64_t off = 0;
     if (!b || a_int64(vm, argv[1], "offset", &off)) return 1;
     if (argv[2].type != T_STRING) return vm_set_error(vm, E_TYPE, "put expects a string, not %s", type_name(argv[2]));
     if (buf_range(vm, b, off, AS_STR(argv[2])->len)) return 1;
@@ -273,7 +273,7 @@ static const NativeClass cbuf_class = {"ffi_buffer", cbuf_methods, NULL, NULL};
 
 /* ---- raw memory ------------------------------------------------------------------ */
 static int a_addr(VM *vm, SpValue v, void **out) {
-    int64_t a;
+    int64_t a = 0;
     if (a_int64(vm, v, "address", &a)) return 1;
     if (a == 0) return vm_set_error(vm, E_VALUE, "null pointer");
     *out = (void *)(uintptr_t)a;
@@ -456,7 +456,7 @@ static int f_callback(VM *vm, int argc, SpValue *argv, SpValue *ret) {
 static int f_release_callback(VM *vm, int argc, SpValue *argv, SpValue *ret) {
     (void)argc; (void)ret;
     if (need_cap(vm)) return 1;
-    int64_t a;
+    int64_t a = 0;
     if (a_int64(vm, argv[0], "address", &a)) return 1;
     for (int k = 0; k < NCB; k++) {
         uintptr_t x;
@@ -478,7 +478,7 @@ typedef double (*FnD)(int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, ...)
 static int f_call(VM *vm, int argc, SpValue *argv, SpValue *ret) {
     (void)argc;
     if (need_cap(vm)) return 1;
-    int64_t addr;
+    int64_t addr = 0;
     if (a_int64(vm, argv[0], "address", &addr)) return 1;
     if (addr == 0) return vm_set_error(vm, E_VALUE, "null function pointer");
     if (argv[1].type != T_STRING) return vm_set_error(vm, E_TYPE, "signature must be a string");

@@ -6,6 +6,7 @@
 #include "sp.h"
 
 /* functions shared between the parts of this stage */
+void value_vm_init(VM *vm);
 void *new_obj(VM *vm, size_t size, int type, int with_id);
 void obj_release_block(VM *vm, Obj *o);
 

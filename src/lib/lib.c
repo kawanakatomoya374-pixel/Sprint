@@ -388,7 +388,7 @@ SpValue lib_module_value(VM *vm, const char *name) {
             v = vstr(vm, "other", 5);
 #endif
         } else {
-            v = vstr(vm, "2.31.0", 6);
+            v = vstr(vm, "2.63.0", 6);
         }
         table_set_str(vm, m->exports, c->name, strlen(c->name), v);
     }

@@ -33,7 +33,7 @@ static int a_int(VM *vm, SpValue v, const char *what, int64_t *out) {
 }
 
 static int a_coord(VM *vm, SpValue v, const char *what, int *out) {
-    int64_t x;
+    int64_t x = 0;
     if (a_int(vm, v, what, &x)) return 1;
     if (x < -(1 << 28) || x > (1 << 28)) return vm_set_error(vm, E_VALUE, "%s out of range", what);
     *out = (int)x;
@@ -41,7 +41,7 @@ static int a_coord(VM *vm, SpValue v, const char *what, int *out) {
 }
 
 static int a_color(VM *vm, SpValue v, uint32_t *out) {
-    int64_t x;
+    int64_t x = 0;
     if (a_int(vm, v, "color", &x)) return 1;
     if (x < 0 || x > 0xFFFFFF) return vm_set_error(vm, E_VALUE, "color must be in 0..0xFFFFFF (see gfx.rgb)");
     *out = (uint32_t)x;
@@ -627,7 +627,7 @@ static int cm_clear(VM *vm, int argc, SpValue *argv, SpValue *ret) {
 static int cm_set_alpha(VM *vm, int argc, SpValue *argv, SpValue *ret) {
     (void)argc; (void)ret;
     SELF();
-    int64_t a;
+    int64_t a = 0;
     if (a_int(vm, argv[1], "alpha", &a)) return 1;
     if (a < 0 || a > 255) return vm_set_error(vm, E_VALUE, "alpha must be in 0..255");
     c->alpha = (int)a;
@@ -686,7 +686,7 @@ static int cm_fill_triangle(VM *vm, int argc, SpValue *argv, SpValue *ret) {
 static int text_scale(VM *vm, int argc, SpValue *argv, int idx, int *scale) {
     *scale = 1;
     if (argc > idx) {
-        int64_t s;
+        int64_t s = 0;
         if (a_int(vm, argv[idx], "scale", &s)) return 1;
         if (s < 1 || s > 64) return vm_set_error(vm, E_VALUE, "scale must be in 1..64");
         *scale = (int)s;
@@ -847,7 +847,7 @@ static const NativeClass canvas_class = {"canvas", canvas_methods, NULL, NULL};
 /* module functions                                                  */
 /* ---------------------------------------------------------------- */
 static int g_canvas(VM *vm, int argc, SpValue *argv, SpValue *ret) {
-    int64_t w, h;
+    int64_t w = 0, h = 0;
     if (a_int(vm, argv[0], "width", &w) || a_int(vm, argv[1], "height", &h)) return 1;
     if (w < 1 || h < 1 || w > MAX_DIM || h > MAX_DIM || w * h > MAX_PIXELS)
         return vm_set_error(vm, E_VALUE, "canvas size must be 1..%d per side and at most %d pixels", MAX_DIM, MAX_PIXELS);
@@ -888,7 +888,7 @@ static int g_text_advance(VM *vm, int argc, SpValue *argv, SpValue *ret) {
 /* hsv(h, s, v): h in degrees (any int, wrapped to 0..359), s and v in 0..100 (ints) */
 static int g_hsv(VM *vm, int argc, SpValue *argv, SpValue *ret) {
     (void)argc;
-    int64_t hh, s, v;
+    int64_t hh = 0, s = 0, v = 0;
     if (a_int(vm, argv[0], "h", &hh) || a_int(vm, argv[1], "s", &s) || a_int(vm, argv[2], "v", &v)) return 1;
     if (s < 0 || s > 100 || v < 0 || v > 100) return vm_set_error(vm, E_VALUE, "s and v must be in 0..100");
     hh %= 360;

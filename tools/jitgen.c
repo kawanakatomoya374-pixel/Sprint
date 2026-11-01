@@ -1,8 +1,9 @@
 /* jitgen: turns the relocatable object assembled from src/runtime/jit/stencils.S into src/runtime/jit/stencils.h.
  *
  * Every `.text.<name>` section is one stencil. Its bytes are copied verbatim; every relocation against one of the
- * hole symbols H0..H5, HQ, JIT_T, JIT_X becomes a patch record (offset, which hole, kind, addend). The JIT only has to
- * memcpy a stencil and write the holes. Usage: jitgen stencils.o > stencils.h   (see `make jit-regen`) */
+ * hole symbols H0..H5, HQ/HQ2, HB0..HB5, JIT_T and JIT_X become patch records containing the offset, hole,
+ * relocation width/kind and addend. The JIT only has to memcpy a stencil and write the holes. Usage:
+ * jitgen stencils.o > stencils.h   (see `make jit-regen`) */
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -17,10 +18,13 @@ typedef struct { uint64_t offset, info; int64_t addend; } Rela;
 static unsigned char *img;
 static size_t imglen;
 
-static const char *hole_names[] = {"H0", "H1", "H2", "H3", "H4", "H5", "HQ", "JIT_T", "JIT_X", "HQ2"};
+static const char *hole_names[] = {
+    "H0", "H1", "H2", "H3", "H4", "H5", "HQ", "JIT_T", "JIT_X", "HQ2",
+    "HB0", "HB1", "HB2", "HB3", "HB4", "HB5"
+};
 
 static int hole_id(const char *s) {
-    for (int i = 0; i < 10; i++) if (strcmp(s, hole_names[i]) == 0) return i;
+    for (int i = 0; i < (int)(sizeof hole_names / sizeof hole_names[0]); i++) if (strcmp(s, hole_names[i]) == 0) return i;
     fprintf(stderr, "jitgen: unknown symbol '%s'\n", s);
     exit(1);
 }
@@ -51,8 +55,8 @@ int main(int argc, char **argv) {
     printf("enum {\n");
     for (int k = 0; k < ns; k++) printf("    ST_%s,\n", shstr + sh[sec_of[k]].name + 6);
     printf("    ST_COUNT\n};\n");
-    printf("enum { HOLE_H0, HOLE_H1, HOLE_H2, HOLE_H3, HOLE_H4, HOLE_H5, HOLE_HQ, HOLE_T, HOLE_X, HOLE_HQ2 };\n");
-    printf("enum { REL_ABS32, REL_ABS64, REL_PC32 };\n");
+    printf("enum { HOLE_H0, HOLE_H1, HOLE_H2, HOLE_H3, HOLE_H4, HOLE_H5, HOLE_HQ, HOLE_T, HOLE_X, HOLE_HQ2, HOLE_B0, HOLE_B1, HOLE_B2, HOLE_B3, HOLE_B4, HOLE_B5 };\n");
+    printf("enum { REL_ABS8, REL_ABS32, REL_ABS64, REL_PC32 };\n");
     printf("typedef struct { uint16_t at; uint8_t hole, kind; int32_t addend; } JReloc;\n");
     printf("typedef struct { uint32_t off, len, rel0, nrel; } JStencil;\n");
 
@@ -88,13 +92,16 @@ int main(int argc, char **argv) {
                 uint32_t type = (uint32_t)(r[q].info & 0xffffffffu), sym = (uint32_t)(r[q].info >> 32);
                 int hole = hole_id(strs + syms[sym].name);
                 int kind;
-                if (type == 10 || type == 11) kind = 0;        /* R_X86_64_32 / 32S */
-                else if (type == 1) kind = 1;                  /* R_X86_64_64 */
-                else if (type == 2 || type == 4) kind = 2;     /* PC32 / PLT32 */
+                if (type == 14) kind = 0;                      /* R_X86_64_8 */
+                else if (type == 10 || type == 11) kind = 1; /* R_X86_64_32 / 32S */
+                else if (type == 1) kind = 2;                /* R_X86_64_64 */
+                else if (type == 2 || type == 4) kind = 3;   /* PC32 / PLT32 */
                 else { fprintf(stderr, "jitgen: unsupported relocation type %u\n", type); return 1; }
                 printf("    {%u, HOLE_%s, %s, %d},\n", (unsigned)r[q].offset,
-                       hole <= 5 ? hole_names[hole] : hole == 6 ? "HQ" : hole == 7 ? "T" : hole == 8 ? "X" : "HQ2",
-                       kind == 0 ? "REL_ABS32" : kind == 1 ? "REL_ABS64" : "REL_PC32", (int)r[q].addend);
+                       hole <= 5 ? hole_names[hole] : hole == 6 ? "HQ" : hole == 7 ? "T" :
+                       hole == 8 ? "X" : hole == 9 ? "HQ2" : hole_names[hole] + 1,
+                       kind == 0 ? "REL_ABS8" : kind == 1 ? "REL_ABS32" :
+                       kind == 2 ? "REL_ABS64" : "REL_PC32", (int)r[q].addend);
                 nrel_total++;
                 nrel[k]++;
             }

@@ -72,6 +72,15 @@ void *vm_mem(VM *vm, void *p, size_t old, size_t nw) {
 /* Small objects come from per-VM size-class pools (no malloc/free per object).
  * Chunks are only returned to the system in vm_free. */
 enum { POOL_MAX = SP_POOL_MAX, POOL_CHUNK = 65536 };
+static char pool_empty_sentinel;
+
+void value_vm_init(VM *vm) {
+    if (vm == NULL) return;
+    /* Both pointers refer to the same real object, so the initial subtraction
+     * in pool_alloc is defined and yields zero without a per-allocation NULL branch. */
+    vm->pool_cur = &pool_empty_sentinel;
+    vm->pool_end = &pool_empty_sentinel;
+}
 
 static void *pool_alloc(VM *vm, size_t size) {
     size_t c = (size + 15) >> 4;

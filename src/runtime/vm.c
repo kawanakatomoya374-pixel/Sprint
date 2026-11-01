@@ -1,5 +1,6 @@
 /* Layer 6: the interpreter (SPEC 17): arithmetic, indexing, the dispatch loop. No C recursion for Sprint calls. */
 #include "vm_int.h"
+#include "vm/internal.h"
 
 static const ICEnt *ic_fill(VM *vm, ICEnt *e, const SClass *k, const SString *name);
 
@@ -17,14 +18,22 @@ static const char *op_sym(int op) {
 }
 
 static int add_ovf(int64_t x, int64_t y, int64_t *r) {
+#if defined(__GNUC__)
+    return __builtin_add_overflow(x, y, r);
+#else
     uint64_t u = (uint64_t)x + (uint64_t)y;
     *r = (int64_t)u;
     return (((x ^ *r) & (y ^ *r)) < 0);
+#endif
 }
 static int sub_ovf(int64_t x, int64_t y, int64_t *r) {
+#if defined(__GNUC__)
+    return __builtin_sub_overflow(x, y, r);
+#else
     uint64_t u = (uint64_t)x - (uint64_t)y;
     *r = (int64_t)u;
     return (((x ^ y) & (x ^ *r)) < 0);
+#endif
 }
 static int mul_ovf(int64_t x, int64_t y, int64_t *r) {
 #if defined(__GNUC__)
@@ -268,7 +277,8 @@ static int get_member(VM *vm, SpValue o, SString *name, SpValue *out) {
     }
     case T_CLASS: {
         SClass *k = AS_CLASS(o);
-        if (table_get_sstr(k->methods, name, out)) return 0;
+        const ICEnt *ce = ic_find(vm, k, name);
+        if (ce && ce->kind == 2) { *out = ce->fn; return 0; }
         return vm_set_error(vm, E_NAME, "class '%s' has no method '%s'", k->name->data, name->data);
     }
     case T_ARRAY: case T_STRING:
@@ -394,124 +404,6 @@ static SString *concat_fast(VM *vm, const SpValue *ops, unsigned n) {
 /* for the JIT: the same fast path (strings and ints only; NULL otherwise) */
 SString *vm_concat_fast(VM *vm, const SpValue *ops, unsigned n) { return concat_fast(vm, ops, n); }
 
-/* Fused-opcode selection: LOCAL,SMALLINT,binop[,JUMP_IF_FALSE] and
- * LOCAL,LOCAL,binop[,JUMP_IF_FALSE], and RANGE_NEXT,STORE_LOCAL. Only the first
- * byte of a sequence is replaced (see enum Op). */
-static int q_cmp_index(int op) {
-    switch (op) {
-    case OP_LT: return 0; case OP_LE: return 1; case OP_GT: return 2;
-    case OP_GE: return 3; case OP_EQ: return 4; case OP_NE: return 5;
-    default: return -1;
-    }
-}
-
-static void proto_quicken(Proto *p) {
-    if (!p->ocode && SP_JIT && p->code_len > 0) {
-        p->ocode = malloc(p->code_len);   /* the JIT compiles from the pristine bytecode */
-        if (p->ocode) memcpy(p->ocode, p->code, p->code_len);
-    }
-    uint8_t *w = p->code;
-    const uint8_t *c = p->code;
-    uint32_t n = p->code_len, pc = 0;
-    uint32_t *jumps = NULL;
-    size_t nj = 0, capj = 0;
-    while (pc < n) {
-        int op = c[pc];
-        int len = op_len(op);
-        if (len <= 0) break;
-        if (op == OP_JUMP) {
-            if (nj == capj) {
-                size_t nc = capj ? capj * 2 : 16;
-                uint32_t *t = realloc(jumps, nc * sizeof *t);
-                if (!t) break;
-                jumps = t;
-                capj = nc;
-            }
-            jumps[nj++] = pc;
-        }
-        if (op == OP_LOAD_UPVAL && pc + 10 <= n && c[pc + 3] == OP_SMALLINT && c[pc + 6] == OP_ADD && c[pc + 7] == OP_STORE_UPVAL &&
-            rd16(c + pc + 8) == rd16(c + pc + 1)) {
-            w[pc] = OP_Q_UP_INC;   /* u += k */
-        } else if (op == OP_LOAD_UPVAL && pc + 4 <= n && c[pc + 3] == OP_RETURN) {
-            w[pc] = OP_Q_RET_UP;
-        } else if (op == OP_LOAD_LOCAL && pc + 17 <= n && c[pc + 3] == OP_SMALLINT && c[pc + 6] == OP_MOD && c[pc + 7] == OP_SMALLINT &&
-                   (c[pc + 10] == OP_EQ || c[pc + 10] == OP_NE) && c[pc + 11] == OP_JUMP_IF_FALSE) {
-            w[pc] = c[pc + 10] == OP_EQ ? OP_Q_MODEQ_JF : OP_Q_MODNE_JF;   /* if x % m == k / != k */
-        } else if ((op == OP_LOAD_LOCAL || op == OP_LOAD_MODULE) && pc + 14 <= n && c[pc + 3] == OP_LOAD_LOCAL && c[pc + 6] == OP_SMALLINT &&
-            (c[pc + 9] == OP_MOD || c[pc + 9] == OP_MUL || c[pc + 9] == OP_ADD || c[pc + 9] == OP_SUB) &&
-            c[pc + 10] == OP_ADD && c[pc + 11] == (op == OP_LOAD_LOCAL ? OP_STORE_LOCAL : OP_STORE_MODULE) &&
-            rd16(c + pc + 12) == rd16(c + pc + 1)) {
-            w[pc] = op == OP_LOAD_LOCAL ? OP_Q_ACC_I : OP_Q_ACC_IM;   /* s += x <op> k */
-        } else if ((op == OP_LOAD_LOCAL || op == OP_LOAD_MODULE) && pc + 10 <= n && c[pc + 3] == OP_LOAD_LOCAL && c[pc + 6] == OP_ADD &&
-                   c[pc + 7] == (op == OP_LOAD_LOCAL ? OP_STORE_LOCAL : OP_STORE_MODULE) && rd16(c + pc + 8) == rd16(c + pc + 1)) {
-            w[pc] = op == OP_LOAD_LOCAL ? OP_Q_ACC_L : OP_Q_ACC_LM;   /* s += x */
-        } else if (op == OP_LOAD_LOCAL && pc + 10 <= n && c[pc + 3] == OP_LOAD_LOCAL && c[pc + 6] == OP_LOAD_LOCAL &&
-                   c[pc + 9] == OP_SET_INDEX) {
-            w[pc] = OP_Q_SETIDX_LLL;   /* a[i] = v */
-        } else if (op == OP_LOAD_LOCAL && pc + 8 <= n && c[pc + 3] == OP_LOAD_LOCAL && (c[pc + 6] == OP_TRUE || c[pc + 6] == OP_FALSE) &&
-                   c[pc + 7] == OP_SET_INDEX) {
-            w[pc] = OP_Q_SETIDX_LLB;   /* a[i] = true / false */
-        } else if (op == OP_LOAD_LOCAL && pc + 4 <= n && (c[pc + 3] == OP_GET_MEMBER || c[pc + 3] == OP_RETURN)) {
-            w[pc] = c[pc + 3] == OP_RETURN ? OP_Q_RET_LOCAL : OP_Q_LOCAL_GETM;
-        } else if (op == OP_LOAD_LOCAL && pc + 4 <= n && c[pc + 3] == OP_GET_INDEX) {
-            w[pc] = OP_Q_IDX_L;   /* top[local] */
-        } else if (op == OP_LOAD_LOCAL && pc + 4 <= n && (c[pc + 3] == OP_ADD || c[pc + 3] == OP_SUB || c[pc + 3] == OP_MUL || c[pc + 3] == OP_DIV)) {
-            w[pc] = (uint8_t)(c[pc + 3] == OP_ADD ? OP_Q_ADD_L : c[pc + 3] == OP_SUB ? OP_Q_SUB_L : c[pc + 3] == OP_MUL ? OP_Q_MUL_L : OP_Q_DIV_L);   /* top <op> local */
-        } else if (op == OP_LOAD_LOCAL && pc + 7 <= n && (c[pc + 3] == OP_SMALLINT || c[pc + 3] == OP_LOAD_LOCAL)) {
-            int imm = c[pc + 3] == OP_SMALLINT;
-            int b = c[pc + 6];
-            int ci = q_cmp_index(b);
-            int q = 0;
-            if (ci >= 0) {
-                int jf = pc + 12 <= n && c[pc + 7] == OP_JUMP_IF_FALSE;
-                q = jf ? (imm ? OP_Q_LLI_LT_JF : OP_Q_LLL_LT_JF) + ci : (imm ? OP_Q_LLI_LT : OP_Q_LLL_LT) + ci;
-            } else if (b == OP_ADD) q = imm ? OP_Q_LLI_ADD : OP_Q_LLL_ADD;
-            else if (b == OP_SUB) q = imm ? OP_Q_LLI_SUB : OP_Q_LLL_SUB;
-            else if (b == OP_MOD && imm) q = OP_Q_LLI_MOD;
-            else if (b == OP_MUL) q = imm ? OP_Q_LLI_MUL : OP_Q_LLL_MUL;
-            else if (b == OP_DIV && !imm) q = OP_Q_LLL_DIV;
-            else if (b == OP_FLOOR_DIV && imm) q = OP_Q_LLI_FDIV;
-            else if (b == OP_GET_INDEX && !imm) q = OP_Q_LL_IDX;
-            if (imm && pc + 10 <= n && c[pc + 7] == OP_STORE_LOCAL) {
-                if (b == OP_ADD) q = OP_Q_LLI_ADD_ST;
-                else if (b == OP_SUB) q = OP_Q_LLI_SUB_ST;
-            }
-            if (q) w[pc] = (uint8_t)q;
-        } else if (op == OP_SMALLINT && pc + 9 <= n && q_cmp_index(c[pc + 3]) >= 0 && c[pc + 4] == OP_JUMP_IF_FALSE) {
-            w[pc] = (uint8_t)(OP_Q_SI_LT_JF + q_cmp_index(c[pc + 3]));   /* if x <cmp> k */
-        } else if (op == OP_SMALLINT && pc + 7 <= n && c[pc + 3] == OP_LOAD_LOCAL && (c[pc + 6] == OP_ADD || c[pc + 6] == OP_MUL)) {
-            w[pc] = c[pc + 6] == OP_ADD ? OP_Q_IL_ADD : OP_Q_IL_MUL;   /* k + x, k * x */
-        } else if (op == OP_SMALLINT && pc + 4 <= n && (c[pc + 3] == OP_ADD || c[pc + 3] == OP_SUB || c[pc + 3] == OP_MUL)) {
-            w[pc] = (uint8_t)(c[pc + 3] == OP_ADD ? OP_Q_SI_ADD : c[pc + 3] == OP_SUB ? OP_Q_SI_SUB : OP_Q_SI_MUL);
-        } else if ((op == OP_ADD || op == OP_SUB) && pc + 4 <= n && c[pc + 1] == OP_STORE_LOCAL) {
-            w[pc] = (uint8_t)(op == OP_ADD ? OP_Q_ADD_ST : OP_Q_SUB_ST);
-        } else if (op == OP_MUL && pc + 4 <= n && c[pc + 1] == OP_STORE_LOCAL) {
-            w[pc] = OP_Q_MUL_ST;
-        } else if ((op == OP_ADD || op == OP_SUB) && pc + 4 <= n && c[pc + 1] == OP_STORE_MODULE) {
-            w[pc] = (uint8_t)(op == OP_ADD ? OP_Q_ADD_STM : OP_Q_SUB_STM);
-        } else if (op == OP_RANGE_NEXT && pc + 10 <= n && c[pc + 7] == OP_STORE_LOCAL) {
-            w[pc] = OP_Q_RANGE_NEXT_ST;
-        }
-        pc += (uint32_t)len;
-    }
-    /* second pass: a jump whose target is a fused loop head runs that head inline */
-    for (size_t i = 0; i < nj; i++) {
-        uint32_t jp = jumps[i];
-        int64_t t = (int64_t)jp + 5 + (int32_t)rd32(c + jp + 1);
-        if (t < 0 || t >= (int64_t)n) continue;
-        int tq = c[t];
-        if (tq == OP_Q_RANGE_NEXT_ST) w[jp] = OP_Q_JUMP_RN;
-        else if (tq == OP_Q_LLL_LT_JF) w[jp] = OP_Q_JUMP_LLL_LT;
-        else if (tq == OP_Q_LLI_LT_JF) w[jp] = OP_Q_JUMP_LLI_LT;
-        else if ((tq > OP_Q_LLI_LT_JF && tq <= OP_Q_LLI_NE_JF) || (tq > OP_Q_LLL_LT_JF && tq <= OP_Q_LLL_NE_JF)) w[jp] = OP_Q_JUMP_JF;
-    }
-    free(jumps);
-}
-
-void prog_quicken(Program *pg) {
-    for (int i = 0; i < pg->nprotos; i++) proto_quicken(pg->protos[i]);
-}
-
 /* The step budget is handed to run_loop in chunks so that an asynchronous
  * sp_interrupt() is noticed without any per-instruction flag test. */
 enum { TICK_CHUNK = 1 << 20 };
@@ -529,87 +421,10 @@ static uint64_t tick_refill(VM *vm) {
     return chunk - 1;
 }
 
-/* Construction fast path. The compiler-generated constructor (SPEC 10.3) has a fixed shape; when every
- * field initialiser is a constant, `C(args)` can allocate the instance, store the initial slot values and
- * run `init` directly, without the constructor frame, the rest array and the spread call. The shape is
- * recognised from the bytecode (also after quickening), so program images need no extra information. */
-static int ctor_const(const uint8_t *c, uint32_t n, uint32_t *pc, const Proto *p, SpValue *out) {
-    if (*pc >= n) return 0;
-    switch (c[*pc]) {
-    case OP_CONST: { unsigned k = rd16(c + *pc + 1); if (k >= (unsigned)p->nconsts) return 0; *out = p->consts[k]; *pc += 3; return 1; }
-    case OP_SMALLINT: *out = v_int((int16_t)rd16(c + *pc + 1)); *pc += 3; return 1;
-    case OP_NIL: *out = v_nil(); *pc += 1; return 1;
-    case OP_TRUE: *out = v_bool(1); *pc += 1; return 1;
-    case OP_FALSE: *out = v_bool(0); *pc += 1; return 1;
-    default: return 0;
-    }
-}
-
-/* Recognise the constructor's shape. On success fills d[] (initial slot values), *has_init and *init. */
-static int ctor_shape(const SClass *cls, SpValue *d, int *any, SFunc **init) {
-    const Proto *p = cls->ctor->proto;
-    const uint8_t *c = p->code;
-    uint32_t n = p->code_len, pc = 7;
-    if (n < 11 || c[0] != OP_LOAD_MODULE || c[3] != OP_NEW_INSTANCE || c[4] != OP_STORE_LOCAL) return 0;
-    unsigned self = rd16(c + 5);
-    while (pc + 3 <= n && c[pc] == OP_LOAD_LOCAL && rd16(c + pc + 1) == self) {
-        uint32_t q = pc + 3;
-        SpValue v;
-        if (!ctor_const(c, n, &q, p, &v)) return 0;
-        if (q + 3 > n || c[q] != OP_SET_SLOT) return 0;
-        unsigned slot = rd16(c + q + 1);
-        if ((int)slot >= cls->nfields) return 0;
-        d[slot] = v;
-        *any = 1;
-        pc = q + 3;
-    }
-    *init = NULL;
-    if (pc + 3 <= n && c[pc] == OP_LOAD_MODULE) {
-        /* LOAD_MODULE ik; GET_MEMBER init; LOAD_LOCAL self; LOAD_LOCAL rest; CALL_SPREAD 1; POP */
-        if (pc + 15 > n || c[pc + 3] != OP_GET_MEMBER || c[pc + 6] != OP_LOAD_LOCAL || rd16(c + pc + 7) != self ||
-            c[pc + 9] != OP_LOAD_LOCAL || c[pc + 12] != OP_CALL_SPREAD || c[pc + 13] != 1 || c[pc + 14] != OP_POP)
-            return 0;
-        pc += 15;
-        const SString *key = NULL;
-        for (int k = 0; k < p->nconsts && !key; k++) {
-            const SpValue *cv = &p->consts[k];
-            if (cv->type == T_STRING && AS_STR(*cv)->len == 4 && memcmp(AS_STR(*cv)->data, "init", 4) == 0) key = AS_STR(*cv);
-        }
-        SpValue mv;
-        if (!key || !table_get_sstr(cls->methods, key, &mv) || mv.type != T_FUNCTION || AS_FUNC(mv)->nat) return 0;
-        *init = AS_FUNC(mv);
-    } else if (pc + 3 <= n && c[pc] == OP_CTOR_CHECK) {
-        pc += 3;
-    } else {
-        return 0;
-    }
-    /* LOAD_LOCAL self; RETURN (or its quickened form) */
-    if (pc + 4 > n) return 0;
-    return (c[pc] == OP_LOAD_LOCAL && rd16(c + pc + 1) == self && c[pc + 3] == OP_RETURN) ||
-           (c[pc] == OP_Q_RET_LOCAL && rd16(c + pc + 1) == self);
-}
-
-static void class_analyze(SClass *cls) {
-    cls->fast = 2;
-    if (!cls->ctor || cls->ctor->nat) return;
-    SpValue *d = NULL;
-    if (cls->nfields > 0) {
-        d = malloc((size_t)cls->nfields * sizeof *d);
-        if (!d) return;
-        for (int i = 0; i < cls->nfields; i++) d[i] = v_nil();
-    }
-    int any = 0;
-    SFunc *init = NULL;
-    if (ctor_shape(cls, d, &any, &init)) {
-        cls->init = init;
-        cls->dflt = any ? d : NULL;
-        if (!any) free(d);
-        cls->fast = 1;
-    } else {
-        free(d);
-    }
-}
-
+/* Execution-path recorder for TraceJIT. It records one actually executed iteration after a backward edge is
+ * observed, including bytecodes executed in callees, then passes supported traces to the verified SSA compiler.
+ * Unsupported paths are discarded and continue through the interpreter/region JIT unchanged. Keep storage off
+ * the normal path. */
 /* The dispatch loop holds no arrays or buffers (only scalars and one small struct), so the stack canary buys
  * nothing here and costs ~15% of interpreter speed; every other function keeps -fstack-protector-strong. */
 #if defined(__GNUC__) && !defined(__clang__) && __GNUC__ >= 11
@@ -623,6 +438,18 @@ static RunStatus run_loop(VM *vm) {
     SpValue *base = fr->base;
     Proto *proto = fr->fn->proto;
     uint64_t left = vm->ileft; /* remaining step budget (UINT64_MAX = unlimited) */
+    const char *trace_env = getenv("SPRINT_TRACE_RECORD");
+    const char *trace_jit_env = getenv("SPRINT_TRACE_JIT");
+    const int jit_enabled = vm->jit_on;
+    /* Keep trace recording off the normal JIT hot path unless explicitly requested. */
+    int trace_jit_enabled = jit_enabled && trace_jit_env && trace_jit_env[0] && trace_jit_env[0] != '0';
+    const int trace_record_enabled = trace_env && trace_env[0] && trace_env[0] != '0';
+    VMTraceCapture *trace_cap = NULL;
+    if ((trace_jit_enabled || trace_record_enabled) && vm->jit_on) {
+        trace_cap = vm_trace_capture_begin(trace_record_enabled);
+        if (!trace_cap && trace_record_enabled)
+            (void)fprintf(stderr, "trace-record: nesting limit reached; recorder disabled\n");
+    }
     /* Rarely used state lives in memory so the hot interpreter state (pc, sp,
      * base, left) can stay in registers. */
     struct Cold { int nargs, call_kind, defer_mode; SpValue call_uev, ev, defer_ev; } cold;
@@ -642,7 +469,7 @@ static RunStatus run_loop(VM *vm) {
 #define I32() (pc += 4, (int32_t)rd32(pc - 4))
 #define PUSH(v) (*sp++ = (v))
 #define SYNC() do { fr->pc = pc; vm->sp = sp; vm->ileft = left; } while (0)
-#define RET(x) do { vm->ileft = left; return (x); } while (0)
+#define RET(x) do { vm->ileft = left; if (trace_cap) vm_trace_capture_end(trace_cap); return (x); } while (0)
 #define GCP() do { if (vm->bytes >= vm->gc_next) { SYNC(); vm_gc(vm); } } while (0)
 #define RAISE() goto raise
 /* Step budget (SPEC 17.x): one tick per backward jump, call and defer run. */
@@ -650,10 +477,37 @@ static RunStatus run_loop(VM *vm) {
 /* Hot-loop JIT (src/runtime/jit.c): consulted at backward jumps once the proto is warm; HDR is the loop header. When
  * the loop runs compiled, control comes back here at the instruction where it left the region. */
 #define JIT_HOOK(HDR, JR) do { \
-        if (proto->jhot > 1) proto->jhot--; \
-        else { \
-            vm->ileft = left; \
-            if (jit_site(vm, proto, (HDR), base, sp)) { left = vm->ileft; sp = vm->sp; LOAD_FRAME(); JR = pc; } \
+        /* The interpreter-only configuration should pay one strongly predicted \
+         * not-taken branch at a backedge, not the recorder/cache bookkeeping. */ \
+        if (__builtin_expect(jit_enabled, 0)) { \
+            int trace_done_ = trace_cap ? vm_trace_capture_edge(trace_cap, proto, proto->code, (HDR), base, sp) : 0; \
+            int trace_ran_ = 0; \
+            if (trace_done_ && trace_jit_enabled && trace_cap && !trace_cap->overflow) { \
+                (void)jit_trace_compile(vm, proto, (uint32_t)((HDR) - proto->code), trace_cap->steps, \
+                                        trace_cap->count, trace_cap->stack_depth, \
+                                        trace_cap->is_side != 0U, trace_cap->parent_slot); \
+                vm_trace_capture_clear_side(trace_cap); \
+            } \
+            if (trace_jit_enabled && !((trace_cap) && (trace_cap)->active)) { \
+                vm->ileft = left; \
+                uint8_t trace_parent_slot_ = 0U; \
+                int trace_result_ = jit_trace_site(vm, proto, (HDR), base, sp, \
+                                                   trace_cap ? &trace_parent_slot_ : NULL); \
+                if (trace_result_ != 0) { \
+                    left = vm->ileft; sp = vm->sp; LOAD_FRAME(); \
+                    if (trace_result_ == 2 && trace_cap) \
+                        vm_trace_capture_start_side(trace_cap, proto, proto->code, pc, base, sp, trace_parent_slot_); \
+                    JR = pc; trace_ran_ = 1; \
+                } \
+            } \
+            /* Record one full iteration before falling back to the region JIT. */ \
+            if (!trace_ran_ && (!trace_cap || !trace_cap->active)) { \
+                if (proto->jhot > 1) proto->jhot--; \
+                else { \
+                    vm->ileft = left; \
+                    if (jit_site(vm, proto, (HDR), base, sp)) { left = vm->ileft; sp = vm->sp; LOAD_FRAME(); JR = pc; } \
+                } \
+            } \
         } \
     } while (0)
 
@@ -746,8 +600,14 @@ static RunStatus run_loop(VM *vm) {
         [OP_Q_LLL_EQ_JF] = &&L_OP_Q_LLL_EQ_JF,
         [OP_Q_LLL_NE_JF] = &&L_OP_Q_LLL_NE_JF,
         [OP_Q_RANGE_NEXT_ST] = &&L_OP_Q_RANGE_NEXT_ST,
-        [OP_Q_ACC_I] = &&L_OP_Q_ACC_I,
-        [OP_Q_ACC_IM] = &&L_OP_Q_ACC_I,
+        [OP_Q_ACC_I] = &&L_OP_Q_ACC_I_ADD,
+        [OP_Q_ACC_IM] = &&L_OP_Q_ACC_IM_ADD,
+        [OP_Q_ACC_I_MOD] = &&L_OP_Q_ACC_I_MOD,
+        [OP_Q_ACC_I_MUL] = &&L_OP_Q_ACC_I_MUL,
+        [OP_Q_ACC_I_SUB] = &&L_OP_Q_ACC_I_SUB,
+        [OP_Q_ACC_IM_MOD] = &&L_OP_Q_ACC_IM_MOD,
+        [OP_Q_ACC_IM_MUL] = &&L_OP_Q_ACC_IM_MUL,
+        [OP_Q_ACC_IM_SUB] = &&L_OP_Q_ACC_IM_SUB,
         [OP_Q_ACC_L] = &&L_OP_Q_ACC_L,
         [OP_Q_ACC_LM] = &&L_OP_Q_ACC_L,
         [OP_Q_LLI_MUL] = &&L_OP_Q_LLI_MUL,
@@ -755,7 +615,7 @@ static RunStatus run_loop(VM *vm) {
         [OP_Q_SI_SUB] = &&L_OP_Q_SI_ADD,
         [OP_Q_SI_MUL] = &&L_OP_Q_SI_ADD,
         [OP_Q_LLI_ADD_ST] = &&L_OP_Q_LLI_ADD_ST,
-        [OP_Q_LLI_SUB_ST] = &&L_OP_Q_LLI_ADD_ST,
+        [OP_Q_LLI_SUB_ST] = &&L_OP_Q_LLI_SUB_ST,
         [OP_Q_ADD_ST] = &&L_OP_Q_ADD_ST,
         [OP_Q_SUB_ST] = &&L_OP_Q_ADD_ST,
         [OP_Q_MUL_ST] = &&L_OP_Q_MUL_ST,
@@ -772,12 +632,24 @@ static RunStatus run_loop(VM *vm) {
         [OP_Q_IDX_L] = &&L_OP_Q_IDX_L,
         [OP_Q_SETIDX_LLL] = &&L_OP_Q_SETIDX_LLL,
         [OP_Q_SETIDX_LLB] = &&L_OP_Q_SETIDX_LLL,
-        [OP_Q_LL_IDX] = &&L_OP_Q_LL_IDX
+        [OP_Q_LL_IDX] = &&L_OP_Q_LL_IDX,
+        [OP_Q_INVOKE_STR_FIRST ... OP_Q_INVOKE_STR_LAST] = &&call_general
     };
 #pragma GCC diagnostic pop
-#define NEXT() do { ipc = pc; pc++; _Pragma("GCC diagnostic push") _Pragma("GCC diagnostic ignored \"-Wpedantic\"") goto *dtab[*ipc]; _Pragma("GCC diagnostic pop") } while (0)
+#define TRACE_STEP(IP) do { \
+        if (__builtin_expect(trace_cap && trace_cap->active, 0)) { \
+            if (trace_cap->count < VM_TRACE_RECORD_MAX) { \
+                TraceStep *ts = &trace_cap->steps[trace_cap->count++]; \
+                ts->proto = proto; \
+                ts->pc = (uint32_t)((IP) - proto->code); \
+                ts->op = *(IP); \
+            } else trace_cap->overflow = 1; \
+        } \
+    } while (0)
+#define NEXT() do { ipc = pc; TRACE_STEP(ipc); pc++; _Pragma("GCC diagnostic push") _Pragma("GCC diagnostic ignored \"-Wpedantic\"") goto *dtab[*ipc]; _Pragma("GCC diagnostic pop") } while (0)
     for (;;) {
         ipc = pc;
+        TRACE_STEP(ipc);
         switch (*pc++) {
         case OP_NOP: L_OP_NOP: NEXT();
         case OP_CONST: L_OP_CONST: PUSH(proto->consts[U16()]); NEXT();
@@ -1121,11 +993,19 @@ static RunStatus run_loop(VM *vm) {
             }
             goto call_general;
         }
+        case OP_Q_INVOKE_STR_SLICE: case OP_Q_INVOKE_STR_FIND: case OP_Q_INVOKE_STR_CONTAINS:
+        case OP_Q_INVOKE_STR_STARTS_WITH: case OP_Q_INVOKE_STR_ENDS_WITH: case OP_Q_INVOKE_STR_COUNT:
+        case OP_Q_INVOKE_STR_SPLIT: case OP_Q_INVOKE_STR_SPLIT_LINES: case OP_Q_INVOKE_STR_TRIM:
+        case OP_Q_INVOKE_STR_TRIM_START: case OP_Q_INVOKE_STR_TRIM_END: case OP_Q_INVOKE_STR_UPPER:
+        case OP_Q_INVOKE_STR_LOWER: case OP_Q_INVOKE_STR_REPLACE: case OP_Q_INVOKE_STR_REPEAT:
+        case OP_Q_INVOKE_STR_CHAR_COUNT: case OP_Q_INVOKE_STR_CHAR_AT: case OP_Q_INVOKE_STR_IS_BOUNDARY:
+        case OP_Q_INVOKE_STR_CODEPOINTS:
         case OP_CALL_SPREAD: case OP_INVOKE_SPREAD:
         case OP_INVOKE: call_general: {
             int op = pc[-1];
             SString *mname = NULL;
-            if (op == OP_INVOKE || op == OP_INVOKE_SPREAD) mname = AS_STR(proto->consts[U16()]);
+            int qstr_id = op >= OP_Q_INVOKE_STR_FIRST && op <= OP_Q_INVOKE_STR_LAST ? op - OP_Q_INVOKE_STR_FIRST : -1;
+            if (op == OP_INVOKE || op == OP_INVOKE_SPREAD || qstr_id >= 0) mname = AS_STR(proto->consts[U16()]);
             nargs = (int)U8();
             if (op == OP_CALL_SPREAD || op == OP_INVOKE_SPREAD) {
                 SpValue arr = sp[-1];
@@ -1143,6 +1023,17 @@ static RunStatus run_loop(VM *vm) {
             if (mname) {
                 SpValue *ov = sp - nargs - 1;
                 SpValue recv = *ov;
+                if (qstr_id >= 0 && recv.type == T_STRING) {
+                    SpValue ret = v_nil();
+                    GCP();
+                    SYNC();
+                    int nerr = lib_invoke_string_method_id(vm, recv, (unsigned)qstr_id, nargs + 1, ov, &ret);
+                    left = vm->ileft;
+                    if (nerr) RAISE();
+                    sp = ov;
+                    PUSH(ret);
+                    break;
+                }
                 if (recv.type == T_ARRAY && nargs == 1 && str_hash(mname) == vm->h_append && mname->len == 6 &&
                     memcmp(mname->data, "append", 6) == 0 && AS_ARRAY(recv)->len < AS_ARRAY(recv)->cap) {
                     /* array.append without growth: no allocation, no GC point */
@@ -1917,25 +1808,39 @@ static RunStatus run_loop(VM *vm) {
             pc = ipc + 10;
             NEXT();
         }
-        case OP_Q_ACC_I: case OP_Q_ACC_IM: L_OP_Q_ACC_I: {
-            SpValue *qd = ipc[0] == OP_Q_ACC_I ? &base[rd16(ipc + 12)] : &vm->slots[rd16(ipc + 12)];
-            SpValue qs = *qd, qx = base[rd16(ipc + 4)];
-            int64_t qk = (int16_t)(uint16_t)rd16(ipc + 7), qr, qt;
-            if (qs.type != T_INT || qx.type != T_INT) goto q_deopt;
-            switch (ipc[9]) {
-            case OP_MOD:
-                if (qk <= 0) goto q_deopt;
-                if (qx.as.i >= 0 && (qk & (qk - 1)) == 0) qr = qx.as.i & (qk - 1);
-                else if ((((uint64_t)qx.as.i | (uint64_t)qk) >> 32) == 0) qr = (int64_t)((uint32_t)qx.as.i % (uint32_t)qk);
-                else { qr = qx.as.i % qk; if (qr < 0) qr += qk; }
-                break;
-            case OP_MUL: if (mul_ovf(qx.as.i, qk, &qr)) goto q_deopt; break;
-            case OP_ADD: if (add_ovf(qx.as.i, qk, &qr)) goto q_deopt; break;
-            default: if (sub_ovf(qx.as.i, qk, &qr)) goto q_deopt; break;
-            }
-            if (add_ovf(qs.as.i, qr, &qt)) goto q_deopt;
-            *qd = v_int(qt); pc = ipc + 14; NEXT();
-        }
+#define Q_ACCUMULATE(DEST, ARITH) do { \
+            SpValue *qd_ = (DEST); \
+            SpValue qs_ = *qd_, qx_ = base[rd16(ipc + 4)]; \
+            int64_t qk_ = (int16_t)(uint16_t)rd16(ipc + 7), qr_, qt_; \
+            if (qs_.type != T_INT || qx_.type != T_INT) goto q_deopt; \
+            if ((ARITH) == OP_MOD) { \
+                if (qk_ <= 0) goto q_deopt; \
+                if (qx_.as.i >= 0 && (qk_ & (qk_ - 1)) == 0) qr_ = qx_.as.i & (qk_ - 1); \
+                else if ((((uint64_t)qx_.as.i | (uint64_t)qk_) >> 32) == 0) qr_ = (int64_t)((uint32_t)qx_.as.i % (uint32_t)qk_); \
+                else { qr_ = qx_.as.i % qk_; if (qr_ < 0) qr_ += qk_; } \
+            } else if ((ARITH) == OP_MUL) { if (mul_ovf(qx_.as.i, qk_, &qr_)) goto q_deopt; } \
+            else if ((ARITH) == OP_ADD) { if (add_ovf(qx_.as.i, qk_, &qr_)) goto q_deopt; } \
+            else { if (sub_ovf(qx_.as.i, qk_, &qr_)) goto q_deopt; } \
+            if (add_ovf(qs_.as.i, qr_, &qt_)) goto q_deopt; \
+            *qd_ = v_int(qt_); pc = ipc + 14; NEXT(); \
+        } while (0)
+        case OP_Q_ACC_I: L_OP_Q_ACC_I_ADD:
+            Q_ACCUMULATE(&base[rd16(ipc + 12)], OP_ADD);
+        case OP_Q_ACC_IM: L_OP_Q_ACC_IM_ADD:
+            Q_ACCUMULATE(&vm->slots[rd16(ipc + 12)], OP_ADD);
+        case OP_Q_ACC_I_MOD: L_OP_Q_ACC_I_MOD:
+            Q_ACCUMULATE(&base[rd16(ipc + 12)], OP_MOD);
+        case OP_Q_ACC_I_MUL: L_OP_Q_ACC_I_MUL:
+            Q_ACCUMULATE(&base[rd16(ipc + 12)], OP_MUL);
+        case OP_Q_ACC_I_SUB: L_OP_Q_ACC_I_SUB:
+            Q_ACCUMULATE(&base[rd16(ipc + 12)], OP_SUB);
+        case OP_Q_ACC_IM_MOD: L_OP_Q_ACC_IM_MOD:
+            Q_ACCUMULATE(&vm->slots[rd16(ipc + 12)], OP_MOD);
+        case OP_Q_ACC_IM_MUL: L_OP_Q_ACC_IM_MUL:
+            Q_ACCUMULATE(&vm->slots[rd16(ipc + 12)], OP_MUL);
+        case OP_Q_ACC_IM_SUB: L_OP_Q_ACC_IM_SUB:
+            Q_ACCUMULATE(&vm->slots[rd16(ipc + 12)], OP_SUB);
+#undef Q_ACCUMULATE
         case OP_Q_ACC_L: case OP_Q_ACC_LM: L_OP_Q_ACC_L: {
             SpValue *qd = ipc[0] == OP_Q_ACC_L ? &base[rd16(ipc + 8)] : &vm->slots[rd16(ipc + 8)];
             SpValue qs = *qd, qx = base[rd16(ipc + 4)];
@@ -1962,10 +1867,16 @@ static RunStatus run_loop(VM *vm) {
             if (ovf) goto q_deopt;
             sp[-1] = v_int(qr); pc = ipc + 4; NEXT();
         }
-        case OP_Q_LLI_ADD_ST: case OP_Q_LLI_SUB_ST: L_OP_Q_LLI_ADD_ST: {
+        case OP_Q_LLI_ADD_ST: L_OP_Q_LLI_ADD_ST: {
             SpValue qx = base[rd16(ipc + 1)];
             int64_t qk = (int16_t)(uint16_t)rd16(ipc + 4), qr;
-            if (qx.type != T_INT || (ipc[0] == OP_Q_LLI_ADD_ST ? add_ovf(qx.as.i, qk, &qr) : sub_ovf(qx.as.i, qk, &qr))) goto q_deopt;
+            if (qx.type != T_INT || add_ovf(qx.as.i, qk, &qr)) goto q_deopt;
+            base[rd16(ipc + 8)] = v_int(qr); pc = ipc + 10; NEXT();
+        }
+        case OP_Q_LLI_SUB_ST: L_OP_Q_LLI_SUB_ST: {
+            SpValue qx = base[rd16(ipc + 1)];
+            int64_t qk = (int16_t)(uint16_t)rd16(ipc + 4), qr;
+            if (qx.type != T_INT || sub_ovf(qx.as.i, qk, &qr)) goto q_deopt;
             base[rd16(ipc + 8)] = v_int(qr); pc = ipc + 10; NEXT();
         }
         case OP_Q_ADD_ST: case OP_Q_SUB_ST: L_OP_Q_ADD_ST: {
@@ -2084,8 +1995,13 @@ static RunStatus run_loop(VM *vm) {
             if (qa.type == T_ARRAY && qb.type == T_INT) {
                 SArray *arr = AS_ARRAY(qa);
                 if (qb.as.i >= 0 && qb.as.i < arr->len) {
-                    if (ipc[0] == OP_Q_SETIDX_LLL) { arr->items[qb.as.i] = base[rd16(ipc + 7)]; pc = ipc + 10; }
-                    else { arr->items[qb.as.i] = v_bool(ipc[7] == OP_TRUE); pc = ipc + 8; }
+                    if (ipc[0] == OP_Q_SETIDX_LLL) {
+                        arr->items[qb.as.i] = base[rd16(ipc + 7)];
+                        pc = ipc + 10;
+                    } else {
+                        arr->items[qb.as.i] = v_bool(ipc[6] == OP_TRUE);
+                        pc = ipc + 8;
+                    }
                     break;
                 }
             }
@@ -2113,16 +2029,16 @@ static RunStatus run_loop(VM *vm) {
             case OP_Q_ADD_ST: case OP_Q_ADD_STM: goto q_add;
             case OP_Q_SUB_ST: case OP_Q_SUB_STM: goto q_sub;
             case OP_Q_MUL_ST: goto q_mul;
-            case OP_Q_ACC_IM: case OP_Q_ACC_LM: goto q_load_module;
+            case OP_Q_ACC_IM: case OP_Q_ACC_LM:
+            case OP_Q_ACC_IM_MOD: case OP_Q_ACC_IM_MUL: case OP_Q_ACC_IM_SUB: goto q_load_module;
+            case OP_Q_ACC_I_MOD: case OP_Q_ACC_I_MUL: case OP_Q_ACC_I_SUB: goto q_load_local;
             case OP_Q_UP_INC: case OP_Q_RET_UP: goto q_load_upval;
             default: goto q_load_local;
             }
 
         /* every byte value has a case, so the compiler needs no range check before the jump table */
-        case 0xCB: case 0xCC: case 0xCD: case 0xCE: case 0xCF: case 0xD0: case 0xD1: case 0xD2:
-        case 0xD3: case 0xD4: case 0xD5: case 0xD6: case 0xD7: case 0xD8: case 0xD9: case 0xDA:
-        case 0xDB: case 0xDC: case 0xDD: case 0xDE: case 0xDF: case 0xE0: case 0xE1: case 0xE2:
-        case 0xE3: case 0xE4: case 0xE5: case 0xE6: case 0xE7: case 0xE8: case 0xE9: case 0xEA:
+        case 0xDE: case 0xDF: case 0xE6:
+        case 0xE7: case 0xE8: case 0xE9: case 0xEA:
         case 0xEB: case 0xEC: case 0xED: case 0xEE: case 0xEF: case 0xF0: case 0xF1: case 0xF2:
         case 0xF3: case 0xF4: case 0xF5: case 0xF6: case 0xF7: case 0xF8: case 0xF9: case 0xFA:
         case 0xFB: case 0xFC: case 0xFD: case 0xFE: case 0xFF:
@@ -2142,9 +2058,9 @@ static RunStatus run_loop(VM *vm) {
         TICK();
         if (sp[-nargs - 1].type == T_CLASS) {
             SClass *cc = AS_CLASS(sp[-nargs - 1]);
-            if (cc->fast == 0) class_analyze(cc);
+            if (cc->fast == 0) vm_class_analyze(cc);
             if (cc->fast == 1 && call_kind == FK_NORMAL) {
-                /* construction fast path (see class_analyze) */
+                /* construction fast path (see vm_class_analyze) */
                 GCP();
                 SInstance *ci = vm_new_instance(vm, cc);
                 if (cc->dflt)
@@ -2538,6 +2454,7 @@ static RunStatus run_module(VM *vm, Program *prog, int mi) {
 }
 
 RunStatus vm_run_program(VM *vm, Program *prog, int argc, char **argv) {
+    unsigned trace_depth_base = vm_trace_capture_mark();
     vm->prog = prog;
     vm->prog_argc = argc;
     vm->prog_argv = argv;
@@ -2559,6 +2476,7 @@ RunStatus vm_run_program(VM *vm, Program *prog, int argc, char **argv) {
         vm->result = vm->fatal_status;
     }
     vm->fatal_armed = 0;
+    vm_trace_capture_restore(trace_depth_base); /* discard recorder frames skipped by a fatal longjmp */
     vm_out_flush(vm);
     return (RunStatus)vm->result;
 }
@@ -2566,6 +2484,7 @@ RunStatus vm_run_program(VM *vm, Program *prog, int argc, char **argv) {
 /* REPL: the program grows between calls. Module slots and links are extended in place
  * (values already stored keep their indices) and only the new modules are run. */
 RunStatus vm_run_chunk(VM *vm, Program *prog) {
+    unsigned trace_depth_base = vm_trace_capture_mark();
     vm->prog = prog;
     if (prog->nslots > vm->slots_have || !vm->slots) {
         SpValue *ns = realloc(vm->slots, sizeof(SpValue) * (size_t)(prog->nslots ? prog->nslots : 1));
@@ -2583,7 +2502,7 @@ RunStatus vm_run_chunk(VM *vm, Program *prog) {
         vm->links_have = prog->nlinks;
     }
     if (!vm->no_quicken)
-        for (int i = vm->protos_quick; i < prog->nprotos; i++) proto_quicken(prog->protos[i]);
+        for (int i = vm->protos_quick; i < prog->nprotos; i++) vm_proto_quicken(prog->protos[i]);
     vm->protos_quick = prog->nprotos;
     vm->ibank = prog_limit_left(vm);
     vm->ileft = 0;
@@ -2600,6 +2519,7 @@ RunStatus vm_run_chunk(VM *vm, Program *prog) {
     }
     vm->mods_run = prog->nmods;
     vm->fatal_armed = 0;
+    vm_trace_capture_restore(trace_depth_base); /* discard recorder frames skipped by a fatal longjmp */
     vm_out_flush(vm);
     return (RunStatus)vm->result;
 }

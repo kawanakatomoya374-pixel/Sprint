@@ -1,0 +1,7 @@
+let a = 1
+let b = 0123
+let c = 1__0
+let d = "\q"
+let e = 5 $ 2
+let f = 2
+print(a + f)

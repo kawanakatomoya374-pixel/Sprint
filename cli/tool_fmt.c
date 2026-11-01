@@ -54,6 +54,8 @@ int lex_guarded(Front *F, const char *src, size_t len, TokenList *tl) {
         lex_source(F, src, len, tl);
         return 0;
     }
+    toklist_free(tl);                 /* the tokens produced before the error are not wanted */
+    memset(tl, 0, sizeof *tl);
     return 1;
 }
 

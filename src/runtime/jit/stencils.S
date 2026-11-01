@@ -658,11 +658,11 @@ ST stupki                       # upvalue (byte offset H1) of the closure in slo
 ST jmp
     jmp JIT_T
 
-ST tick                         # back edge: H0 = offsetof(VM, ileft); out of ticks -> exit, else count one
-    cmpq $0,H0(%rbx)
-    je JIT_X
-    decq H0(%rbx)
-    jmp JIT_T
+ST tick                         # back edge: subtract first; carry means the budget was already zero
+    subq $1,H0(%rbx)
+    jnc JIT_T
+    movq $0,H0(%rbx)            # keep the interpreter-visible exhausted value at zero
+    jmp JIT_X
 
 # ---- guards ----------------------------------------------------------------------------------------------
 ST gtag                         # frame slot H0 must have type word H1
@@ -684,6 +684,10 @@ ST gimm                         # int payload of frame slot H0 must be H1 (a reg
 ST gtag_mod                     # module variable at byte offset H0 must have type word H1
     cmpq $H1,H0(%r14)
     jne JIT_X
+
+ST gnonneg                      # int slot H0 must be non-negative
+    cmpq $0,H0+8(%r12)
+    js JIT_X
 
 ST gnz                          # int slot H0 must be non-zero
     cmpq $0,H0+8(%r12)
@@ -801,6 +805,23 @@ IMOD_TAIL
 
 # x % c and x // c for a constant divisor c > 0 that is not a power of two: multiply by the reciprocal (Hacker's
 # Delight, unsigned round-up method). H1 = x slot, H2 = c, H3 = shift, HQ = magic. Negative x takes an idiv path.
+# x % c where the compiler has proved x >= 0 and x is held in the pinned rbp register.
+# H2 = c, H3 = shift, HQ = unsigned reciprocal. No sign test, fallback divide, or frame-slot load.
+ST imod_m_np
+    mov %rbp,%r8
+    movabs $HQ,%rax
+    mul %r8
+    mov %r8,%rax
+    sub %rdx,%rax
+    shr $1,%rax
+    add %rdx,%rax
+    mov $H3,%ecx
+    shr %cl,%rax
+    imul $H2,%rax,%rax
+    sub %rax,%r8
+    movq $T_INT,H0(%r12)
+    mov %r8,H0+8(%r12)
+
 ST imod_m
     mov H1+8(%r12),%rax
     mov %rax,%r8
@@ -1145,6 +1166,48 @@ ST range_dn                     # step < 0
     mov %rcx,%rax
 4:  mov %rax,H1+8(%r12)
 
+# Unit steps cannot overflow: current < stop implies current < INT64_MAX (and vice versa for -1).
+# The _p forms update the rbp mirror of the yielded loop variable directly and rely on its entry type guard.
+ST range_up1
+    mov H1+8(%r12),%rax
+    mov H1+24(%r12),%rcx
+    cmp %rcx,%rax
+    jge JIT_T
+    movq $T_INT,H0(%r12)
+    mov %rax,H0+8(%r12)
+    inc %rax
+    mov %rax,H1+8(%r12)
+
+ST range_dn1
+    mov H1+8(%r12),%rax
+    mov H1+24(%r12),%rcx
+    cmp %rcx,%rax
+    jle JIT_T
+    movq $T_INT,H0(%r12)
+    mov %rax,H0+8(%r12)
+    dec %rax
+    mov %rax,H1+8(%r12)
+
+ST range_up1_p
+    mov H1+8(%r12),%rax
+    mov H1+24(%r12),%rcx
+    cmp %rcx,%rax
+    jge JIT_T
+    mov %rax,H0+8(%r12)
+    mov %rax,%rbp
+    inc %rax
+    mov %rax,H1+8(%r12)
+
+ST range_dn1_p
+    mov H1+8(%r12),%rax
+    mov H1+24(%r12),%rcx
+    cmp %rcx,%rax
+    jle JIT_T
+    mov %rax,H0+8(%r12)
+    mov %rax,%rbp
+    dec %rax
+    mov %rax,H1+8(%r12)
+
 # ---- arrays: H3 = offsetof(SArray, len), H4 = offsetof(SArray, items) --------------------------------------
 ST getidx_rr                    # slot H0 <- array(H1)[int(H2)]; out of range -> interpreter (raises)
     mov H1+8(%r12),%rax
@@ -1203,9 +1266,11 @@ ST alen                         # slot H0 <- len(array(H1))
 
 # one step of budget for an inlined call (the interpreter ticks once per call)
 ST tick1                        # H0 = offsetof(VM, ileft)
-    cmpq $0,H0(%rbx)
-    je JIT_X
-    decq H0(%rbx)
+    subq $1,H0(%rbx)
+    jnc 1f
+    movq $0,H0(%rbx)
+    jmp JIT_X
+1:
 
 # slot H0 must NOT have type word H1 (e.g. an uninitialised module variable)
 ST gntag
@@ -1385,5 +1450,151 @@ ST tnext
     jz JIT_X
     jmp JIT_T
 1:
+
+
+# ---- TraceJIT Copy-and-Patch atoms ---------------------------------------------------------------
+# TraceIR uses the same stencil table as the regular JIT. HB0..HB5 are byte-sized patch holes,
+# H0..H5 are 32-bit holes, HQ is a 64-bit hole, and JIT_T is a trace-local rel32 label.
+# The trace backend supplies the ABI prologue/epilogue once and patches the per-op atoms below.
+
+ST tr_prologue
+    endbr64
+    push %rbp
+    mov %rsp,%rbp
+    push %rbx
+    push %r12
+    push %r13
+    push %r14
+    push %r15
+    sub $16,%rsp
+    mov %rdi,%r12
+    mov %rsi,%r13
+
+ST tr_epilogue
+    add $16,%rsp
+    pop %r15
+    pop %r14
+    pop %r13
+    pop %r12
+    pop %rbx
+    pop %rbp
+    ret
+
+ST tr_local_guard
+    cmpb $HB0,H0(%r12)
+    jne JIT_T
+
+ST tr_local_load
+    .byte HB0, 0x8b, HB1, 0x24
+    .long H0
+
+ST tr_local_store
+    .byte HB0, 0x89, HB1, 0x24
+    .long H0
+
+ST tr_reg_mov
+    .byte HB0, 0x89, HB1
+
+ST tr_reg_imm
+    .byte HB0, HB1
+    .quad HQ
+
+ST tr_reg_binop
+    .byte HB0, HB1, HB2
+
+ST tr_reg_imul
+    .byte HB0, 0x0f, 0xaf, HB1
+
+ST tr_reg_neg
+    .byte HB0, 0xf7, HB1
+
+ST tr_reg_cmp
+    .byte HB0, 0x39, HB1
+
+ST tr_reg_setcc
+    .byte HB0, 0x0f, HB1, HB2
+    .byte HB3, 0x0f, 0xb6, HB4
+
+ST tr_reg_test
+    .byte HB0, 0x85, HB1
+
+ST tr_gpr_to_xmm
+    .byte 0x66, HB0, 0x0f, 0x6e, HB1
+
+ST tr_xmm_to_gpr
+    .byte 0x66, HB0, 0x0f, 0x7e, HB1
+
+ST tr_f64_binop
+    .byte 0xf2, 0x0f, HB0, 0xc1
+
+ST tr_f64_cmp
+    .byte 0x66, 0x0f, 0x2e, 0xc1
+
+ST tr_jcc
+    .byte 0x0f, HB0
+    .long JIT_T - . - 4
+
+ST tr_jmp
+    jmp JIT_T
+
+ST tr_return
+    mov $H0,%eax
+    jmp JIT_T
+
+# Update per-trace LRU timestamp. HQ points at TraceRuntimeCells.
+ST tr_touch
+    movabs $HQ,%r10
+    mov 16(%r10),%r11
+    lock incq (%r11)
+    mov (%r11),%r11
+    xchg %r11,8(%r10)
+
+# Trace exit with an optional native tail link.  The link target has the same
+# TraceEntry ABI; unwind this trace frame before entering it so linked traces
+# do not grow the C/native stack.  A null link returns the ordinary exit PC.
+ST tr_exit
+    movabs $HQ,%r10
+    mov 16(%r10),%r11
+    lock incq (%r11)
+    mov (%r11),%r11
+    xchg %r11,8(%r10)
+    mov (%r10),%r10
+    test %r10,%r10
+    jz 1f
+    mov %r12,%rdi
+    mov %r13,%rsi
+    add $16,%rsp
+    pop %r15
+    pop %r14
+    pop %r13
+    pop %r12
+    pop %rbx
+    pop %rbp
+    jmp *%r10
+1:
+    mov $H0,%eax
+    jmp JIT_T
+
+ST tr_dec_r11
+    dec %r11
+
+ST tr_fdiv_guard
+    pxor %xmm0,%xmm0
+    ucomisd %xmm0,%xmm1
+    jp 1f
+    je JIT_T
+1:
+
+ST tr_fcmp_ne_guard
+    jp 1f
+    je JIT_T
+1:
+
+
+ST tr_load_budget
+    mov 0(%r13),%r11
+
+ST tr_store_budget
+    mov %r11,0(%r13)
 
 .section .note.GNU-stack,"",@progbits

@@ -6,20 +6,61 @@ static void mark_val(VM *vm, SpValue v);
 /* ---------------------------------------------------------------- */
 /* GC: precise, non-moving mark & sweep (no C recursion)            */
 /* ---------------------------------------------------------------- */
-static void gray_push(VM *vm, Obj *o) {
-    if (vm->ngray == vm->capgray) {
-        vm->capgray = vm->capgray ? vm->capgray * 2 : 1024;
-        vm->gray = realloc(vm->gray, vm->capgray * sizeof(Obj *));
-        if (!vm->gray) { fputs("out of memory during GC\n", stderr); exit(14); }
+/* Stack growth is deliberately outlined: it is a cold path and must not
+ * inflate the per-object mark routine. */
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((noinline, cold))
+#endif
+static int gray_grow(VM *vm) {
+    size_t next;
+    if (vm->gc_gray_overflow) return 0;
+    if (vm->gc_mark_limit != 0U && vm->capgray >= vm->gc_mark_limit) {
+        vm->gc_gray_overflow = 1;
+        return 0;
     }
+    next = vm->capgray ? vm->capgray * 2U : 1024U;
+    if (next < vm->capgray || next > SIZE_MAX / sizeof *vm->gray) {
+        vm->gc_gray_overflow = 1;
+        return 0;
+    }
+    if (vm->gc_mark_limit != 0U && next > vm->gc_mark_limit) next = vm->gc_mark_limit;
+    if (next <= vm->ngray) {
+        vm->gc_gray_overflow = 1;
+        return 0;
+    }
+    Obj **grown = (Obj **)realloc(vm->gray, next * sizeof *grown);
+    if (grown == NULL) {
+        vm->gc_gray_overflow = 1;
+        return 0;
+    }
+    vm->gray = grown;
+    vm->capgray = next;
+    return 1;
+}
+
+static void gray_push(VM *vm, Obj *o) {
+    if (vm->ngray == vm->capgray && !gray_grow(vm)) return;
     vm->gray[vm->ngray++] = o;
 }
 
-static void mark_obj(VM *vm, Obj *o) {
-    if (!o || o->marked) return;
-    o->marked = 1;
-    if (o->type == T_STRING) return;
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((noinline))
+#endif
+static void mark_obj_new(VM *vm, Obj *o) {
+    if (o->type == T_STRING) {
+        o->marked = 2U; /* strings have no outgoing references */
+        return;
+    }
+    o->marked = 1U; /* gray: queued, or discoverable by the fallback heap scan */
     gray_push(vm, o);
+}
+
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((always_inline))
+#endif
+static inline void mark_obj(VM *vm, Obj *o) {
+    if (o == NULL || o->marked != 0U) return;
+    mark_obj_new(vm, o);
 }
 
 
@@ -153,7 +194,8 @@ static void free_obj(VM *vm, Obj *o) {
 
 void vm_gc(VM *vm) {
     vm->gc_runs++;
-    vm->ngray = 0;
+    vm->ngray = 0U;
+    vm->gc_gray_overflow = 0;
     memset(vm->ic, 0, sizeof vm->ic);
     memset(vm->mc, 0, sizeof vm->mc);
     {
@@ -180,7 +222,33 @@ void vm_gc(VM *vm) {
     mark_val(vm, vm->pend_obj);
     mark_val(vm, vm->uncaught);
     for (int i = 0; i < 17; i++) mark_obj(vm, (Obj *)vm->type_names[i]);
-    while (vm->ngray) blacken(vm, vm->gray[--vm->ngray]);
+    for (;;) {
+        while (vm->ngray != 0U) {
+            Obj *o = vm->gray[--vm->ngray];
+            /* The discovery bit prevents duplicate pushes; the normal fast
+             * path needs no second per-object mark-state store. */
+            blacken(vm, o);
+        }
+        if (!vm->gc_gray_overflow) break;
+        /* The mark stack may be capped or realloc may fail. Every discovered
+         * object is still gray. Re-scan the heap, blackening gray objects and
+         * repeating until newly reached objects have also been visited. */
+        vm->ngray = vm->capgray; /* make every attempted enqueue take the cold full-stack path */
+        for (;;) {
+            size_t found = 0U;
+            for (Obj *o = vm->objs; o != NULL; o = o->next) {
+                if (o->marked == 1U) {
+                    o->marked = 2U;
+                    blacken(vm, o);
+                    found++;
+                }
+            }
+            if (found == 0U) break;
+        }
+        vm->ngray = 0U;
+        vm->gc_gray_overflow = 0;
+        break;
+    }
 
     Obj **pp = &vm->objs;
     while (*pp) {
@@ -206,10 +274,13 @@ void vm_gc(VM *vm) {
         }
     }
     size_t live = vm->bytes;
-    vm->gc_next = live * 2 < (size_t)1 << 20 ? (size_t)1 << 20 : live * 2;
-    if (vm->gc_next > vm->lim.max_heap_bytes) vm->gc_next = vm->lim.max_heap_bytes;
-    if (vm->gc_next < live + 4096) vm->gc_next = live + 4096;
-    if (vm->gc_stress) vm->gc_next = live + 1;   /* SPRINT_GC_STRESS=1: collect at every allocation point */
+    size_t next = live > SIZE_MAX / 3U ? SIZE_MAX : live * 3U;
+    if (next < ((size_t)1U << 20U)) next = (size_t)1U << 20U;
+    if (vm->lim.max_heap_bytes != 0U && next > vm->lim.max_heap_bytes)
+        next = vm->lim.max_heap_bytes;
+    if (next < live) next = live;
+    if (vm->gc_stress) next = live == SIZE_MAX ? SIZE_MAX : live + 1U;
+    vm->gc_next = next;
 }
 
 void vm_free(VM *vm) {

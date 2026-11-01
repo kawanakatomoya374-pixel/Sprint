@@ -14,11 +14,23 @@
  * a hot threshold of 1 to check that. Regions contain no calls, allocation or GC points. */
 #define _GNU_SOURCE
 #include "../sp.h"
+#include "trace_ir.h"
+#include "jit/internal.h"
 
 #if !SP_JIT
 
 int jit_site(VM *vm, Proto *p, const uint8_t *hdr, SpValue *base, SpValue *sp) {
     (void)vm; (void)p; (void)hdr; (void)base; (void)sp;
+    return 0;
+}
+int jit_trace_compile(VM *vm, Proto *p, uint32_t header, const TraceStep *steps, unsigned count,
+                      uint32_t stack_depth, int is_side, uint8_t parent_slot) {
+    (void)vm; (void)p; (void)header; (void)steps; (void)count; (void)stack_depth; (void)is_side; (void)parent_slot;
+    return 0;
+}
+int jit_trace_site(VM *vm, Proto *p, const uint8_t *hdr, SpValue *base, SpValue *sp,
+                   uint8_t *side_parent_slot_out) {
+    (void)vm; (void)p; (void)hdr; (void)base; (void)sp; (void)side_parent_slot_out;
     return 0;
 }
 JitUnit *jit_call_hot(VM *vm, SFunc *fn, SpValue *base) {
@@ -66,6 +78,13 @@ enum { EK_MEM = 0, EK_LOC, EK_K, EK_MOD, EK_REG };   /* EK_REG: a typed value he
 enum { MAXMV = 24, MAXEXTRA = 256, MAXFIX = 1 << 16 };
 enum { JS_NEW = 0, JS_OK, JS_FAIL };
 
+/* Shared physical-register allocator used by the bytecode and trace JITs.
+ * The tiers retain different lifetime policies (online stack spilling versus
+ * trace live intervals), but all register ownership, selection and release
+ * now passes through this bank abstraction. */
+static const uint8_t JIT_REGION_GPR_POOL[6] = {6U, 7U, 8U, 9U, 10U, 11U};
+static const uint8_t JIT_REGION_XMM_POOL[7] = {1U, 2U, 3U, 4U, 5U, 6U, 7U};
+
 typedef struct { uint32_t pc; int depth; int ictx; } JExit;   /* ictx: 0, or 1 + the inlined call the exit lies in */
 typedef struct { Proto *proto; uint32_t retpc; int base_slots; int ctor; int parent; } JIctx;   /* an inlined callee: resume pc of the caller, callee base in slots */
 typedef struct JRegion {
@@ -90,11 +109,34 @@ typedef struct JRegion {
     JitUnit u;
     Proto *proto;
 } JRegion;
-struct JitProto {
-    JRegion **r;
-    int n, cap, nok;
-    JRegion *unit;
-};
+
+/* One W^X publication path for both JIT tiers.  Generated code is writable
+ * only while being copied, then instruction-cache synchronized and made RX. */
+void *jit_code_publish(const void *bytes, size_t length, size_t *mapped_size) {
+    long page_size_long;
+    size_t page_size, size;
+    void *mem;
+    if (!bytes || length == 0U || !mapped_size) return NULL;
+    page_size_long = sysconf(_SC_PAGESIZE);
+    if (page_size_long <= 0) page_size_long = 4096;
+    page_size = (size_t)page_size_long;
+    if (page_size == 0U || length > SIZE_MAX - (page_size - 1U)) return NULL;
+    size = ((length + page_size - 1U) / page_size) * page_size;
+    mem = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (mem == MAP_FAILED) return NULL;
+    memcpy(mem, bytes, length);
+    __builtin___clear_cache((char *)mem, (char *)mem + length);
+    if (mprotect(mem, size, PROT_READ | PROT_EXEC) != 0) {
+        (void)munmap(mem, size);
+        return NULL;
+    }
+    *mapped_size = size;
+    return mem;
+}
+
+void jit_code_unmap(void *mem, size_t mapped_size) {
+    if (mem && mapped_size != 0U) (void)munmap(mem, mapped_size);
+}
 
 /* allocation for compiled code: the collection the interpreter would run before NEW_INSTANCE, then the instance with
  * its default slot values (vm->sp has been set to the top of the live stack) */
@@ -107,6 +149,8 @@ static void *jit_new_inst(VM *vm, SClass *k) {
 }
 
 static SpValue g_hint_int;   /* "probably an int": the guess for the result of a call */
+static SpValue g_hint_string; /* a result known to be a string; every use still has a run-time type guard */
+static int g_jit_stats;       /* opt-in compiler-shape diagnostics; zero-cost when disabled */
 
 void jit_configure(VM *vm) {
     vm->jit_on = 1;
@@ -118,7 +162,10 @@ void jit_configure(VM *vm) {
     if (e && atoi(e) > 0) vm->jit_thresh = atoi(e);
     e = getenv("SPRINT_JIT_DEBUG");
     if (e && e[0] >= '1') vm->jit_dbg = e[0] - '0';
+    e = getenv("SPRINT_JIT_STATS");
+    g_jit_stats = e && e[0] && e[0] != '0';
     g_hint_int = v_int(0);
+    g_hint_string = v_obj(T_STRING, NULL);
     vm->jit_cur = NULL;
     vm->jit_rsp = NULL;
     vm->jit_fmax = 0;
@@ -127,7 +174,7 @@ void jit_configure(VM *vm) {
 
 static void region_free(JRegion *r) {
     if (!r) return;
-    if (r->mem) munmap(r->mem, r->msize);
+    jit_code_unmap(r->mem, r->msize);
     free(r->kt);
     free(r->exits);
     free(r->ictx);
@@ -149,6 +196,7 @@ void jit_free_proto(Proto *p) {
     if (!jp) return;
     for (int i = 0; i < jp->n; i++) region_free(jp->r[i]);
     region_free(jp->unit);
+    jit_trace_free_all(jp);
     free(jp->r);
     free(jp);
     p->jit = NULL;
@@ -177,6 +225,7 @@ typedef struct {
     uint8_t *ldep;                       /* per-leader stack depth above d0 (0xff: not yet known); the values are in memory at a join */
     int *lmap, nl;                       /* pc - hdr -> leader index or -1 */
     uint8_t *isins;                      /* pc - hdr -> instruction start */
+    uint8_t *rnext_unit;                 /* per RANGE_NEXT: proved constant positive unit step during this walk */
     Ent *st;
     int dep, stcap;
     uint8_t *cb;
@@ -197,11 +246,12 @@ typedef struct {
     int tk, tt, xe;                      /* branch / guard target for the next stencil */
     int pin;                             /* local mirrored in rbp (payload word; memory stays authoritative), or -1 */
     int pin_fuse;                        /* fuse_store may write straight into the pinned local (only int arithmetic syncs rbp) */
+    int pin_nonneg;                      /* pinned local is non-negative throughout this region (entry-guarded positive unit range) */
     int reg_on;                          /* register temporaries enabled (SPRINT_JIT_REGS=0 turns them off) */
     struct { int k, reg, x, up, ty; } lc[8];     /* locals whose payload is also held in a register (memory stays authoritative: write-through) */
     int nlc;
     uint8_t *lrd;                        /* reads of each local in the region (hot ones are worth a register) */
-    int rb, xb;                          /* machine registers holding EK_REG entries (bit masks: GPR number / xmm number) */
+    JitRegBank gpr_bank, xmm_bank;       /* shared physical-register banks for GPR and XMM classes */
     int32_t xmm_off;                     /* frame offset whose float payload xmm0 holds right now (-1: none) */
     int skipx;                           /* the next stencil may drop its leading "movsd H1+8(%r12),%xmm0" */
     int32_t rax_off;                     /* frame offset whose int payload rax holds right now (-1: none) */
@@ -209,6 +259,9 @@ typedef struct {
     int32_t h5;                          /* sixth hole of the next stencil (consumed by em) */
     uint64_t hq2;                        /* second 64-bit hole of the next stencil (consumed by em) */
     uint32_t cur_pc;
+    /* Compile-time diagnostics, reset for each final analysis/emission walk. */
+    uint32_t nstencils, nraw, nspills, nflushed, nlocal_mirrors;
+    size_t stencil_bytes, raw_bytes;
     int32_t rstep_imm[256];
     uint8_t rstep[256];                  /* per range-loop state slot: 1/2 = the step is a constant > 0 / < 0, 3 = not constant (set by RANGE_PREP); 0 = no RANGE_PREP seen in the region */
     uint8_t eg[256];                     /* range slots whose step is checked against egv[] when the region is entered */
@@ -311,6 +364,9 @@ static int em(JC *c, int sid, int32_t h0, int32_t h1, int32_t h2, int32_t h3, in
         } else if (r->hole == HOLE_HQ || r->hole == HOLE_HQ2) {
             uint64_t v = (r->hole == HOLE_HQ ? hq : hq2) + (uint64_t)(int64_t)r->addend;
             memcpy(d + r->at, &v, 8);
+        } else if (r->hole >= HOLE_B0 && r->hole <= HOLE_B5) {
+            uint8_t v = (uint8_t)((uint32_t)hv[r->hole - HOLE_B0] + (uint32_t)r->addend);
+            d[r->at] = v;
         } else if (r->hole == HOLE_T) {
             if (!addfix(c, (uint32_t)c->cn + r->at, c->tk, c->tt, r->addend)) { c->why = "too many branches"; return 0; }
         } else {
@@ -319,6 +375,7 @@ static int em(JC *c, int sid, int32_t h0, int32_t h1, int32_t h2, int32_t h3, in
         }
     }
     c->cn += slen;
+    if (g_jit_stats) { c->nstencils++; c->stencil_bytes += slen; }
     c->rax_off = -1;
     c->xmm_off = -1;
     return 1;
@@ -383,12 +440,12 @@ static Ent *push(JC *c, int kind, int ty, int idx) {
  * Registers used: rsi rdi r8 r9 r10 r11 and xmm1..xmm7 (the stencils the reg-aware handlers may still emit - tag and
  * class guards, mov of a local - only use rax rcx rdx). rax rcx rdx xmm0 are scratch here. */
 enum { R_R12 = 12, R_R13 = 13, R_R14 = 14, R_R15 = 15, R_RAX = 0, R_RCX = 1, R_RDX = 2, R_RBP = 5, R_RSI = 6, R_RDI = 7 };
-static const int gpool[6] = {6, 7, 8, 9, 10, 11};
 
 static int xput(JC *c, const uint8_t *b, size_t n) {
     if (!cb_room(c, n)) { if (!c->why) c->why = "out of memory"; return 0; }
     memcpy(c->cb + c->cn, b, n);
     c->cn += n;
+    if (g_jit_stats) { c->nraw++; c->raw_bytes += n; }
     c->rax_off = -1;
     c->xmm_off = -1;
     c->skip1 = 0;
@@ -465,16 +522,14 @@ static int x_ldop(JC *c, int rd, const Ent *e, int pos) {
     if (e->kind == EK_LOC && e->idx == c->pin) return x_mov(c, rd, R_RBP);
     return x_ld(c, rd, R_R12, roff(c, e, pos) + 8);
 }
+static JitRegBank *reg_bank(JC *c, int xmm) {
+    return xmm ? &c->xmm_bank : &c->gpr_bank;
+}
 static int reg_get(JC *c, int xmm) {
-    if (xmm) {
-        for (int i = 1; i <= 7; i++) if (!((c->xb >> i) & 1)) { c->xb |= 1 << i; return i; }
-        return -1;
-    }
-    for (int i = 0; i < 6; i++) if (!((c->rb >> gpool[i]) & 1)) { c->rb |= 1 << gpool[i]; return gpool[i]; }
-    return -1;
+    return jit_ra_alloc(reg_bank(c, xmm), -1);
 }
 static void reg_put(JC *c, int xmm, int r) {
-    if (xmm) c->xb &= ~(1 << r); else c->rb &= ~(1 << r);
+    jit_ra_release(reg_bank(c, xmm), r);
 }
 static int reg_is_x(const Ent *e) { return e->ty == TY_FLT; }
 
@@ -485,14 +540,16 @@ static int reg_spill(JC *c, int pos) {
     int ok = x_sti(c, R_R12, so, (int32_t)tag_of(e->ty));
     if (ok) ok = reg_is_x(e) ? x_sd_st(c, R_R12, so + 8, e->idx) : x_st(c, R_R12, so + 8, e->idx);
     reg_put(c, reg_is_x(e), e->idx);
+    if (g_jit_stats) c->nspills++;
     e->kind = EK_MEM;
     return ok;
 }
 static int flush_regs(JC *c) {
-    if (!c->rb && !c->xb) return 1;
+    if (jit_ra_mask(&c->gpr_bank) == 0U && jit_ra_mask(&c->xmm_bank) == 0U) return 1;
+    if (g_jit_stats) c->nflushed++;
     if (c->vm->jit_dbg > 2) (void)fprintf(stderr, "jit: flush regs at op 0x%02x\n", (unsigned)c->code[c->cur_pc]);
     for (int i = c->pos0; i < c->dep; i++) if (c->st[i].kind == EK_REG && !reg_spill(c, i)) return 0;
-    c->rb = c->xb = 0; c->nlc = 0;
+    jit_ra_reset(&c->gpr_bank); jit_ra_reset(&c->xmm_bank); c->nlc = 0;
     return 1;
 }
 /* mirrors of an inlined body's locals live in the same table under keys of their own (one range per inlined call) */
@@ -562,6 +619,7 @@ static int lc_src(JC *c, const Ent *e, int x) {
     int ok = x ? x_sd_ld(c, r, R_R12, LOFF(c, e->idx) + 8) : x_ld(c, r, R_R12, LOFF(c, e->idx) + 8);
     if (!ok) return -2;
     lc_add(c, e->idx, x, r);
+    if (g_jit_stats) c->nlocal_mirrors++;
     return r;
 }
 /* a free register of the class, spilling the lowest register entry of that class when none is left (never positions
@@ -820,6 +878,23 @@ static int arith_reg(JC *c, int op, int pa, int pb, int fl) {
     return 1;
 }
 
+/* Prove that the pinned local is written only by the yield value of positive unit-step ranges.
+ * Called after the first analysis walk, when rstep[] contains the region's inferred range steps. */
+static int pin_is_positive_unit_range(const JC *c) {
+    if (c->pin < 0 || !c->rnext_unit) return 0;
+    int writes = 0;
+    for (uint32_t pc = c->hdr; pc < c->end;) {
+        int op = c->code[pc], len = op_len(op);
+        if (len <= 0) return 0;
+        if (op == OP_STORE_LOCAL && len == 3 && rd16(c->code + pc + 1) == (unsigned)c->pin) {
+            if (pc < 7 || c->code[pc - 7] != OP_RANGE_NEXT || !c->rnext_unit[pc - 7 - c->hdr]) return 0;
+            writes++;
+        }
+        pc += (uint32_t)len;
+    }
+    return writes > 0;
+}
+
 static int do_arith(JC *c, int op, uint32_t pc, int len, uint32_t *skip) {
     int pb = c->dep - 1, pa = c->dep - 2;
     if (pa < c->d0) FAIL("stack underflow");
@@ -864,7 +939,13 @@ static int do_arith(JC *c, int op, uint32_t pc, int len, uint32_t *skip) {
             int64_t k = c->kt[b->idx].as.i;
             if (op == OP_MOD) {
                 if (is_pow2(k)) { EM(ST_imod_p2, dst, oa, (int32_t)(k - 1), 0, 0, 0); rax_res = 1; }
-                else { uint64_t mg; int sh = magic_of(k, &mg); EM(ST_imod_m, dst, oa, (int32_t)k, sh, 0, mg); }
+                else {
+                    uint64_t mg; int sh = magic_of(k, &mg);
+                    if (c->pin_nonneg && a->kind == EK_LOC && a->idx == c->pin)
+                        EM(ST_imod_m_np, dst, 0, (int32_t)k, sh, 0, mg);
+                    else
+                        EM(ST_imod_m, dst, oa, (int32_t)k, sh, 0, mg);
+                }
             } else {
                 if (is_pow2(k)) { EM(ST_ifdiv_p2, dst, oa, log2i(k), 0, 0, 0); rax_res = 1; }
                 else { uint64_t mg; int sh = magic_of(k, &mg); EM(ST_ifdiv_m, dst, oa, (int32_t)k, sh, 0, mg); }
@@ -1139,6 +1220,23 @@ static int do_get_member(JC *c, uint32_t pc, int len, uint32_t *skip) {
     const SString *name = AS_STR(c->p->consts[kix]);
     Ent *a = &c->st[pa];
     const SClass *k = inst_class(a);
+    if (!k && a->hint && a->hint->type == T_CLASS) {
+        /* `super.method()` compiles to GET_MEMBER on a statically known parent class.
+         * Resolve the immutable method table entry once, then let do_call inline its body. */
+        const SClass *ck = AS_CLASS(*a->hint);
+        int64_t mi = table_find_sstr(ck->methods, name);
+        if (mi < 0) FAIL("class method");
+        const SpValue *method = &ck->methods->ents[mi].val;
+        if (method->type != T_FUNCTION || !AS_FUNC(*method)->proto) FAIL("class method");
+        int ki = kadd(c, *method);
+        if (ki < 0) FAIL("too many constants");
+        c->dep--;
+        Ent *e = push(c, EK_K, TY_UNK, ki);
+        if (!e) return 0;
+        e->hint = method;
+        e->ppc = pc;
+        return 1;
+    }
     if (!k) FAIL("member of a non-instance");
     int slot = field_slot(k, name);
     if (slot < 0) FAIL("not a field");
@@ -1349,30 +1447,65 @@ static double (*libm_fn(const char *name))(double) {
 static int jh_nat(VM *vm, SpValue *argv, unsigned argc, SpValue *dst, NativeFn fn, unsigned want);
 static int emit_nat(JC *c, uint32_t pc, int pf, int argc, const NativeDesc *nd, int rty);
 static int nat_result_ty(const NativeDesc *nd, JC *c, int pf, int argc);
+static int jh_strmethod(VM *vm, SpValue *argv, unsigned argc, SpValue *dst, NativeFn fn, unsigned want);
+static int emit_invoke_strmethod(JC *c, uint32_t pc, int pm, int argc, const NativeDesc *nd, int returns_string);
 
 /* INVOKE with one argument: math.sqrt / sin / cos / exp / tan / atan (LOAD_MODULE m; arg; INVOKE name) and
  * array.append (no growth) */
+static int emit_invoke_strmethod(JC *c, uint32_t pc, int pm, int argc, const NativeDesc *nd, int returns_string) {
+    /* INVOKE keeps the receiver as argv[0], unlike CALL which has a separate callee slot. */
+    if (!flush_regs(c) || !flush_from(c, pm, c->dep)) return 0;
+    c->xe = gexit(c);
+    if (c->xe < 0) FAIL("out of memory");
+    c->hq2 = (uint64_t)(uintptr_t)nd->fn;
+    EM(ST_hnat, soff(c, pm), soff(c, pm), argc + 1, soff(c, c->dep), 0xff, (uint64_t)(uintptr_t)jh_strmethod);
+    c->dep -= argc + 1;
+    Ent *r = push(c, EK_MEM, TY_UNK, 0);
+    if (!r) return 0;
+    r->ppc = pc;
+    if (returns_string) r->hint = &g_hint_string;
+    c->rax_off = -1; c->xmm_off = -1; c->skip1 = 0; c->skipx = 0;
+    return 1;
+}
+
+static int string_method_returns_string(const NativeDesc *nd) {
+    const char *n = nd->name;
+    return !strcmp(n, "slice") || !strcmp(n, "trim") || !strcmp(n, "trim_start") ||
+           !strcmp(n, "trim_end") || !strcmp(n, "upper") || !strcmp(n, "lower") ||
+           !strcmp(n, "replace") || !strcmp(n, "repeat");
+}
+
 static int do_invoke(JC *c, uint32_t pc, int len, uint32_t *skip) {
     unsigned kix = rd16(c->code + pc + 1);
     int argc = c->code[pc + 3];
-    if (kix >= (unsigned)c->p->nconsts || c->p->consts[kix].type != T_STRING) FAIL("call");
+    if (kix >= (unsigned)c->p->nconsts || c->p->consts[kix].type != T_STRING) FAIL("invoke: bad method constant");
     if (c->dep - 1 - argc >= c->d0) {
         const Ent *re = &c->st[c->dep - 1 - argc];
         const SClass *rk = inst_class(re);
         if (rk) return do_invoke_inst(c, pc, len, rk, AS_STR(c->p->consts[kix]), argc);
     }
     int pb = c->dep - 1, pm = c->dep - 1 - argc;
-    if (argc < 1 || pm < c->d0) FAIL("call");
+    /* Zero-argument methods (upper(), trim(), char_count(), etc.) still
+     * have their receiver on the operand stack. */
+    if (pm < c->d0) FAIL("invoke: missing receiver");
     Ent *m = &c->st[pm];
     const SString *name = AS_STR(c->p->consts[kix]);
     if (m->ty != TY_MOD) {
-        if (argc != 1) FAIL("call");
+        /* A hot string local/result can call its immutable built-in methods directly through the
+         * GC-aware native stencil. The helper checks the receiver tag on every execution, so a
+         * later type change exits to the interpreter without changing language semantics. */
+        {
+            const NativeDesc *sd = lib_string_method(name);
+            if (sd && argc + 1 >= sd->min_args && argc + 1 <= sd->max_args)
+                return emit_invoke_strmethod(c, pc, pm, argc, sd, string_method_returns_string(sd));
+        }
+        if (argc != 1) FAIL("invoke: nonmodule arity");
         if (!flush_regs(c)) return 0;
         m = &c->st[pm];
-        if (name->len != 6 || memcmp(name->data, "append", 6) != 0) FAIL("call");
+        if (name->len != 6 || memcmp(name->data, "append", 6) != 0) FAIL("invoke: nonmodule method not supported");
         Ent *a = &c->st[pb];
-        if (m->kind == EK_K || m->kind == EK_MOD) FAIL("append receiver");
-        if (!need(c, pm, TY_ARR)) FAIL("append receiver");
+        if (m->kind == EK_K || m->kind == EK_MOD) FAIL("invoke: append receiver");
+        if (!need(c, pm, TY_ARR)) FAIL("invoke: append receiver");
         if (a->kind == EK_MOD && !materialize(c, pb)) return 0;
         if (!flush_from(c, c->d0, pm)) return 0;
         c->xe = gexit(c);
@@ -1388,18 +1521,18 @@ static int do_invoke(JC *c, uint32_t pc, int len, uint32_t *skip) {
         return 1;
     }
     const SpValue *mv = &c->vm->slots[c->mslot[m->idx]];
-    if (mv->type != T_MODULE) FAIL("call");
+    if (mv->type != T_MODULE) FAIL("invoke: module receiver is not module");
     SpValue fv;
-    if (!table_get_sstr(AS_MODULE(*mv)->exports, name, &fv) || fv.type != T_FUNCTION || !AS_FUNC(fv)->nat) FAIL("call");
+    if (!table_get_sstr(AS_MODULE(*mv)->exports, name, &fv) || fv.type != T_FUNCTION || !AS_FUNC(fv)->nat) FAIL("invoke: module member not native");
     const NativeDesc *nd = AS_FUNC(fv)->nat;
     double o;
     int is_sqrt = strcmp(nd->name, "sqrt") == 0;
     double (*lf)(double) = is_sqrt ? NULL : libm_fn(nd->name);
     if (argc != 1 || !math_fast1(nd, 4.0, &o) || (!is_sqrt && !lf)) {
-        if (!math_pure_native(nd) || argc < nd->min_args || (nd->max_args >= 0 && argc > nd->max_args)) FAIL("call");
+        if (!math_pure_native(nd) || argc < nd->min_args || (nd->max_args >= 0 && argc > nd->max_args)) FAIL("invoke: native not pure");
         return emit_nat(c, pc, pm, argc, nd, nat_result_ty(nd, c, pm, argc));
     }
-    if (is_sqrt && (o < 1.999 || o > 2.001)) FAIL("call");
+    if (is_sqrt && (o < 1.999 || o > 2.001)) FAIL("invoke: sqrt guard");
     Ent *a = &c->st[pb];
     if (a->ty == TY_UNK && !need(c, pb, hint_ty(a->hint) == TY_INT ? TY_INT : TY_FLT)) FAIL("math argument");
     if (a->ty != TY_FLT && a->ty != TY_INT) FAIL("math argument");
@@ -1784,7 +1917,8 @@ static int inl_body(JC *c, const Proto *kp, const uint8_t *kcode, int argc, int 
         c->cur_pc = pc;
         uint32_t skip = 0;
         int r = 1;
-        if ((c->rb || c->xb) && !reg_aware(op) && op != OP_RETURN && !flush_regs(c)) goto out;
+        if ((jit_ra_mask(&c->gpr_bank) != 0U || jit_ra_mask(&c->xmm_bank) != 0U) &&
+            !reg_aware(op) && op != OP_RETURN && !flush_regs(c)) goto out;
         switch (op) {
         case OP_NOP: break;
         case OP_CONST: {
@@ -1903,7 +2037,7 @@ out:
     c->p = sv.p; c->fn = sv.fn; c->code = sv.code; c->hdr = sv.hdr; c->end = sv.end; c->cur_pc = sv.cur_pc; c->nloc = sv.nloc;
     c->d0 = sv.d0; c->nvars = sv.nvars; c->nmv = sv.nmv; c->pin = sv.pin; c->cur_ic = sv.cur_ic; c->pos0 = sv.pos0; c->bias = sv.bias; c->nest--;
     c->base = sv.base; c->vt = sv.vt; c->vlive = sv.vlive; c->vk = sv.vk; c->lmap = sv.lmap; c->lrd = sv.lrd;
-    if (!ok) { c->dep = sv.dep; c->rb = c->xb = 0; c->nlc = 0; }
+    if (!ok) { c->dep = sv.dep; jit_ra_reset(&c->gpr_bank); jit_ra_reset(&c->xmm_bank); c->nlc = 0; }
     return ok ? 1 : -1;
 }
 
@@ -1912,9 +2046,8 @@ static int do_call(JC *c, uint32_t pc, int len, uint32_t *skip) {
     int pf = c->dep - 1 - argc;
     if (pf < c->d0) FAIL("stack underflow");
     Ent *f = &c->st[pf];
-    if (f->kind == EK_K && c->kt[f->idx].type == T_FUNCTION) {
+    if (f->kind == EK_K && c->kt[f->idx].type == T_FUNCTION && AS_FUNC(c->kt[f->idx])->nat) {
         const NativeDesc *nd = AS_FUNC(c->kt[f->idx])->nat;
-        if (!nd) FAIL("call");
         if (argc == 1 && strcmp(nd->name, "len") == 0) {
             const Ent *ae = &c->st[c->dep - 1];
             if (ae->kind != EK_K && ae->kind != EK_MOD && (ae->ty == TY_ARR || (ae->ty == TY_UNK && ae->hint && ae->hint->type == T_ARRAY)))
@@ -2240,6 +2373,13 @@ static int jh_nat(VM *vm, SpValue *argv, unsigned argc, SpValue *dst, NativeFn f
     if (want != 0xffu && (unsigned)r.type != want) return 0;
     *dst = r;
     return 1;
+}
+/* String methods never mutate their receiver or external VM state. They may allocate a result;
+ * ST_hnat publishes the complete live stack before entering this helper, so those allocations
+ * and any collection they trigger are safe. A receiver/argument error falls back to the VM. */
+static int jh_strmethod(VM *vm, SpValue *argv, unsigned argc, SpValue *dst, NativeFn fn, unsigned want) {
+    if (argc == 0 || argv[0].type != T_STRING) return 0;
+    return jh_nat(vm, argv, argc, dst, fn, want);
 }
 static int jh_setidx(VM *vm, const SpValue *o, const SpValue *k, const SpValue *v) {
     if (vm->bytes >= vm->gc_next) vm_gc(vm);
@@ -2743,11 +2883,18 @@ static int do_range_next(JC *c, uint32_t pc, uint32_t *skip) {
         if (sv != 0 && sv >= INT32_MIN && sv <= INT32_MAX && (!c->eg[s] || c->egv[s] == (int32_t)sv)) {
             c->eg[s] = 1; c->egv[s] = (int32_t)sv;
             mode = sv > 0 ? 1 : 2; imm = (int32_t)sv;
+            if (s < 256) { c->rstep[s] = (uint8_t)mode; c->rstep_imm[s] = imm; }
         }
     }
-    if (mode == 1 || mode == 2) EM(mode == 1 ? ST_range_up : ST_range_dn, dst, s * 16, imm, 0, 0, 0);
+    int unit_step = (mode == 1 && imm == 1) || (mode == 2 && imm == -1);
+    if (c->rnext_unit && pc >= c->hdr && pc < c->end) c->rnext_unit[pc - c->hdr] = (uint8_t)(mode == 1 && imm == 1);
+    int pin_updated = unit_step && dl >= 0 && dl == c->pin;
+    if (unit_step) {
+        if (pin_updated) EM(mode == 1 ? ST_range_up1_p : ST_range_dn1_p, dst, s * 16, 0, 0, 0, 0);
+        else EM(mode == 1 ? ST_range_up1 : ST_range_dn1, dst, s * 16, 0, 0, 0, 0);
+    } else if (mode == 1 || mode == 2) EM(mode == 1 ? ST_range_up : ST_range_dn, dst, s * 16, imm, 0, 0, 0);
     else EM(ST_range_next, dst, s * 16, 0, 0, 0, 0);
-    if (dl >= 0 && dl == c->pin) EM(ST_ldp, dst, 0, 0, 0, 0, 0);
+    if (dl >= 0 && dl == c->pin && !pin_updated) EM(ST_ldp, dst, 0, 0, 0, 0, 0);
     if (dl >= 0) {
         c->vt[dl] = 0x80 | TY_INT;
         *skip = 3;
@@ -2931,8 +3078,15 @@ static int reg_aware(int op) {
 }
 
 static int walk(JC *c) {
-    c->rb = c->xb = 0; c->nlc = 0;
+    if (g_jit_stats) {
+        c->nstencils = c->nraw = c->nspills = c->nflushed = c->nlocal_mirrors = 0;
+        c->stencil_bytes = c->raw_bytes = 0;
+    }
+    jit_ra_init(&c->gpr_bank, JIT_REGION_GPR_POOL, sizeof JIT_REGION_GPR_POOL / sizeof JIT_REGION_GPR_POOL[0]);
+    jit_ra_init(&c->xmm_bank, JIT_REGION_XMM_POOL, sizeof JIT_REGION_XMM_POOL / sizeof JIT_REGION_XMM_POOL[0]);
+    c->nlc = 0;
     memset(c->rstep, 0, sizeof c->rstep);
+    if (c->rnext_unit) memset(c->rnext_unit, 0, (size_t)(c->end - c->hdr));
     c->cn = 0;
     c->nfx = 0;
     c->nex = 0;
@@ -2967,7 +3121,7 @@ static int walk(JC *c) {
             c->xmm_off = -1;
             c->dep = c->d0;
             for (int k = 0; k < c->ldep[li]; k++) { Ent *je = push(c, EK_MEM, TY_UNK, 0); if (!je) return 0; je->ppc = pc; }
-            c->rb = c->xb = 0; c->nlc = 0;
+            jit_ra_reset(&c->gpr_bank); jit_ra_reset(&c->xmm_bank); c->nlc = 0;
             reach = 1;
             c->pcaddr[pc - c->hdr] = (uint32_t)c->cn;
         } else if (!reach) {
@@ -2977,7 +3131,8 @@ static int walk(JC *c) {
         c->cur_pc = pc;
         uint32_t skip = 0;
         int ok = 1;
-        if ((c->rb || c->xb) && !reg_aware(op) && !flush_regs(c)) return 0;
+        if ((jit_ra_mask(&c->gpr_bank) != 0U || jit_ra_mask(&c->xmm_bank) != 0U) &&
+            !reg_aware(op) && !flush_regs(c)) return 0;
         switch (op) {
         case OP_NOP: break;
         case OP_CONST: {
@@ -3111,7 +3266,7 @@ static int op_allowed(int op, int unit) {
 }
 
 static void jc_free(JC *c) {
-    free(c->vt); free(c->vk); free(c->vlive); free(c->lt); free(c->lvalid); free(c->ldep); free(c->lmap); free(c->isins); free(c->st);
+    free(c->vt); free(c->vk); free(c->vlive); free(c->lt); free(c->lvalid); free(c->ldep); free(c->lmap); free(c->isins); free(c->rnext_unit); free(c->st);
     free(c->lrd); free(c->cb); free(c->fx); free(c->pcaddr); free(c->ex); free(c->kt); free(c->ic);
 }
 
@@ -3119,11 +3274,12 @@ static int jc_setup(JC *c, uint32_t len) {
     size_t n = (size_t)len + 1;
     c->lmap = malloc(n * sizeof(int));
     c->isins = calloc(n, 1);
+    c->rnext_unit = calloc(n, 1);
     c->pcaddr = malloc(n * sizeof(uint32_t));
     c->stcap = c->p->max_stack + 4 + INL_MAXLOC + 16;
     c->st = malloc((size_t)c->stcap * sizeof *c->st);
     c->kt = malloc(((size_t)c->p->nconsts + MAXEXTRA) * sizeof *c->kt);
-    if (!c->lmap || !c->isins || !c->pcaddr || !c->st || !c->kt) return 0;
+    if (!c->lmap || !c->isins || !c->rnext_unit || !c->pcaddr || !c->st || !c->kt) return 0;
     for (size_t i = 0; i < n; i++) c->lmap[i] = -1;
     if (c->p->nconsts > 0) memcpy(c->kt, c->p->consts, (size_t)c->p->nconsts * sizeof *c->kt);
     c->nk = c->nk0 = c->p->nconsts;
@@ -3154,7 +3310,6 @@ static int compile_region(VM *vm, Proto *p, JRegion *r, SFunc *fn, SpValue *base
     size_t msize = 0;
     uint32_t n = p->code_len, end = 0, entry_off = 0, tramp_off = 0;
     uint32_t *stub = NULL;
-    long pg = 0;
     void *fp = NULL;
 
     if (c->unit) {
@@ -3262,6 +3417,19 @@ static int compile_region(VM *vm, Proto *p, JRegion *r, SFunc *fn, SpValue *base
         if (!allint) {
             c->pin = -1;
             if (!walk(c)) goto done;
+        } else {
+            /* Some loop bodies overwrite a local before reading it, so the normal liveness pass need not guard its
+             * incoming tag. The pinned mirror relies on an integer payload at entry; make that precondition explicit. */
+            c->vlive[c->pin] = 1;
+            if (pin_is_positive_unit_range(c)) {
+                c->pin_nonneg = 1;
+                for (int round = 0;; round++) {
+                    if (round > 16) { c->why = "nonnegative pin fixpoint"; goto done; }
+                    c->changed = 0;
+                    if (!walk(c)) goto done;
+                    if (!c->changed) break;
+                }
+            }
         }
     }
 
@@ -3299,6 +3467,7 @@ static int compile_region(VM *vm, Proto *p, JRegion *r, SFunc *fn, SpValue *base
             }
         }
     }
+    if (eok && c->pin_nonneg) eok = em(c, ST_gnonneg, c->pin * 16, 0, 0, 0, 0, 0);
     for (int si = 0; eok && si < 256; si++)
         if (c->eg[si]) eok = em(c, ST_gimm, (si + 2) * 16, c->egv[si], 0, 0, 0, 0);
     if (eok && c->pin >= 0) { c->xe = -1; eok = em(c, ST_ldp, c->pin * 16, 0, 0, 0, 0, 0); }
@@ -3333,13 +3502,8 @@ static int compile_region(VM *vm, Proto *p, JRegion *r, SFunc *fn, SpValue *base
         memcpy(c->cb + f->pos, &rel, 4);
     }
     free(stub);
-    pg = sysconf(_SC_PAGESIZE);
-    if (pg <= 0) pg = 4096;
-    msize = (c->cn + (size_t)pg - 1) / (size_t)pg * (size_t)pg;
-    mem = mmap(NULL, msize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (mem == MAP_FAILED) { mem = NULL; c->why = "mmap failed"; goto done; }
-    memcpy(mem, c->cb, c->cn);
-    if (mprotect(mem, msize, PROT_READ | PROT_EXEC) != 0) { munmap(mem, msize); mem = NULL; c->why = "mprotect failed"; goto done; }
+    mem = jit_code_publish(c->cb, c->cn, &msize);
+    if (!mem) { c->why = "native code publish failed"; goto done; }
     {   /* developer aid: SPRINT_JIT_DUMP=file appends every compiled region's bytes (objdump -D -b binary -mi386:x86-64) */
         const char *dump = getenv("SPRINT_JIT_DUMP");
         FILE *df = dump ? fopen(dump, "ab") : NULL;
@@ -3378,6 +3542,15 @@ done:
     if (vm->jit_dbg) {
         if (ok) (void)fprintf(stderr, "jit: %s %s @%u..%u ok (%zu bytes)\n", c->unit ? "function" : "loop", p->name ? p->name : "?", c->hdr, c->end, c->cn);
         else (void)fprintf(stderr, "jit: %s %s @%u failed: %s\n", c->unit ? "function" : "loop", p->name ? p->name : "?", c->hdr, c->why ? c->why : "?");
+    }
+    if (g_jit_stats) {
+        (void)fprintf(stderr,
+            "jit-stats: %s %s @%u..%u %s bc=%u native=%zu stencil=%u/%zu raw=%u/%zu "
+            "exits=%d fixups=%d inline=%d reg-spill=%u flush=%u local-mirror=%u\n",
+            c->unit ? "function" : "loop", p->name ? p->name : "?", c->hdr, c->end,
+            ok ? "compiled" : "rejected", c->end - c->hdr, c->cn, c->nstencils,
+            c->stencil_bytes, c->nraw, c->raw_bytes, c->nex, c->nfx, c->nic,
+            c->nspills, c->nflushed, c->nlocal_mirrors);
     }
     jc_free(c);
     return ok;
@@ -3427,7 +3600,7 @@ static void jit_finish(VM *vm, int id) {
     vm->sp = f->base + fp->nlocals + e->depth;
 }
 
-static struct JitProto *jit_proto(Proto *p) {
+struct JitProto *jit_proto(Proto *p) {
     struct JitProto *jp = p->jit;
     if (!jp) {
         jp = calloc(1, sizeof *jp);

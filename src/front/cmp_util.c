@@ -41,12 +41,16 @@ Proto *new_proto(Comp *c, const char *name) {
         memcpy(p->name, name, strlen(name) + 1);
     }
     p->mod = c->cur_mod;
+    p->compile_index = pg->nprotos;
     pg->protos[pg->nprotos++] = p;
     return p;
 }
 
 int proto_index(const Comp *c, const Proto *p) {
-    for (int i = 0; i < c->prog->nprotos; i++)
+    int i = p->compile_index;
+    if (i >= 0 && i < c->prog->nprotos && c->prog->protos[i] == p) return i;
+    /* Keep a defensive fallback for a Proto not created by this compiler pass. */
+    for (i = 0; i < c->prog->nprotos; i++)
         if (c->prog->protos[i] == p) return i;
     return -1;
 }
@@ -271,7 +275,89 @@ static int resolve_up(Comp *c, const Node *where, FS *fs, const char *name, size
     return -1;
 }
 
+/* Module names are resolved many times during compilation. Keep the newest slot for
+ * each name in an open-addressed index; MVar entries themselves remain the source of
+ * truth for attributes and REPL slot reuse. */
+static void mv_index_put(Comp *c, int index) {
+    const MVar *m = &c->mv[index];
+    if (!m->len || !c->mv_index_cap) return;
+    uint32_t hash = sp_hash_bytes(m->name, m->len);
+    size_t mask = (size_t)c->mv_index_cap - 1u;
+    size_t pos = (size_t)hash & mask;
+    for (;;) {
+        int stored = c->mv_index[pos];
+        if (!stored) {
+            c->mv_index[pos] = index + 1;
+            c->mv_index_count++;
+            return;
+        }
+        int prior = stored - 1;
+        const MVar *old = &c->mv[prior];
+        if (old->len == m->len && memcmp(old->name, m->name, m->len) == 0) {
+            c->mv_index[pos] = index + 1;
+            return;
+        }
+        pos = (pos + 1u) & mask;
+    }
+}
+
+static void mv_index_rehash(Comp *c, int capacity) {
+    int *slots = calloc((size_t)capacity, sizeof *slots);
+    if (!slots) exit(14);
+    free(c->mv_index);
+    c->mv_index = slots;
+    c->mv_index_cap = capacity;
+    c->mv_index_count = 0;
+    for (int i = 0; i < c->nmv; i++) mv_index_put(c, i);
+}
+
+void mv_index_reset(Comp *c) {
+    /* For small modules the original reverse scan is cheaper than allocating an index. */
+    if (c->nmv < 32) {
+        free(c->mv_index);
+        c->mv_index = NULL;
+        c->mv_index_cap = 0;
+        c->mv_index_count = 0;
+        return;
+    }
+    int capacity = 32;
+    while (capacity < c->nmv * 2 + 32) capacity *= 2;
+    if (capacity > c->mv_index_cap) {
+        mv_index_rehash(c, capacity);
+        return;
+    }
+    memset(c->mv_index, 0, sizeof *c->mv_index * (size_t)c->mv_index_cap);
+    c->mv_index_count = 0;
+    for (int i = 0; i < c->nmv; i++) mv_index_put(c, i);
+}
+
+static void mv_index_insert(Comp *c, int index) {
+    if (!c->mv_index_cap) {
+        if (c->nmv >= 32) mv_index_reset(c);
+        return;
+    }
+    if ((c->mv_index_count + 1) * 10 >= c->mv_index_cap * 7) {
+        int next = c->mv_index_cap * 2;
+        mv_index_rehash(c, next);
+    }
+    mv_index_put(c, index);
+}
+
 int find_mvar(const Comp *c, const char *name, size_t len) {
+    if (c->mv_index && c->mv_index_cap > 0 && len) {
+        uint32_t hash = sp_hash_bytes(name, len);
+        size_t mask = (size_t)c->mv_index_cap - 1u;
+        size_t pos = (size_t)hash & mask;
+        for (;;) {
+            int stored = c->mv_index[pos];
+            if (!stored) return -1;
+            int index = stored - 1;
+            const MVar *m = &c->mv[index];
+            if (m->len == len && memcmp(m->name, name, len) == 0)
+                return index >= c->mv_start ? index : -1;
+            pos = (pos + 1u) & mask;
+        }
+    }
     for (int i = c->nmv - 1; i >= c->mv_start; i--)
         if (c->mv[i].len == len && memcmp(c->mv[i].name, name, len) == 0) return i;
     return -1;
@@ -302,7 +388,9 @@ int declare_mvar(Comp *c, const Node *where, const char *name, size_t len, int i
     c->mv[c->nmv].modname = modname;
     c->mv[c->nmv].user_mod = -1;
     c->mv[c->nmv].alias_slot = -1;
-    return c->nmv++;
+    int index = c->nmv++;
+    mv_index_insert(c, index);
+    return index;
 }
 
 /* an unnamed module variable (slot only), for compiler-generated functions */

@@ -143,7 +143,18 @@ static int gc_stats(VM *vm, int argc, SpValue *argv, SpValue *ret) {
     (void)argc; (void)argv;
     STable *t = vm_new_table(vm, 4);
     int z = vm->deterministic;
-    table_set_str(vm, t, "heap_bytes", 10, v_int(z ? 0 : (int64_t)vm->bytes));
+    table_set_str(vm, t, "heap_bytes", 10,
+                  v_int(z ? 0 : (vm->bytes > (size_t)INT64_MAX ? INT64_MAX : (int64_t)vm->bytes)));
+    size_t live_objects = 0U;
+    if (!z) {
+        /* Count on demand: do not burden every object allocation/free with a
+         * counter update solely for this diagnostic API. */
+        for (Obj *o = vm->objs; o != NULL; o = o->next) {
+            if (live_objects != SIZE_MAX) live_objects++;
+        }
+    }
+    table_set_str(vm, t, "live_objects", 12,
+                  v_int(z ? 0 : (live_objects > (size_t)INT64_MAX ? INT64_MAX : (int64_t)live_objects)));
     table_set_str(vm, t, "collections", 11, v_int(z ? 0 : vm->gc_runs));
     *ret = v_obj(T_TABLE, t);
     return 0;

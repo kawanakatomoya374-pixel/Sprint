@@ -226,6 +226,7 @@ static void comp_abort(void *p) {
     Comp *c = p;
     for (FS *f = c->fs; f; f = f->parent) fs_free(f);
     free(c->mv);
+    free(c->mv_index);
     for (int i = c->ncls_keep; i < c->ncls; i++) free(c->classes[i]);
     free(c->classes);
     free_comp_exports(c);
@@ -325,6 +326,7 @@ void compile_module_scoped(Front *F, VM *vm, Program *prog, Node *root, const ch
         } else if (c.nmv) {
             memset(c.mv, 0, sizeof(MVar) * (size_t)c.nmv);
         }
+        mv_index_reset(&c);
         for (int i = c.ncls_keep; i < c.ncls; i++) free(c.classes[i]);
         c.ncls = c.ncls_keep;
         if (rs && c.ncls_keep) {
@@ -374,6 +376,7 @@ void compile_module_scoped(Front *F, VM *vm, Program *prog, Node *root, const ch
     for (int i = 0; i < c.ncls; i++) free(c.classes[i]);
     free(c.classes);
     free(c.mv);
+    free(c.mv_index);
 }
 
 void compile_module(Front *F, VM *vm, Program *prog, Node *root, const char *modname, const char *file) {

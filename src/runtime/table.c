@@ -68,11 +68,44 @@ static int64_t t_find(const STable *t, SpValue k, uint64_t h, int64_t *slot_out)
     }
 }
 
-static void t_idx_insert(STable *t, int32_t e) {
+/* String-key lookup avoids the generic key_eq path. In particular, long strings
+ * can have an uncached hash: compute it once for the probe and compare stored
+ * strings by cached hash/length/bytes instead of hashing them again per probe. */
+static int64_t t_find_sstr(const STable *t, const SString *key, uint32_t h32,
+                           int64_t *slot_out, uint64_t *hash_out) {
+    uint64_t h = mix64(h32);
+    if (hash_out) *hash_out = h;
+    if (!t->idx) return -1;
     uint64_t mask = (uint64_t)t->idxcap - 1;
-    uint64_t i = hash_value(t->ents[e].key) & mask;
+    uint64_t i = h & mask;
+    for (;;) {
+        int32_t e = t->idx[i];
+        if (e == -1) return -1;
+        if (e >= 0) {
+            const TEntry *te = &t->ents[e];
+            if (te->key.type == T_STRING) {
+                const SString *ks = AS_STR(te->key);
+                if (ks == key || ((ks->hash == h32 || !ks->hash) &&
+                                  ks->len == key->len &&
+                                  memcmp(ks->data, key->data, key->len) == 0)) {
+                    if (slot_out) *slot_out = (int64_t)i;
+                    return e;
+                }
+            }
+        }
+        i = (i + 1) & mask;
+    }
+}
+
+static void t_idx_insert_h(STable *t, int32_t e, uint64_t h) {
+    uint64_t mask = (uint64_t)t->idxcap - 1;
+    uint64_t i = h & mask;
     while (t->idx[i] >= 0) i = (i + 1) & mask;
     t->idx[i] = e;
+}
+
+static void t_idx_insert(STable *t, int32_t e) {
+    t_idx_insert_h(t, e, hash_value(t->ents[e].key));
 }
 
 static void t_rebuild(VM *vm, STable *t, int64_t newcap) {
@@ -103,52 +136,27 @@ int table_reserve(VM *vm, STable *t, int64_t n) {
 
 int table_get(VM *vm, STable *t, SpValue key, SpValue *out, int *found) {
     if (norm_key(vm, &key)) return 1;
-    int64_t e = t_find(t, key, hash_value(key), NULL);
+    int64_t e;
+    if (key.type == T_STRING) {
+        SString *s = AS_STR(key);
+        e = t_find_sstr(t, s, str_hash(s), NULL, NULL);
+    } else {
+        e = t_find(t, key, hash_value(key), NULL);
+    }
     if (e >= 0) { *out = t->ents[e].val; if (found) *found = 1; }
     else { *out = v_nil(); if (found) *found = 0; }
     return 0;
 }
 
-/* Same as table_get_str for a key that is already an SString (uses its cached hash). */
+/* Same as table_get_str for a key that is already an SString. */
 int table_get_sstr(const STable *t, const SString *key, SpValue *out) {
-    if (!t->idx) return 0;
-    uint32_t h32 = key->hash ? key->hash : str_hash_calc(key->data, key->len);
-    uint64_t mask = (uint64_t)t->idxcap - 1;
-    uint64_t i = mix64(h32) & mask;
-    for (;;) {
-        int32_t e = t->idx[i];
-        if (e == -1) return 0;
-        if (e >= 0) {
-            const TEntry *te = &t->ents[e];
-            if (te->key.type == T_STRING) {
-                const SString *ks = AS_STR(te->key);
-                if (ks == key || ((ks->hash == h32 || !ks->hash) && ks->len == key->len && memcmp(ks->data, key->data, key->len) == 0)) {
-                    if (out) *out = te->val;
-                    return 1;
-                }
-            }
-        }
-        i = (i + 1) & mask;
-    }
+    int64_t e = t_find_sstr(t, key, str_hash_peek(key), NULL, NULL);
+    if (e < 0) return 0;
+    if (out) *out = t->ents[e].val;
+    return 1;
 }
 int64_t table_find_sstr(const STable *t, const SString *key) {
-    if (!t->idx) return -1;
-    uint32_t h32 = key->hash ? key->hash : str_hash_calc(key->data, key->len);
-    uint64_t mask = (uint64_t)t->idxcap - 1;
-    uint64_t i = mix64(h32) & mask;
-    for (;;) {
-        int32_t e = t->idx[i];
-        if (e == -1) return -1;
-        if (e >= 0) {
-            const TEntry *te = &t->ents[e];
-            if (te->key.type == T_STRING) {
-                const SString *ks = AS_STR(te->key);
-                if (ks == key || ((ks->hash == h32 || !ks->hash) && ks->len == key->len && memcmp(ks->data, key->data, key->len) == 0))
-                    return e;
-            }
-        }
-        i = (i + 1) & mask;
-    }
+    return t_find_sstr(t, key, str_hash_peek(key), NULL, NULL);
 }
 int table_get_str(STable *t, const char *s, size_t len, SpValue *out) {
     if (!t->idx) return 0;
@@ -173,9 +181,16 @@ int table_get_str(STable *t, const char *s, size_t len, SpValue *out) {
 
 int table_set(VM *vm, STable *t, SpValue key, SpValue val) {
     if (norm_key(vm, &key)) return 1;
-    uint64_t h = hash_value(key);
     int64_t slot = -1;
-    int64_t e = t_find(t, key, h, &slot);
+    uint64_t h;
+    int64_t e;
+    if (key.type == T_STRING) {
+        SString *s = AS_STR(key);
+        e = t_find_sstr(t, s, str_hash(s), &slot, &h);
+    } else {
+        h = hash_value(key);
+        e = t_find(t, key, h, &slot);
+    }
     if (val.type == T_NIL) { /* delete */
         if (e >= 0) {
             t->ents[e].key = v_nil();
@@ -193,7 +208,7 @@ int table_set(VM *vm, STable *t, SpValue key, SpValue val) {
     }
     t->ents[t->nent].key = key;
     t->ents[t->nent].val = val;
-    t_idx_insert(t, (int32_t)t->nent);
+    t_idx_insert_h(t, (int32_t)t->nent, h);
     t->nent++;
     t->count++;
     t->version++;

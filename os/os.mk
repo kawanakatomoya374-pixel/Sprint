@@ -42,8 +42,8 @@ $(OSB)/u/bundled.o: $(OSB)/u/bundled.c src/sp.h
 	$(OSCC) $(OSUFLAGS) -c -o $@ $<
 
 # ---- user program (ring 3): static-PIE, loaded by the kernel's ELF loader written in Sprint ----
-$(OSB)/userland.elf: $(OSUOBJ)
-	$(OSCC) -static-pie -o $@ $(OSUOBJ) -lm
+$(OSB)/userland.elf: $(OSUOBJ) os/tools/link_userland.sh
+	sh os/tools/link_userland.sh $(OSCC) $@ $(OSUOBJ)
 
 # ---- kernel ----
 $(OSB)/boot.o: os/boot/boot.S

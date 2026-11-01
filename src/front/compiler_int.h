@@ -89,6 +89,9 @@ typedef struct Comp {
     int dry;
     MVar *mv;
     int nmv, capmv;
+    int *mv_index;       /* open-addressed name -> module-variable index (index + 1; zero = empty) */
+    int mv_index_cap;
+    int mv_index_count;
     ClassCtx **classes;
     int ncls, capcls;
     Program *real;  /* program holding the already-compiled modules */
@@ -141,6 +144,7 @@ void end_scope(Comp *c);
 int declare_local(Comp *c, const Node *where, Decl *d);
 int declare_hidden(Comp *c, const Node *where);
 int find_mvar(const Comp *c, const char *name, size_t len);
+void mv_index_reset(Comp *c);
 int declare_mvar(Comp *c, const Node *where, const char *name, size_t len, int is_const, const char *modname);
 int declare_hidden_mvar(Comp *c, const Node *where);
 Res resolve_name(Comp *c, const Node *n);

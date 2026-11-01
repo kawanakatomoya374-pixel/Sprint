@@ -1,0 +1,13 @@
+# Build outputs and generated test artifacts
+/build/
+*.o
+*.a
+*.so
+*.d
+*.spc
+
+# Editor / OS noise
+*~
+.DS_Store
+.vscode/
+.idea/

@@ -44,6 +44,16 @@ for f in tests/lint/*.sp; do
     if [ "$out" = "$(cat "$b.out")" ] && [ "$rc" = "$exp_rc" ]; then pass=$((pass+1))
     else fail=$((fail+1)); echo "FAIL lint $f (rc=$rc)"; fi
 done
+# fmt / lint / check on files with a lexical error: a diagnostic and exit status 12 (a leak would make LeakSanitizer change it), and no leak (the token list and the
+# indentation stack of the failed lex are released)
+for f in tests/fmt_err/*.sp; do
+    ok=1
+    for c in "fmt" "fmt --check" "lint" "check"; do
+        out=$(ASAN_OPTIONS=detect_leaks=1 "$SPRINT" $c "$f" 2>/dev/null); rc=$?
+        { [ "$rc" = 12 ] && [ -z "$out" ]; } || ok=0
+    done
+    if [ $ok = 1 ]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL fmt_err $f"; fi
+done
 # REPL: scripted sessions on stdin (stdout and exit code compared)
 for f in tests/repl/*.in; do
     b=${f%.in}

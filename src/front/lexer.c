@@ -214,6 +214,8 @@ typedef struct Lexer {
 } Lexer;
 
 static SP_NORETURN void lerr(Lexer *L, int line, int col, size_t off, const char *msg) {
+    free(L->indent);                /* front_error does not return: release the indentation stack on every lexical error */
+    L->indent = NULL;
     front_error(L->F, "LexError", E_LEX, line, col, off, "%s", msg);
 }
 
@@ -536,12 +538,10 @@ void lex_source_at(Front *F, const char *src, size_t len, TokenList *out, int li
     L.indent[L.nind++] = 0;
 
     if (len >= 3 && (unsigned char)src[0] == 0xEF && (unsigned char)src[1] == 0xBB && (unsigned char)src[2] == 0xBF) {
-        free(L.indent);
         lerr(&L, 1, 1, 0, "byte order mark is not allowed");
     }
     size_t bad;
     if (!utf8_validate(src, len, &bad)) {
-        free(L.indent);
         /* compute position of bad byte */
         int ln = 1, cl = 1;
         for (size_t i = 0; i < bad; i++) {
@@ -556,8 +556,8 @@ void lex_source_at(Front *F, const char *src, size_t len, TokenList *out, int li
             int n = 0;
             while (peekc(&L, 0) == ' ') { adv(&L); n++; }
             int c = peekc(&L, 0);
-            if (c == '\t') { free(L.indent); lerr(&L, L.line, L.col, L.pos, "tab characters are not allowed"); }
-            if (c == '\r') { free(L.indent); lerr(&L, L.line, L.col, L.pos, "stray carriage return"); }
+            if (c == '\t') { lerr(&L, L.line, L.col, L.pos, "tab characters are not allowed"); }
+            if (c == '\r') { lerr(&L, L.line, L.col, L.pos, "stray carriage return"); }
             if (c == '\n') { adv(&L); continue; }
             if (c < 0) break;
             if (c == '#') {
@@ -569,11 +569,11 @@ void lex_source_at(Front *F, const char *src, size_t len, TokenList *out, int li
                         if (peekc(&L, 0) == '*' && peekc(&L, 1) == '#') { adv(&L); adv(&L); closed = 1; break; }
                         adv(&L);
                     }
-                    if (!closed) { free(L.indent); lerr(&L, sl, sc, so, "unterminated block comment"); }
+                    if (!closed) { lerr(&L, sl, sc, so, "unterminated block comment"); }
                     while (peekc(&L, 0) == ' ') adv(&L);
                     if (peekc(&L, 0) == '#' ) { while (peekc(&L, 0) >= 0 && peekc(&L, 0) != '\n') adv(&L); }
                     if (peekc(&L, 0) == '\n') adv(&L);
-                    else if (peekc(&L, 0) >= 0) { free(L.indent); lerr(&L, L.line, L.col, L.pos, "'*#' must be the last thing on its line"); }
+                    else if (peekc(&L, 0) >= 0) { lerr(&L, L.line, L.col, L.pos, "'*#' must be the last thing on its line"); }
                     continue;
                 }
                 while (peekc(&L, 0) >= 0 && peekc(&L, 0) != '\n') adv(&L);
@@ -589,7 +589,7 @@ void lex_source_at(Front *F, const char *src, size_t len, TokenList *out, int li
             }
             int top = L.indent[L.nind - 1];
             if (n > top) {
-                if (n != top + 4) { free(L.indent); lerr(&L, L.line, 1, L.pos - (size_t)n, "indentation must be exactly 4 spaces deeper"); }
+                if (n != top + 4) { lerr(&L, L.line, 1, L.pos - (size_t)n, "indentation must be exactly 4 spaces deeper"); }
                 if (L.nind == L.capind) { L.capind *= 2; L.indent = realloc(L.indent, sizeof(int) * (size_t)L.capind); }
                 L.indent[L.nind++] = n;
                 push_tok(&L, TK_INDENT, L.line, 1, L.pos - (size_t)n, (size_t)n);
@@ -598,7 +598,7 @@ void lex_source_at(Front *F, const char *src, size_t len, TokenList *out, int li
                     L.nind--;
                     push_tok(&L, TK_DEDENT, L.line, 1, L.pos - (size_t)n, 0);
                 }
-                if (n != L.indent[L.nind - 1]) { free(L.indent); lerr(&L, L.line, 1, L.pos - (size_t)n, "inconsistent dedent"); }
+                if (n != L.indent[L.nind - 1]) { lerr(&L, L.line, 1, L.pos - (size_t)n, "inconsistent dedent"); }
             }
             at_line_start = 0;
         }
@@ -606,21 +606,21 @@ void lex_source_at(Front *F, const char *src, size_t len, TokenList *out, int li
         int c = peekc(&L, 0);
         if (c < 0) break;
         if (c == ' ') { adv(&L); continue; }
-        if (c == '\t') { free(L.indent); lerr(&L, L.line, L.col, L.pos, "tab characters are not allowed"); }
-        if (c == '\r') { free(L.indent); lerr(&L, L.line, L.col, L.pos, "stray carriage return"); }
+        if (c == '\t') { lerr(&L, L.line, L.col, L.pos, "tab characters are not allowed"); }
+        if (c == '\r') { lerr(&L, L.line, L.col, L.pos, "stray carriage return"); }
         if (c == '\n') {
             adv(&L);
             if (L.paren == 0) { end_line_tokens(&L); at_line_start = 1; }
             continue;
         }
         if (c == '#') {
-            if (peekc(&L, 1) == '*') { free(L.indent); lerr(&L, L.line, L.col, L.pos, "block comment must start its own line"); }
+            if (peekc(&L, 1) == '*') { lerr(&L, L.line, L.col, L.pos, "block comment must start its own line"); }
             while (peekc(&L, 0) >= 0 && peekc(&L, 0) != '\n') adv(&L);
             continue;
         }
         int line = L.line, col = L.col;
         size_t off = L.pos;
-        if (c >= 0x80) { free(L.indent); lerr(&L, line, col, off, "non-ASCII character outside string or comment"); }
+        if (c >= 0x80) { lerr(&L, line, col, off, "non-ASCII character outside string or comment"); }
         L.content_on_line = 1;
         if (c == 'r' && (peekc(&L, 1) == '"' || peekc(&L, 1) == '\'')) { lex_raw(&L); continue; }
         if (c == 'f' && (peekc(&L, 1) == '"' || peekc(&L, 1) == '\'')) { lex_string(&L, 1); continue; }
@@ -691,7 +691,6 @@ void lex_source_at(Front *F, const char *src, size_t len, TokenList *out, int li
         if (kind < 0) {
             char m[64];
             snprintf(m, sizeof m, "unexpected character '%c'", c);
-            free(L.indent);
             lerr(&L, line, col, off, m);
         }
         if (L.paren < 0) { free(L.indent); front_error(F, "ParseError", E_PARSE, line, col, off, "unmatched closing bracket"); }

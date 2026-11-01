@@ -16,7 +16,7 @@ int main(int argc, char **argv) {
         if (!in) { (void)fprintf(stderr, "embedsrc: cannot open %s\n", eq + 1); return 1; }
         (void)fprintf(out, "static const char src_%d[] = {", i - 2);
         int c, n = 0;
-        while ((c = fgetc(in)) != EOF) (void)fprintf(out, "%s%d,", n++ % 24 == 0 ? "\n" : "", c);
+        while ((c = fgetc(in)) != EOF) (void)fprintf(out, "%s%d,", n++ % 24 == 0 ? "\n" : "", c > 127 ? c - 256 : c);   /* bytes >= 128 (UTF-8) as signed char values */
         (void)fprintf(out, "\n};\n");
         (void)fclose(in);
     }

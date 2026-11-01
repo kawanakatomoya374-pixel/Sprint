@@ -1,5 +1,6 @@
 /* VM creation and error construction (the interpreter loop is in vm.c). */
 #include "vm_int.h"
+#include "value_int.h"
 
 /* ---------------------------------------------------------------- */
 /* creation                                                          */
@@ -8,14 +9,23 @@ VM *vm_new(const Limits *lim, int caps) {
     VM *vm = calloc(1, sizeof *vm);
     if (!vm) return NULL;
     vm->lim = *lim;
+    value_vm_init(vm);
     jit_configure(vm);
     {
         const char *gs = getenv("SPRINT_GC_STRESS");
+        const char *ml = getenv("SPRINT_GC_MARK_LIMIT");
         vm->gc_stress = gs && gs[0] == '1';
-        if (vm->gc_stress) vm->gc_next = 1;
+        if (ml != NULL && ml[0] >= '1' && ml[0] <= '9') {
+            char *end = NULL;
+            unsigned long long parsed = strtoull(ml, &end, 10);
+            if (end != ml && *end == '\0' && parsed <= (unsigned long long)SIZE_MAX)
+                vm->gc_mark_limit = (size_t)parsed;
+        }
     }
     vm->caps = caps;
-    vm->gc_next = (size_t)1 << 20;
+    vm->gc_next = vm->gc_stress ? 1U : ((size_t)1 << 20);
+    vm->gray = NULL;
+    vm->capgray = 0U;
     vm->h_append = str_hash_calc("append", 6);
     vm->stack = malloc(sizeof(SpValue) * (size_t)vm->lim.max_operand_stack);
     vm->frames = malloc(sizeof(Frame) * (size_t)vm->lim.max_call_depth);

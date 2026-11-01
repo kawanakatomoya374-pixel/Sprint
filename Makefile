@@ -18,25 +18,39 @@ STDSRC   := $(wildcard stdlib/*.sp)
 # gui is kept as ordered parts (stdlib/gui/NN_*.sp) and embedded as one module
 GUIPARTS := $(sort $(wildcard stdlib/gui/*.sp))
 
+# ---- compiler probing ---------------------------------------------------------
+# Flags that only newer GCCs know are added when the compiler in use accepts them, so an older GCC (9 and later) still builds.
+# `make WERROR=` turns the warnings into plain warnings (another compiler may have different false positives).
+cc-opt   = $(shell $(CC) $(1) -x c -c /dev/null -o /dev/null >/dev/null 2>&1 && echo $(1))
+WERROR   ?= -Werror
+OPT_WARN := $(foreach f,-Wstrict-flex-arrays -Warray-compare -Warith-conversion -Wc11-c2x-compat -Wattribute-alias=2 \
+                        -Wmultistatement-macros -Wfree-nonheap-object -Wcast-align=strict -Wimplicit-fallthrough=5,$(call cc-opt,$(f)))
+OPT_HARD := $(foreach f,-fstrict-flex-arrays=3 -ftrivial-auto-var-init=zero -fcf-protection=full -fwrapv-pointer -fstack-clash-protection,$(call cc-opt,$(f)))
+# without -ftrivial-auto-var-init (GCC 12+) older compilers report possible uninitialised reads in a few output-parameter
+# idioms (lib_gfx.c); the locals are initialised on every path that uses them, so that one warning stays a warning there
+ifeq ($(findstring -ftrivial-auto-var-init=zero,$(OPT_HARD)),)
+WERROR += -Wno-error=maybe-uninitialized
+endif
+
 # ---- language / diagnostics -------------------------------------------------
 STD      := -std=c11 -pedantic-errors
-WARN     := -Werror -Wall -Wextra \
-            -Wconversion -Wsign-conversion -Wdouble-promotion -Warith-conversion \
-            -Wshadow -Wundef -Wpointer-arith -Wcast-align=strict -Wcast-qual \
+WARN     := $(WERROR) $(OPT_WARN) -Wall -Wextra \
+            -Wconversion -Wsign-conversion -Wdouble-promotion \
+            -Wshadow -Wundef -Wpointer-arith -Wcast-qual \
             -Wwrite-strings -Wvla -Walloca -Wredundant-decls -Wnested-externs \
             -Wstrict-prototypes -Wold-style-definition \
             -Wmissing-prototypes -Wmissing-declarations \
             -Wformat=2 -Wformat-signedness -Wformat-overflow=2 -Wformat-truncation=2 \
             -Wnull-dereference -Wduplicated-cond -Wduplicated-branches -Wlogical-op \
-            -Wimplicit-fallthrough=5 -Wswitch-default -Wjump-misses-init \
+            -Wswitch-default -Wjump-misses-init \
             -Wbad-function-cast -Wstrict-aliasing=2 -Warray-bounds=2 \
             -Wstringop-overflow=4 -Wshift-overflow=2 -Wunused-macros \
             -Wmissing-include-dirs -Wtrampolines -Wunsafe-loop-optimizations \
-            -Wstack-protector -Winvalid-pch -Wattribute-alias=2 \
+            -Wstack-protector -Winvalid-pch \
             -Wfloat-equal -Wswitch-enum -Wpacked -Wdate-time -Wdisabled-optimization \
-            -Wmultistatement-macros -Wunused-const-variable=2 -Wuninitialized \
-            -Wmaybe-uninitialized -Warray-compare -Wc11-c2x-compat -Wcomment \
-            -Wtrigraphs -Wstrict-flex-arrays -Wfree-nonheap-object -Wdangling-else \
+            -Wunused-const-variable=2 -Wuninitialized \
+            -Wmaybe-uninitialized -Wcomment \
+            -Wtrigraphs -Wdangling-else \
             -Wsizeof-array-argument -Wsizeof-pointer-memaccess -Wpointer-compare \
             -Wint-in-bool-context -Wmisleading-indentation -Wparentheses \
             -Wframe-larger-than=65536 -Wlarger-than=8388608 \
@@ -44,11 +58,12 @@ WARN     := -Werror -Wall -Wextra \
             -Wno-error=unsafe-loop-optimizations
 
 # ---- hardening ---------------------------------------------------------------
-HARDEN   := -fstack-protector-strong -fstack-clash-protection -fcf-protection=full \
-            -D_FORTIFY_SOURCE=3 -fno-common -fno-strict-overflow -fwrapv-pointer \
-            -fno-delete-null-pointer-checks -ftrivial-auto-var-init=zero \
-            -fstrict-flex-arrays=3 -fPIE
-LDHARDEN := -pie -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack
+HARDEN   := -fstack-protector-strong -D_FORTIFY_SOURCE=3 -fno-common -fno-strict-overflow \
+            -fno-delete-null-pointer-checks $(OPT_HARD) -fPIE
+# Fail closed on unresolved symbols or linker diagnostics, and keep executable
+# code in a separate segment in addition to PIE/RELRO/NX hardening.
+LDHARDEN := -pie -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack \
+            -Wl,-z,separate-code -Wl,-z,defs -Wl,--fatal-warnings
 
 INC      := -Isrc
 comma    := ,
@@ -60,7 +75,13 @@ CFLAGS_DBG := $(STD) $(WARN) $(HARDEN) -O0 -g3 $(INC) \
 LDFLAGS_DBG := -fsanitize=address,undefined
 
 FRONT_SRC   := src/front/lexer.c src/front/parser.c src/front/parse_expr.c src/front/compiler.c src/front/cmp_util.c src/front/cmp_expr.c src/front/cmp_stmt.c src/front/cmp_class.c src/front/cmp_import.c src/front/disasm.c src/front/loader.c
-RUNTIME_SRC := src/runtime/value.c src/runtime/table.c src/runtime/format.c src/runtime/gc.c src/runtime/vm_core.c src/runtime/vm.c src/runtime/image.c src/runtime/sha256.c src/runtime/verify.c src/runtime/embed.c src/runtime/jit.c
+RUNTIME_SRC := src/runtime/value.c src/runtime/table.c src/runtime/format.c \
+               src/runtime/gc.c src/runtime/vm_core.c src/runtime/vm.c \
+               src/runtime/vm/quickening.c src/runtime/vm/class.c \
+               src/runtime/vm/trace_record.c src/runtime/image.c \
+               src/runtime/sha256.c src/runtime/verify.c src/runtime/embed.c \
+               src/runtime/trace_ir.c src/runtime/jit/regalloc.c src/runtime/jit/snapshot.c \
+               src/runtime/jit.c src/runtime/jit_trace.c
 LIB_SRC     := src/lib/lib.c src/lib/lib_math.c src/lib/lib_str.c src/lib/lib_array.c src/lib/lib_table.c src/lib/lib_sys.c src/lib/lib_co.c src/lib/lib_ext.c src/lib/lib_gfx.c src/lib/font_ja.c src/lib/lib_ffi.c src/lib/lib_typed.c
 LIBSRC := $(FRONT_SRC) $(RUNTIME_SRC) $(LIB_SRC) $(GEN)/bundled.c
 CLISRC := cli/main.c cli/tool_fmt.c cli/tool_lint.c cli/repl.c
@@ -78,7 +99,7 @@ $(GEN)/bundled.c: tools/embedsrc.c $(STDSRC) $(GEN)/gui.sp Makefile
 	$(CC) -O1 -o $(GEN)/embedsrc tools/embedsrc.c
 	$(GEN)/embedsrc $@ gui=$(GEN)/gui.sp $(foreach f,$(STDSRC),$(basename $(notdir $(f)))=$(f))
 
-.PHONY: all debug analyze test test-san test-embed fuzz bench clean lib
+.PHONY: all debug analyze test test-san test-embed test-gc-stress test-gc-stack-growth test-gc-stats test-gc-stress-san test-gc-stack-growth-san test-gc-stats-san fuzz bench clean lib
 all: $(BUILD)/sprint
 
 lib: $(BUILD)/libsprint.a
@@ -122,7 +143,7 @@ fuzz: $(BUILD)/sprint-san
 analyze: $(GEN)/bundled.c
 	@for f in $(ALLSRC); do \
 	  echo "analyze $$f"; \
-	  $(CC) $(STD) $(WARN) -O1 $(INC) -fanalyzer -fstrict-flex-arrays=3 -Wno-analyzer-malloc-leak \
+	  $(CC) $(STD) $(WARN) -O1 $(INC) -fanalyzer $(call cc-opt,-fstrict-flex-arrays=3) -Wno-analyzer-malloc-leak \
 	    -fsyntax-only $$f || exit 1; \
 	done
 
@@ -135,11 +156,36 @@ $(BUILD)/libcxxtest.so: tests/ffi/cxxtest.cpp
 	@mkdir -p $(BUILD)
 	c++ -std=c++17 -O2 -Wall -Wextra -Werror -shared -fPIC -o $@ $<
 
-test: $(BUILD)/sprint $(FFI_LIBS)
+test: $(BUILD)/sprint $(FFI_LIBS) test-trace-snapshot test-gc-stress test-gc-stack-growth test-gc-stats
 	@SPRINT=$(BUILD)/sprint sh tests/run_tests.sh
 
-test-san: $(BUILD)/sprint-san $(FFI_LIBS)
+test-san: $(BUILD)/sprint-san $(FFI_LIBS) test-trace-snapshot-san test-gc-stress-san test-gc-stack-growth-san test-gc-stats-san
 	@SPRINT=$(BUILD)/sprint-san sh tests/run_tests.sh
+
+# Force the mark stack to one entry so the allocation-free heap-rescan fallback is exercised.
+test-gc-stress: $(BUILD)/sprint
+	@SPRINT_GC_STRESS=1 SPRINT_GC_MARK_LIMIT=1 $(BUILD)/sprint run tests/cases/lang/gc.sp > $(BUILD)/gc-stress.out
+	@cmp $(BUILD)/gc-stress.out tests/cases/lang/gc.out && echo 'gc: stress + one-slot mark fallback + cyclic graph + stats verified'
+
+test-gc-stress-san: $(BUILD)/sprint-san
+	@SPRINT_GC_STRESS=1 SPRINT_GC_MARK_LIMIT=1 ASAN_OPTIONS=detect_leaks=1 $(BUILD)/sprint-san run tests/cases/lang/gc.sp > $(BUILD)/gc-stress-san.out
+	@cmp $(BUILD)/gc-stress-san.out tests/cases/lang/gc.out && echo 'gc-san: stress + one-slot mark fallback + cyclic graph + stats verified'
+
+test-gc-stack-growth: $(BUILD)/sprint
+	@$(BUILD)/sprint run tests/cases/lang/gc.sp > $(BUILD)/gc-growth.out
+	@cmp $(BUILD)/gc-growth.out tests/cases/lang/gc.out && echo 'gc: dynamic mark-stack growth (>1024 references) verified'
+
+test-gc-stack-growth-san: $(BUILD)/sprint-san
+	@ASAN_OPTIONS=detect_leaks=1 $(BUILD)/sprint-san run tests/cases/lang/gc.sp > $(BUILD)/gc-growth-san.out
+	@cmp $(BUILD)/gc-growth-san.out tests/cases/lang/gc.out && echo 'gc-san: dynamic mark-stack growth (>1024 references) verified'
+
+test-gc-stats: $(BUILD)/sprint
+	@$(BUILD)/sprint run tests/runtime/gc_stats.sp > $(BUILD)/gc-stats.out
+	@cmp $(BUILD)/gc-stats.out tests/runtime/gc_stats.out && echo 'gc: live_objects increases on allocation and decreases after collection'
+
+test-gc-stats-san: $(BUILD)/sprint-san
+	@ASAN_OPTIONS=detect_leaks=1 $(BUILD)/sprint-san run tests/runtime/gc_stats.sp > $(BUILD)/gc-stats-san.out
+	@cmp $(BUILD)/gc-stats-san.out tests/runtime/gc_stats.out && echo 'gc-san: live_objects accounting verified'
 
 # C embedding API: build the host programs against the library (release and
 # ASan/UBSan builds) and run them.
@@ -184,6 +230,70 @@ jit-regen: tools/jitgen.c tools/jitlayout.c src/runtime/jit/stencils.S
 .PHONY: jit-regen
 
 # Whole suite with the JIT compiling every loop at its first back edge (the output must equal the interpreter's).
-test-jit: $(BUILD)/sprint $(FFI_LIBS)
+test-jit: $(BUILD)/sprint $(FFI_LIBS) test-trace-snapshot
 	@SPRINT_JIT_THRESHOLD=1 SPRINT=$(BUILD)/sprint sh tests/run_tests.sh
 .PHONY: test-jit
+
+# TraceJIT records a complete loop iteration before compiling the hot trace.
+test-trace-jit: $(BUILD)/sprint $(FFI_LIBS) test-trace-snapshot test-trace-snapshot-budget test-trace-side test-trace-side-cache
+	@SPRINT_JIT_THRESHOLD=2 SPRINT_TRACE_JIT=1 SPRINT=$(BUILD)/sprint sh tests/run_tests.sh
+.PHONY: test-trace-jit
+
+# Run the in-file TraceIR verifier/optimizer invariant suite under the strict diagnostics.
+test-trace-ir: | $(BUILD)
+	$(CC) $(STD) $(WARN) $(HARDEN) -O2 $(INC) -DSPRINT_TRACE_IR_TEST -o $(BUILD)/trace-ir-test src/runtime/trace_ir.c
+	$(BUILD)/trace-ir-test
+.PHONY: test-trace-ir
+
+# Snapshot map/token/restore invariants used by TraceJIT side exits.
+test-trace-snapshot: | $(BUILD)
+	$(CC) $(STD) $(WARN) $(HARDEN) -O2 $(INC) -o $(BUILD)/snapshot-test tests/runtime/snapshot_test.c src/runtime/jit/snapshot.c src/runtime/trace_ir.c
+	$(BUILD)/snapshot-test
+.PHONY: test-trace-snapshot
+
+test-trace-snapshot-san: | $(BUILD)
+	$(CC) $(STD) $(WARN) $(HARDEN) -O0 -g -fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer $(INC) -o $(BUILD)/snapshot-test-san tests/runtime/snapshot_test.c src/runtime/jit/snapshot.c src/runtime/trace_ir.c -fsanitize=address,undefined
+	$(BUILD)/snapshot-test-san
+.PHONY: test-trace-snapshot-san
+
+test-trace-side: $(BUILD)/sprint
+	# Keep the region JIT cold so this test exercises TraceJIT linking and Side Trace dispatch.
+	@SPRINT_JIT_THRESHOLD=10000 SPRINT_TRACE_JIT=1 SPRINT_TRACE_JIT_DEBUG=1 $(BUILD)/sprint run tests/cases/jit/jit_trace_side.sp > $(BUILD)/trace-side.log 2>&1
+	@grep -Eq 'trace-jit: side-record-request polymorphic_loop@' $(BUILD)/trace-side.log
+	@grep -q 'trace-jit: native-link linked_side@32 -> @69' $(BUILD)/trace-side.log
+	@grep -q 'trace-jit: result slot=1 kind=2 owner=linked_side@69' $(BUILD)/trace-side.log
+	@grep -q 'trace-jit: side-record-request linked_side@69' $(BUILD)/trace-side.log
+	@test $$(grep -c 'trace-jit: side-compiled' $(BUILD)/trace-side.log) -ge 3
+	@grep -q 'trace-jit: side-hit linked_side@69' $(BUILD)/trace-side.log
+	@grep -q 'trace-jit: side-record-request ref_loop@' $(BUILD)/trace-side.log
+	@test $$(grep -c 'trace-jit: side-compiled ref_loop@' $(BUILD)/trace-side.log) -eq 4
+	@grep -q 'trace-jit: side-compiled ref_loop@.*depth=1 ' $(BUILD)/trace-side.log
+	@grep -q 'trace-jit: side-compiled ref_loop@.*depth=2 ' $(BUILD)/trace-side.log
+	@test $$(grep -c 'trace-jit: side-compiled ref_loop@.*depth=3 ' $(BUILD)/trace-side.log) -eq 2
+	@grep -q 'trace-jit: side-record-request ref_loop@.*depth=2 ' $(BUILD)/trace-side.log
+	@grep -q 'trace-jit: side-hit ref_loop@' $(BUILD)/trace-side.log
+	@tail -n 18 $(BUILD)/trace-side.log > $(BUILD)/trace-side.out
+	@cmp $(BUILD)/trace-side.out tests/cases/jit/jit_trace_side.out && echo 'trace-side: Root + Side-of-Side depth 1/2/3 + bounded branching + linked MISS verified'
+	@SPRINT_GC_STRESS=1 SPRINT_JIT_THRESHOLD=10000 SPRINT_TRACE_JIT=1 $(BUILD)/sprint run tests/cases/jit/jit_trace_side.sp > $(BUILD)/trace-side-gc.log 2>&1
+	@tail -n 18 $(BUILD)/trace-side-gc.log > $(BUILD)/trace-side-gc.out
+	@cmp $(BUILD)/trace-side-gc.out tests/cases/jit/jit_trace_side.out && echo 'trace-side: reference values survive GC-stress allocations after native restore'
+.PHONY: test-trace-side
+
+# Stress root/side cache admission, parent-child eviction and re-entry across 70 loop sites.
+test-trace-side-cache: $(BUILD)/sprint
+	@SPRINT_JIT_THRESHOLD=10000 SPRINT_TRACE_JIT=1 SPRINT_TRACE_JIT_DEBUG=1 $(BUILD)/sprint run tests/cases/jit/jit_trace_cache.sp > $(BUILD)/trace-side-cache.log 2>&1
+	@grep -q 'trace-jit: side-record-request many@' $(BUILD)/trace-side-cache.log
+	@test $$(grep -c 'trace-jit: side-compiled many@' $(BUILD)/trace-side-cache.log) -ge 20
+	@grep -q 'trace-jit: side-hit many@' $(BUILD)/trace-side-cache.log
+	@! grep -q 'trace-jit: rejected many@' $(BUILD)/trace-side-cache.log
+	@grep -Eq 'cache=64/[0-9]+B' $(BUILD)/trace-side-cache.log
+	@tail -n 3 $(BUILD)/trace-side-cache.log > $(BUILD)/trace-side-cache.out
+	@cmp $(BUILD)/trace-side-cache.out tests/cases/jit/jit_trace_cache.out && echo 'trace-side-cache: 70 roots + side variants + bounded LRU verified'
+.PHONY: test-trace-side-cache
+
+test-trace-snapshot-budget: $(BUILD)/sprint
+	@set +e; SPRINT_JIT_THRESHOLD=2 SPRINT_TRACE_JIT=1 SPRINT_TRACE_JIT_DEBUG=1 $(BUILD)/sprint run --max-instr 2000 tests/runtime/snapshot_budget.sp > $(BUILD)/snapshot-budget.log 2>&1; status=$$?; set -e; \
+	  test $$status -eq 124 && grep -q 'snapshot slot=.*kind=3' $(BUILD)/snapshot-budget.log && \
+	  grep -q 'TimeoutError: instruction limit exceeded' $(BUILD)/snapshot-budget.log && \
+	  echo "snapshot-budget: budget exit restored and limit error preserved"
+.PHONY: test-trace-snapshot-budget

@@ -402,6 +402,7 @@ struct Proto {
     int jhot;              /* back-edge countdown until the JIT is consulted (0 = not initialised) */
     struct JitUnit *junit; /* native entry of the whole function (JIT), NULL = not compiled */
     int jcall;             /* call countdown until the JIT is asked to compile the function (0 = not initialised) */
+    int compile_index;     /* stable index in Program.protos while compiling */
 };
 
 enum { LINK_PRELUDE = 0, LINK_MOD_EXPORT = 1, LINK_MOD_VALUE = 2 };
@@ -502,8 +503,22 @@ enum Op {
     OP_Q_ACC_I = 0xB0, OP_Q_ACC_L, OP_Q_ACC_IM, OP_Q_ACC_LM, OP_Q_LLL_DIV, OP_Q_SETIDX_LLL, OP_Q_SETIDX_LLB, OP_Q_MUL_ST,
     OP_Q_SI_LT_JF, OP_Q_SI_LE_JF, OP_Q_SI_GT_JF, OP_Q_SI_GE_JF, OP_Q_SI_EQ_JF, OP_Q_SI_NE_JF,
     OP_Q_LLI_FDIV, OP_Q_IL_ADD, OP_Q_IL_MUL, OP_Q_IDX_L, OP_Q_UP_INC, OP_Q_RET_UP,
-    OP_Q_ADD_L, OP_Q_SUB_L, OP_Q_MUL_L, OP_Q_DIV_L, OP_Q_MODEQ_JF, OP_Q_MODNE_JF, OP_Q_JUMP_JF
+    OP_Q_ADD_L, OP_Q_SUB_L, OP_Q_MUL_L, OP_Q_DIV_L, OP_Q_MODEQ_JF, OP_Q_MODNE_JF, OP_Q_JUMP_JF,
+    /* Quickened built-in string method calls; operands retain (const index, argc). */
+    OP_Q_INVOKE_STR_SLICE = 0xCB, OP_Q_INVOKE_STR_FIND, OP_Q_INVOKE_STR_CONTAINS,
+    OP_Q_INVOKE_STR_STARTS_WITH, OP_Q_INVOKE_STR_ENDS_WITH, OP_Q_INVOKE_STR_COUNT,
+    OP_Q_INVOKE_STR_SPLIT, OP_Q_INVOKE_STR_SPLIT_LINES, OP_Q_INVOKE_STR_TRIM,
+    OP_Q_INVOKE_STR_TRIM_START, OP_Q_INVOKE_STR_TRIM_END, OP_Q_INVOKE_STR_UPPER,
+    OP_Q_INVOKE_STR_LOWER, OP_Q_INVOKE_STR_REPLACE, OP_Q_INVOKE_STR_REPEAT,
+    OP_Q_INVOKE_STR_CHAR_COUNT, OP_Q_INVOKE_STR_CHAR_AT, OP_Q_INVOKE_STR_IS_BOUNDARY,
+    OP_Q_INVOKE_STR_CODEPOINTS,
+    /* Operation-specialized accumulator opcodes. The original 14-byte
+     * instruction layout is retained; the operation is encoded in the opcode. */
+    OP_Q_ACC_I_MOD = 0xE0, OP_Q_ACC_I_MUL, OP_Q_ACC_I_SUB,
+    OP_Q_ACC_IM_MOD, OP_Q_ACC_IM_MUL, OP_Q_ACC_IM_SUB
 };
+#define OP_Q_INVOKE_STR_FIRST OP_Q_INVOKE_STR_SLICE
+#define OP_Q_INVOKE_STR_LAST OP_Q_INVOKE_STR_CODEPOINTS
 
 /* ------------------------------------------------------------------ */
 /* VM                                                                  */
@@ -718,7 +733,10 @@ struct VM {
     int hrun;                   /* an embedded program is running */
     int max_reentry;            /* max nested sp_call depth */
     double deadline_s;          /* wall-clock deadline (0 = none), see max_runtime_ms */
-    MCEnt mc[MC_SIZE]; /* last, so the hot fields above keep their small offsets */
+    MCEnt mc[MC_SIZE]; /* last hot-field cache; keep JIT-consumed offsets stable */
+    /* GC bookkeeping is appended so offsets consumed by native stencils do not move. */
+    size_t gc_mark_limit;       /* optional developer cap; zero means unlimited */
+    int gc_gray_overflow;       /* mark-stack fallback scan required */
 };
 
 
@@ -863,6 +881,13 @@ typedef struct JitUnit {
 /* Enter compiled code for the loop at HDR; 1 = it ran and left the interpreter state in the VM (top frame pc, vm->sp,
  * vm->ileft), 0 = nothing happened. */
 int jit_site(VM *vm, Proto *p, const uint8_t *hdr, SpValue *base, SpValue *sp);
+/* Recorded bytecode path used by the TraceJIT; PCs are offsets in the quickened Proto. */
+typedef struct TraceStep { const Proto *proto; uint32_t pc; uint8_t op; } TraceStep;
+int jit_trace_compile(VM *vm, Proto *p, uint32_t header, const TraceStep *steps, unsigned count,
+                      uint32_t stack_depth, int is_side, uint8_t parent_slot);
+/* 0 = not run, 1 = trace ran, 2 = MISS restored and side recording requested. */
+int jit_trace_site(VM *vm, Proto *p, const uint8_t *hdr, SpValue *base, SpValue *sp,
+                   uint8_t *side_parent_slot_out);
 /* Called from OP_CALL: after the call countdown ran out. Returns the unit to enter, or NULL. */
 JitUnit *jit_call_hot(VM *vm, SFunc *fn, SpValue *base);
 /* Run a unit whose frame is already pushed (nf = top frame, base = its base); state as for jit_site. */
@@ -944,5 +969,9 @@ int lib_invoke_builtin_method(VM *vm, SpValue recv, const char *name, size_t len
 int sp_invoke_method_exists(int type, const char *name, size_t len);
 /* same as lib_invoke_builtin_method, but the method name is a constant string and the lookup is cached */
 int lib_invoke_builtin_method_s(VM *vm, SpValue recv, const SString *name, int argc, SpValue *argv, SpValue *ret, int *found);
+/* Lookup helpers for immutable built-in string methods. */
+const NativeDesc *lib_string_method(const SString *name);
+int lib_string_method_id(const SString *name);
+int lib_invoke_string_method_id(VM *vm, SpValue recv, unsigned id, int argc, SpValue *argv, SpValue *ret);
 
 #endif

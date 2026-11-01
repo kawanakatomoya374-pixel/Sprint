@@ -6,7 +6,7 @@
 #endif
 #include "tools.h"
 
-#define SPRINT_VERSION "2.31.0"
+#define SPRINT_VERSION "2.63.0"
 
 static int usage(FILE *f) {
     (void)fputs("usage: sprint run [--json] [--deterministic] [--max-heap N] [--max-instr N]\n"

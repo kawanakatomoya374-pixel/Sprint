@@ -93,14 +93,14 @@ static int64_t rng_int(VM *vm, int64_t lo, int64_t hi) {
 
 static int r_seed(VM *vm, int argc, SpValue *argv, SpValue *ret) {
     (void)argc; (void)ret;
-    int64_t n;
+    int64_t n = 0;
     if (need_int(vm, argv[0], "seed", &n)) return 1;
     rng_seed(vm, (uint64_t)n);
     return 0;
 }
 static int r_int(VM *vm, int argc, SpValue *argv, SpValue *ret) {
     (void)argc;
-    int64_t lo, hi;
+    int64_t lo = 0, hi = 0;
     if (need_int(vm, argv[0], "lo", &lo) || need_int(vm, argv[1], "hi", &hi)) return 1;
     if (lo > hi) return vm_set_error(vm, E_VALUE, "random.int(): lo must be <= hi");
     if (rng_ready(vm)) return 1;

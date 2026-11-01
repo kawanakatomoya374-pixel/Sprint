@@ -6,7 +6,7 @@
 
 - **薄いC/asm** (`os/boot`, `os/kernel`): 起動(32→64bit)、GDT/TSS/IDT、SYSCALL入口、トラップの保存/復帰、`hw` モジュール(ポートI/O、物理メモリpeek/poke、framebuffer、ctx切替)。
 - **ポリシーは全てSprint** (`os/sprint`): `kmem`(物理ページ)、`vmm`(4段ページテーブルの構築/走査/解放)、`kelf`(ELFローダ)、`kproc`(プロセス/メモリ領域/要求時ページング)、`ksys`(Linux互換syscall表)、`osmain`(カーネル本体ループ)、`ps2`/`rtc`(ドライバ)。
-- **Ring 3**: `os/user/umain.c` は同じSprintインタプリタを静的PIEでビルドしたもの。`os/user/*.sp` が各プロセスの中身で、**各ユーザプロセスは独立したSprint VM**。カーネルは `initrd.S` で組み込んだ ELF を `kelf` でロードする。
+- **Ring 3**: `os/user/umain.c` は同じSprintインタプリタを静的PIEでビルドしたもの（リンクは `os/tools/link_userland.sh`。`musl-gcc -static-pie` の結果が ET_DYN・PT_INTERP なし・DT_NEEDED なしの静的PIEであることを検査し、古い `musl-gcc.specs` で動的PIEになったときは `rcrt1.o` を明示して作り直す）。`os/user/*.sp` が各プロセスの中身で、**各ユーザプロセスは独立したSprint VM**。カーネルは `initrd.S` で組み込んだ ELF を `kelf` でロードする。
 - **トラップモデル**: `hw.enter(ctx)` はユーザ空間へ入り、トラップ/syscall でベクタ番号(256=syscall)を返してカーネルのSprintループに戻る。
 
 ## 現状 (2.8.0)
