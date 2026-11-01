@@ -2490,6 +2490,15 @@ static int jh_setidx(VM *vm, const SpValue *o, const SpValue *k, const SpValue *
     if (o->type == T_NATIVE) return typed_is(*o) && typed_poke(*o, *k, *v);
     return 0;
 }
+/* [a, b, ...] / []: the elements sit in the consecutive stack slots ops[0..n-1] (published to the collector by ST_hconcat) */
+static int jh_newarr(VM *vm, const SpValue *ops, unsigned n, SpValue *dst) {
+    if (vm->bytes >= vm->gc_next) vm_gc(vm);
+    SArray *a = vm_new_array(vm, (int64_t)n);
+    for (unsigned i = 0; i < n; i++) a->items[i] = ops[i];
+    a->len = (int64_t)n;
+    *dst = v_obj(T_ARRAY, a);
+    return 1;
+}
 static int jh_concat(VM *vm, const SpValue *ops, unsigned n, SpValue *dst) {
     if (vm->bytes >= vm->gc_next) vm_gc(vm);
     SString *s = vm_concat_fast(vm, ops, n);
@@ -2545,6 +2554,25 @@ static int do_set_index_h(JC *c) {
     if (c->xe < 0) FAIL("out of memory");
     EM(ST_hset, soff(c, c->dep), roff(c, a, pa), roff(c, i, pi), roff(c, v, pv), 0, (uint64_t)(uintptr_t)jh_setidx);
     c->dep -= 3;
+    c->rax_off = -1; c->xmm_off = -1; c->skip1 = 0; c->skipx = 0;
+    return 1;
+}
+
+static int do_newarray(JC *c, uint32_t pc) {
+    int n = (int)rd16(c->code + pc + 1);
+    int p0 = c->dep - n;
+    if (n > 64 || p0 < c->d0) FAIL("array literal");
+    if (!flush_regs(c)) return 0;
+    /* The allocation is about to happen, and a later exit resumes from the oldest entry that is still pending (see gexit) and
+     * runs everything after it again: realise the whole stack first, or the array would be allocated twice. */
+    if (!flush_from(c, c->d0, c->dep)) return 0;
+    c->xe = gexit(c);
+    if (c->xe < 0) FAIL("out of memory");
+    EM(ST_hconcat, soff(c, p0), soff(c, p0), n, soff(c, c->dep), 0, (uint64_t)(uintptr_t)jh_newarr);
+    c->dep -= n;
+    Ent *r = push(c, EK_MEM, TY_ARR, 0);
+    if (!r) return 0;
+    r->ppc = pc;
     c->rax_off = -1; c->xmm_off = -1; c->skip1 = 0; c->skipx = 0;
     return 1;
 }
@@ -3328,6 +3356,7 @@ static int walk(JC *c) {
         }
         case OP_GET_INDEX: ok = do_get_index(c, pc, len, &skip); break;
         case OP_CONCAT: ok = do_concat(c, pc); break;
+        case OP_NEW_ARRAY: ok = do_newarray(c, pc); break;
         case OP_SET_INDEX: ok = do_set_index(c, pc); break;
         case OP_INVOKE: ok = do_invoke(c, pc, len, &skip); break;
         case OP_GET_MEMBER: ok = do_get_member(c, pc, len, &skip); break;
@@ -3367,7 +3396,7 @@ static int op_allowed(int op, int unit) {
     case OP_SUB: case OP_MUL: case OP_DIV: case OP_FLOOR_DIV: case OP_MOD: case OP_NEG: case OP_EQ: case OP_NE:
     case OP_LT: case OP_LE: case OP_GT: case OP_GE: case OP_JUMP: case OP_JUMP_IF_FALSE: case OP_JUMP_IF_TRUE:
     case OP_JUMP_IF_FALSE_OR_POP: case OP_JUMP_IF_TRUE_OR_POP: case OP_NOT:
-    case OP_GET_INDEX: case OP_SET_INDEX: case OP_INVOKE: case OP_RANGE_PREP: case OP_RANGE_NEXT: case OP_FOR_NEXT: case OP_CONCAT:
+    case OP_GET_INDEX: case OP_SET_INDEX: case OP_INVOKE: case OP_RANGE_PREP: case OP_RANGE_NEXT: case OP_FOR_NEXT: case OP_CONCAT: case OP_NEW_ARRAY:
     case OP_LOAD_LINK: case OP_CALL: case OP_LOAD_UPVAL: case OP_STORE_UPVAL: case OP_GET_MEMBER: case OP_SET_MEMBER:
         return 1;
     case OP_RETURN: case OP_RETURN_NIL:
