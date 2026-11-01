@@ -13,6 +13,7 @@ make            # 厳格リリースビルド → build/sprint
 make test       # 回帰テスト（stdout と終了コードを比較）
 make debug && make test-san   # ASan + UBSan 版で同じテスト
 make analyze    # GCC 静的解析 (-fanalyzer)
+make strict-clang # clang -Weverything -Werror（構文検査）。`make strict` は GCC厳格ビルド・ASan版・analyze・これを全部実行
 make fuzz       # .spc ローダ/verifier/VM の変異ファジング（ASan+UBSan）
 make lib        # 埋め込み用 build/libsprint.a（ヘッダ src/sprint.h。リンクは -lm -ldl）
 make test-embed # 埋め込みAPIのテスト（通常版＋ASan/UBSan版）とサンプル

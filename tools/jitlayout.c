@@ -29,6 +29,7 @@ int main(void) {
     P("L_INST_SLOTS", offsetof(SInstance, slots));
     P("L_SFUNC_PROTO", offsetof(SFunc, proto));
     P("L_SFUNC_UP", offsetof(SFunc, up));
+    P("L_SFUNC_NAT", offsetof(SFunc, nat));
     P("L_CELL_V", offsetof(SCell, v));
     P("L_PROTO_JUNIT", offsetof(Proto, junit));
     P("L_JU_ENTRY", offsetof(JitUnit, entry));

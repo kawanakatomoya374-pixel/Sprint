@@ -2478,7 +2478,7 @@ RunStatus vm_run_program(VM *vm, Program *prog, int argc, char **argv) {
     if (setjmp(vm->fatal_jb) == 0) {
         run_link_range(vm, prog, 0);
         vm->result = RS_OK;
-        for (int mi = 0; mi < prog->nmods && vm->result == RS_OK; mi++) vm->result = run_module(vm, prog, mi);
+        for (int mi = 0; mi < prog->nmods && vm->result == RS_OK; mi++) { const RunStatus mrs = run_module(vm, prog, mi); vm->result = (RunStatusInt)mrs; }
     } else {
         vm->result = vm->fatal_status;
     }
@@ -2519,7 +2519,7 @@ RunStatus vm_run_chunk(VM *vm, Program *prog) {
         vm->result = RS_OK;
         while (vm->mods_run < prog->nmods && vm->result == RS_OK) {
             int mi = vm->mods_run++;
-            vm->result = run_module(vm, prog, mi);
+            { const RunStatus mrs = run_module(vm, prog, mi); vm->result = (RunStatusInt)mrs; }
         }
     } else {
         vm->result = vm->fatal_status;

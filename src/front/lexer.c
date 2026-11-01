@@ -312,13 +312,13 @@ static void lex_number(Lexer *L) {
             buf[bl++] = (char)d; ndig++; last_us = 0; adv(L); \
         } \
         if (last_us) lerr(L, L->line, L->col, L->pos, "misplaced '_' in number literal");
-    DIGITS();
+    DIGITS()
     if (peekc(L, 0) == '.' && peekc(L, 1) >= '0' && peekc(L, 1) <= '9') {
         isfloat = 1;
         buf[bl++] = '.';
         adv(L);
         ndig = 0; last_us = 0;
-        DIGITS();
+        DIGITS()
     }
     c = peekc(L, 0);
     if (c == 'e' || c == 'E') {
@@ -330,7 +330,7 @@ static void lex_number(Lexer *L) {
             adv(L);
             if (peekc(L, 0) == '+' || peekc(L, 0) == '-') { buf[bl++] = (char)peekc(L, 0); adv(L); }
             ndig = 0; last_us = 0;
-            DIGITS();
+            DIGITS()
         }
     }
     #undef DIGITS

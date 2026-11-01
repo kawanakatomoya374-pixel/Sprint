@@ -24,8 +24,11 @@ GUIPARTS := $(sort $(wildcard stdlib/gui/*.sp))
 cc-opt   = $(shell $(CC) $(1) -x c -c /dev/null -o /dev/null >/dev/null 2>&1 && echo $(1))
 WERROR   ?= -Werror
 OPT_WARN := $(foreach f,-Wstrict-flex-arrays -Warray-compare -Warith-conversion -Wc11-c2x-compat -Wattribute-alias=2 \
-                        -Wmultistatement-macros -Wfree-nonheap-object -Wcast-align=strict -Wimplicit-fallthrough=5,$(call cc-opt,$(f)))
-OPT_HARD := $(foreach f,-fstrict-flex-arrays=3 -ftrivial-auto-var-init=zero -fcf-protection=full -fwrapv-pointer -fstack-clash-protection,$(call cc-opt,$(f)))
+                        -Wmultistatement-macros -Wfree-nonheap-object -Wcast-align=strict -Wimplicit-fallthrough=5 \
+                        -Wcast-function-type -Walloc-zero -Walloc-size -Wvla-larger-than=0 -Wmissing-noreturn -Wstringop-overread \
+                        -Wenum-conversion -Wabsolute-value -Wmissing-format-attribute -Wdeprecated-non-prototype \
+                        -Wstack-usage=32768 -Wshadow=local -Wtrivial-auto-var-init,$(call cc-opt,$(f)))
+OPT_HARD := $(foreach f,-fstrict-flex-arrays=3 -ftrivial-auto-var-init=zero -fcf-protection=full -fwrapv-pointer -fstack-clash-protection -fno-plt,$(call cc-opt,$(f)))
 # without -ftrivial-auto-var-init (GCC 12+) older compilers report possible uninitialised reads in a few output-parameter
 # idioms (lib_gfx.c); the locals are initialised on every path that uses them, so that one warning stays a warning there
 ifeq ($(findstring -ftrivial-auto-var-init=zero,$(OPT_HARD)),)
@@ -55,7 +58,8 @@ WARN     := $(WERROR) $(OPT_WARN) -Wall -Wextra \
             -Wint-in-bool-context -Wmisleading-indentation -Wparentheses \
             -Wframe-larger-than=65536 -Wlarger-than=8388608 \
             -Wsuggest-attribute=format -Wsuggest-attribute=noreturn \
-            -Wno-error=unsafe-loop-optimizations
+            -Wno-error=unsafe-loop-optimizations \
+            -Wno-unknown-warning-option
 
 # ---- hardening ---------------------------------------------------------------
 HARDEN   := -fstack-protector-strong -D_FORTIFY_SOURCE=3 -fno-common -fno-strict-overflow \
@@ -63,15 +67,17 @@ HARDEN   := -fstack-protector-strong -D_FORTIFY_SOURCE=3 -fno-common -fno-strict
 # Fail closed on unresolved symbols or linker diagnostics, and keep executable
 # code in a separate segment in addition to PIE/RELRO/NX hardening.
 LDHARDEN := -pie -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack \
-            -Wl,-z,separate-code -Wl,-z,defs -Wl,--fatal-warnings
+            -Wl,-z,separate-code -Wl,-z,defs -Wl,--fatal-warnings -Wl,--as-needed -Wl,-z,nodump \
+            -Wl,--no-copy-dt-needed-entries -Wl,-O1 -Wl,--sort-common -Wl,--hash-style=gnu
 
 INC      := -Isrc
 comma    := ,
-TUNE     := $(if $(filter x86_64,$(shell uname -m)),-mtune-ctrl=^sse_unaligned_load_optimal$(comma)^sse_unaligned_store_optimal,)
+TUNE_FLAG := -mtune-ctrl=^sse_unaligned_load_optimal$(comma)^sse_unaligned_store_optimal
+TUNE     := $(if $(filter x86_64,$(shell uname -m)),$(shell $(CC) $(TUNE_FLAG) -x c -c /dev/null -o /dev/null >/dev/null 2>&1 && echo $(TUNE_FLAG)),)
 CFLAGS_REL := $(STD) $(WARN) $(HARDEN) -O2 $(TUNE) -g $(INC) -DNDEBUG_SP
 CFLAGS_DBG := $(STD) $(WARN) $(HARDEN) -O0 -g3 $(INC) \
               -fsanitize=address,undefined -fno-sanitize-recover=undefined \
-              -fno-omit-frame-pointer
+              -fsanitize=bounds-strict,float-cast-overflow -fstack-protector-all -fno-omit-frame-pointer
 LDFLAGS_DBG := -fsanitize=address,undefined
 
 FRONT_SRC   := src/front/lexer.c src/front/parser.c src/front/parse_expr.c src/front/compiler.c src/front/cmp_util.c src/front/cmp_expr.c src/front/cmp_stmt.c src/front/cmp_class.c src/front/cmp_import.c src/front/disasm.c src/front/loader.c
@@ -147,6 +153,21 @@ analyze: $(GEN)/bundled.c
 	    -fsyntax-only $$f || exit 1; \
 	done
 
+# clang -Weverything (minus the checks that contradict this code base on purpose: unsafe-buffer-usage wants span types,
+# padded is the explicit ABI padding of SpValue, declaration-after-statement is C89 style, the C++98/pre-C11 compat checks
+# are irrelevant). Together with the GCC build above and `make analyze` this is the strictest gate: `make strict`.
+CLANG ?= clang
+CLANG_STRICT := -std=c11 -Weverything -Werror -Wno-unsafe-buffer-usage -Wno-padded -Wno-declaration-after-statement \
+                -Wno-pre-c11-compat -Wno-c++98-compat -Wno-covered-switch-default -Wno-switch-default \
+                -Wno-disabled-macro-expansion -Wno-unknown-warning-option
+strict-clang: $(GEN)/bundled.c
+	@for f in $(ALLSRC); do \
+	  echo "clang $$f"; \
+	  $(CLANG) $(CLANG_STRICT) $(INC) -DNDEBUG_SP -fsyntax-only $$f || exit 1; \
+	done
+strict: all debug analyze strict-clang
+.PHONY: strict-clang strict
+
 # shared libraries used by the ffi tests (the C++ one only when a C++ compiler exists)
 FFI_LIBS := $(BUILD)/libctest.so $(if $(shell command -v c++ 2>/dev/null),$(BUILD)/libcxxtest.so)
 $(BUILD)/libctest.so: tests/ffi/ctest.c
@@ -209,6 +230,7 @@ clean:
 include os/os.mk
 
 # Deliberately not enabled:
+#  -Wunsuffixed-float-constants, -Wdeclaration-after-statement, -Wtraditional-conversion   style checks, not defects
 #  -Wpadded            SpValue's explicit padding is part of the ABI (SPEC 6.2)
 #  -Wtraditional, -Wsystem-headers   obsolete / noise from libc
 #  -fanalyzer in the normal build    slow; run `make analyze` instead

@@ -1435,6 +1435,82 @@ ST hnat                         # slot H0 <- HQ2(vm, the H2 args from slot H1) t
     test %eax,%eax
     jz JIT_X
 
+# ---- direct calls of prepared ffi functions (numeric-only signatures; see ffi_jit_info in lib_ffi.c) ------------------
+# The compiled call flushes the callee and its arguments to their slots, then: ff_fn checks that the callee is the prepared
+# function the code was compiled for (compared by its descriptor, which is never freed), ff_iaK / ff_faK check the type of
+# an argument slot and load it into the K-th C argument register, ff_call calls the C function, ff_sx*/ff_zx* extend a
+# narrow integer result and ff_r* store the result into slot H0. Every failed guard leaves through JIT_X *before* the C
+# function runs, so the interpreter simply repeats the call. Nothing here allocates or touches VM state.
+ST ff_fn                        # H0 = callee slot, HQ = the PrepFn's NativeDesc
+    cmpq $T_FUNCTION,H0(%r12)
+    jne JIT_X
+    mov H0+8(%r12),%rax
+    movabs $HQ,%rcx
+    cmp %rcx,L_SFUNC_NAT(%rax)
+    jne JIT_X
+
+.macro FF_IARG k, reg
+    ST ff_ia\k                  # int slot H0 -> C integer argument \k
+    cmpq $T_INT,H0(%r12)
+    jne JIT_X
+    mov H0+8(%r12),%\reg
+.endm
+FF_IARG 0, rdi
+FF_IARG 1, rsi
+FF_IARG 2, rdx
+FF_IARG 3, rcx
+FF_IARG 4, r8
+FF_IARG 5, r9
+
+.macro FF_FARG k
+    ST ff_fa\k                  # float (or int, converted) slot H0 -> C floating-point argument \k
+    cmpq $T_FLOAT,H0(%r12)
+    jne 1f
+    movsd H0+8(%r12),%xmm\k
+    jmp 2f
+1:
+    cmpq $T_INT,H0(%r12)
+    jne JIT_X
+    cvtsi2sdq H0+8(%r12),%xmm\k
+2:
+.endm
+FF_FARG 0
+FF_FARG 1
+FF_FARG 2
+FF_FARG 3
+FF_FARG 4
+FF_FARG 5
+FF_FARG 6
+FF_FARG 7
+
+ST ff_call                      # HQ = the C function
+    movabs $HQ,%rax
+    call *%rax
+
+ST ff_sx32
+    movslq %eax,%rax
+ST ff_zx32
+    mov %eax,%eax
+ST ff_sx16
+    movswq %ax,%rax
+ST ff_zx16
+    movzwl %ax,%eax
+ST ff_sx8
+    movsbq %al,%rax
+ST ff_zx8
+    movzbl %al,%eax
+ST ff_ri64                      # integer result -> slot H0 (the extension stencils above fall through into this one)
+    movq $T_INT,H0(%r12)
+    mov %rax,H0+8(%r12)
+ST ff_rf32
+    cvtss2sd %xmm0,%xmm0
+ST ff_rf64
+    movq $T_FLOAT,H0(%r12)
+    movsd %xmm0,H0+8(%r12)
+ST ff_rnil
+    movq $0,H0(%r12)
+    movq $0,H0+8(%r12)
+
 # for k, v in table / for k in table: H1 = the loop state (table, cursor, version), H0 = where the key (and, with H2 == 2, the value)
 # goes. HQ = helper(vm, state, dst, n): 0 = leave for the interpreter (it raises the errors), 1 = next entry, 2 = done -> JIT_T.
 ST tnext

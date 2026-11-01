@@ -758,7 +758,6 @@ static int trace_value_type(SpType runtime_type, SpTIRType *tir_type) {
     default:
         return 0;
     }
-    return 0;
 }
 
 static uint8_t trace_ir_runtime_type(const SpTraceIR *ir, SpTIRValue value) {

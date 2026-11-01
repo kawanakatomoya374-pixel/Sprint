@@ -711,6 +711,36 @@ int ffi_jit_safe(const NativeDesc *d) {
     return d->fn == prep_invoke && ((const PrepFn *)(const void *)d)->jit_ok;
 }
 
+int ffi_jit_info(const NativeDesc *d, FfiJit *out) {
+    if (!ffi_jit_safe(d)) return 0;
+    const PrepFn *p = (const PrepFn *)(const void *)d;
+    int ni = 0, nd = 0;
+    for (int i = 0; i < p->sig.nargs; i++) {
+        switch (p->sig.args[i]) {
+        case C_F64: out->cls[i] = 'd'; nd++; break;
+        case C_I64: case C_U64: out->cls[i] = 'i'; ni++; break;
+        default: return 0;
+        }
+    }
+    if (ni > MAX_INT_ARGS || nd > MAX_FP_ARGS) return 0;
+    switch (p->sig.ret) {
+    case C_VOID: out->ret = FFJ_VOID; break;
+    case C_F64: out->ret = FFJ_F64; break;
+    case C_F32: out->ret = FFJ_F32; break;
+    case C_I64: case C_U64: out->ret = FFJ_I64; break;
+    case C_I32: out->ret = FFJ_I32; break;
+    case C_U32: out->ret = FFJ_U32; break;
+    case C_I16: out->ret = FFJ_I16; break;
+    case C_U16: out->ret = FFJ_U16; break;
+    case C_I8: out->ret = FFJ_I8; break;
+    case C_U8: out->ret = FFJ_U8; break;
+    default: return 0;
+    }
+    out->fn = (void *)(uintptr_t)p->addr;
+    out->nargs = p->sig.nargs;
+    return 1;
+}
+
 static int make_prepared(VM *vm, int64_t addr, const SString *sigs, SpValue *ret, int share) {
     Sig sig;
     if (parse_sig(vm, sigs, &sig)) return 1;

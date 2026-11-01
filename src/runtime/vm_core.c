@@ -18,7 +18,7 @@ VM *vm_new(const Limits *lim, int caps) {
         if (ml != NULL && ml[0] >= '1' && ml[0] <= '9') {
             char *end = NULL;
             unsigned long long parsed = strtoull(ml, &end, 10);
-            if (end != ml && *end == '\0' && parsed <= (unsigned long long)SIZE_MAX)
+            if (end != ml && *end == '\0' && (unsigned long long)(size_t)parsed == parsed)
                 vm->gc_mark_limit = (size_t)parsed;
         }
     }

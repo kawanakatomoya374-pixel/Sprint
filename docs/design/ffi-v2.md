@@ -1,6 +1,6 @@
 # Sprint FFI v2 設計 — LuaJIT 級（以上）のC連携と Asm 呼出し
 
-状態: 設計（段階1を実装予定）。規範化するときは `docs/spec/15-stdlib/15-ffi.md` に反映する。
+状態: 段階1・3（数値のみの署名）実装済み。段階2・4は未着手。規範化するときは `docs/spec/15-stdlib/15-ffi.md` に反映する。
 
 ## 1. 現状の測定済みボトルネック（`src/lib/lib_ffi.c`, `stdlib/ffi.sp`）
 
@@ -78,7 +78,7 @@
 
 ## 5. 段階
 
-1. **PreparedCall（VM経路）＋ `ffi.asm` ＋ `asm` capability** ← 次に実装
-2. 専用スタブ
-3. JIT inline（CALL_C）
-4. CData/union/ビットフィールド/グローバル変数/動的 callback
+1. **PreparedCall（VM経路）＋ `ffi.asm` ＋ `asm` capability** — 実装済み（`_ffi.prep` / `_ffi.asm`、`lib_ffi.c` の `PrepFn`）
+2. 専用スタブ — 未着手
+3. JIT inline — **実装済み**。署名が「引数すべて i64/u64/f64（整数6・浮動8まで）、非可変長、戻り値が文字列/構造体以外」のとき、`jit.c` の `emit_ffcall` が stencil `ff_fn`（呼出し先の `PrepFn` 同一性ガード）→ `ff_ia*`/`ff_fa*`（引数の型ガード＋レジスタ載せ）→ `ff_call`（C関数を直接 call）→ `ff_sx*`/`ff_zx*`/`ff_r*`（戻り値の拡張と格納）を並べる。ガード失敗は C 関数の実行前に `JIT_X` で抜け、インタプリタが同じ呼出しをやり直す（副作用なし）。ポインタ/文字列引数・callback を含む署名は、再入や割当てを伴い得るため対象外（ヘルパー経由 `jh_ffi` か通常経路）。実測: `sqrt` 2000万回ループ 9.26s → 約0.08s（呼出し単体）。
+4. CData/union/ビットフィールド/グローバル変数/動的 callback — 未着手

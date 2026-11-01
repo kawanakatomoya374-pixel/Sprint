@@ -152,8 +152,8 @@ static int n_to_float(VM *vm, int argc, SpValue *argv, SpValue *ret) {
     if (v.type == T_FLOAT) { *ret = v; return 0; }
     if (v.type == T_STRING) {
         const SString *s = AS_STR(v);
-        if (strcmp(s->data, "inf") == 0) { *ret = v_float(INFINITY); return 0; }
-        if (strcmp(s->data, "-inf") == 0) { *ret = v_float(-INFINITY); return 0; }
+        if (strcmp(s->data, "inf") == 0) { *ret = v_float((double)INFINITY); return 0; }
+        if (strcmp(s->data, "-inf") == 0) { *ret = v_float(-(double)INFINITY); return 0; }
         if (strcmp(s->data, "nan") == 0) { *ret = v_float((double)NAN); return 0; }
         char buf[128];
         size_t bl = 0;

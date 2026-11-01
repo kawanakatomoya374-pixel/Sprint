@@ -1654,6 +1654,42 @@ static int emit_nat_h(JC *c, uint32_t pc, int pf, int argc, const NativeDesc *nd
     return 1;
 }
 
+/* A call of a prepared ffi function, straight into C: guard the callee, load each argument slot into its C register, call,
+ * store the result (stencils ff_*). fi describes the signature the code is specialised for. */
+static int emit_ffcall(JC *c, uint32_t pc, int pf, int argc, const NativeDesc *nd, const FfiJit *fi) {
+    if (!flush_regs(c) || !flush_from(c, pf, c->dep)) return 0;
+    c->xe = gexit(c);
+    if (c->xe < 0) FAIL("out of memory");
+    EM(ST_ff_fn, soff(c, pf), 0, 0, 0, 0, (uint64_t)(uintptr_t)nd);
+    int ni = 0, nf = 0;
+    for (int i = 0; i < argc; i++) {
+        if (fi->cls[i] == 'i') EM(ST_ff_ia0 + ni++, soff(c, pf + 1 + i), 0, 0, 0, 0, 0);
+        else EM(ST_ff_fa0 + nf++, soff(c, pf + 1 + i), 0, 0, 0, 0, 0);
+    }
+    EM(ST_ff_call, 0, 0, 0, 0, 0, (uint64_t)(uintptr_t)fi->fn);
+    int32_t dst = soff(c, pf);
+    int rty = TY_INT;
+    switch (fi->ret) {
+    case FFJ_I32: EM(ST_ff_sx32, 0, 0, 0, 0, 0, 0); break;
+    case FFJ_U32: EM(ST_ff_zx32, 0, 0, 0, 0, 0, 0); break;
+    case FFJ_I16: EM(ST_ff_sx16, 0, 0, 0, 0, 0, 0); break;
+    case FFJ_U16: EM(ST_ff_zx16, 0, 0, 0, 0, 0, 0); break;
+    case FFJ_I8: EM(ST_ff_sx8, 0, 0, 0, 0, 0, 0); break;
+    case FFJ_U8: EM(ST_ff_zx8, 0, 0, 0, 0, 0, 0); break;
+    default: break;
+    }
+    if (fi->ret == FFJ_F64) { EM(ST_ff_rf64, dst, 0, 0, 0, 0, 0); rty = TY_FLT; }
+    else if (fi->ret == FFJ_F32) { EM(ST_ff_rf32, dst, 0, 0, 0, 0, 0); rty = TY_FLT; }
+    else if (fi->ret == FFJ_VOID) { EM(ST_ff_rnil, dst, 0, 0, 0, 0, 0); rty = TY_UNK; }
+    else EM(ST_ff_ri64, dst, 0, 0, 0, 0, 0);
+    c->dep -= argc + 1;
+    Ent *r = push(c, EK_MEM, rty, 0);
+    if (!r) return 0;
+    r->ppc = pc;
+    c->rax_off = -1; c->xmm_off = -1; c->skip1 = 0; c->skipx = 0;
+    return 1;
+}
+
 static int do_call_len(JC *c, uint32_t pc, int len, uint32_t *skip) {
     int pb = c->dep - 1, pf = c->dep - 2;
     Ent *a = &c->st[pb];
@@ -2062,13 +2098,29 @@ static int do_call(JC *c, uint32_t pc, int len, uint32_t *skip) {
         }
         /* to_float / to_int never allocate or touch VM state, and an error leaves nothing changed (the interpreter repeats
          * the call to report it), like the pure math natives */
-        if (argc == 1 && strcmp(nd->name, "to_float") == 0) return emit_nat(c, pc, pf, 1, nd, TY_FLT);
+        if (argc == 1 && strcmp(nd->name, "to_float") == 0) {
+            if (c->st[c->dep - 1].ty == TY_INT && c->st[c->dep - 1].kind != EK_K) {   /* an int: the conversion is one instruction */
+                if (!flush_regs(c) || !flush_from(c, pf, c->dep)) return 0;
+                EM(ST_i2f, soff(c, pf), soff(c, pf + 1), 0, 0, 0, 0);
+                c->dep -= 2;
+                Ent *r = push(c, EK_MEM, TY_FLT, 0);
+                if (!r) return 0;
+                r->ppc = pc;
+                c->rax_off = -1; c->xmm_off = -1; c->skip1 = 0; c->skipx = 0;
+                return 1;
+            }
+            return emit_nat(c, pc, pf, 1, nd, TY_FLT);
+        }
         if (argc == 1 && strcmp(nd->name, "to_int") == 0) return emit_nat(c, pc, pf, 1, nd, TY_INT);
         if (ffi_jit_safe(nd)) return emit_nat(c, pc, pf, argc, nd, TY_UNK);
         FAIL("call of a builtin");
     }
-    if (f->kind != EK_K && f->hint && f->hint->type == T_FUNCTION && AS_FUNC(*f->hint)->nat && ffi_jit_safe(AS_FUNC(*f->hint)->nat))
+    if (f->kind != EK_K && f->hint && f->hint->type == T_FUNCTION && AS_FUNC(*f->hint)->nat && ffi_jit_safe(AS_FUNC(*f->hint)->nat)) {
+        FfiJit fi;
+        if (ffi_jit_info(AS_FUNC(*f->hint)->nat, &fi) && fi.nargs == argc)
+            return emit_ffcall(c, pc, pf, argc, AS_FUNC(*f->hint)->nat, &fi);
         return emit_nat_h(c, pc, pf, argc, AS_FUNC(*f->hint)->nat, TY_UNK, jh_ffi);
+    }
     if (f->kind != EK_K && f->hint && f->hint->type == T_CLASS) return do_construct(c, pc, len, argc, AS_CLASS(*f->hint));
     if (!flush_from(c, c->d0, c->dep)) return 0;
     int x = exit_for(c, pc, c->dep);

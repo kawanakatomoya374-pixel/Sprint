@@ -44,7 +44,6 @@ static Node *parse_fstring(Parser *P, const Token *t) {
     const char *s = t->sval;
     size_t n = t->slen, i = 0;
     Node *acc = NULL;
-    int nparts = 0;
     while (i < n) {
         size_t j = i;
         while (j < n && s[j] != 1) j++;
@@ -52,7 +51,6 @@ static Node *parse_fstring(Parser *P, const Token *t) {
         if (j > i) part = fstr_text(P, t, s + i, j - i);
         if (part) {
             acc = acc ? bin(P, t, TK_DOTDOT, acc, part) : part;
-            nparts++;
         }
         if (j >= n) break;
         size_t k = j + 1;
@@ -80,7 +78,6 @@ static Node *parse_fstring(Parser *P, const Token *t) {
         free(buf);
         if (!acc) acc = bin(P, t, TK_DOTDOT, fstr_text(P, t, "", 0), e);
         else acc = bin(P, t, TK_DOTDOT, acc, e);
-        nparts++;
         i = k + 1;
     }
     if (!acc) return fstr_text(P, t, "", 0);

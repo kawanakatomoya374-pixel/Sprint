@@ -790,6 +790,15 @@ extern const NativeDesc math_fns[];
 extern const int math_fns_count;
 int math_fast1(const NativeDesc *d, double x, double *out);
 int ffi_jit_safe(const NativeDesc *d); /* prepared numeric-only ffi function: compiled code may call it (lib_ffi.c) */
+/* A prepared ffi function that compiled code can call directly (stencils ff_*): at most 6 integer and 8 floating-point
+ * arguments, every one of them i64/u64/f64. cls[i] is 'i' or 'd'; ret is one of the FFJ_* kinds. */
+enum { FFJ_VOID, FFJ_F64, FFJ_F32, FFJ_I64, FFJ_I32, FFJ_U32, FFJ_I16, FFJ_U16, FFJ_I8, FFJ_U8 };
+typedef struct FfiJit {
+    void *fn;
+    int nargs, ret;
+    char cls[14];
+} FfiJit;
+int ffi_jit_info(const NativeDesc *d, FfiJit *out);
 int math_pure_native(const NativeDesc *d);
 int table_get_sstr(const STable *t, const SString *key, SpValue *out);
 int64_t table_find_sstr(const STable *t, const SString *key); /* entry index or -1 */
