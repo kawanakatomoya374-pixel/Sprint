@@ -396,6 +396,28 @@ static int ta_fdiv_zero_guard(TraceAsm *a) {
     p.target = TA_DEOPT;
     return ta_stencil(a, ST_tr_fdiv_guard, &p);
 }
+static int ta_div_guard(TraceAsm *a) {
+    TracePatch p = ta_patch();
+    p.target = TA_DEOPT;
+    return ta_stencil(a, ST_tr_div_guard, &p);
+}
+static int ta_sar_imm(TraceAsm *a, uint8_t reg, uint8_t count) {
+    TracePatch p = ta_patch();
+    p.b[0] = (uint8_t)(0x48U | (reg >= 8U ? 0x01U : 0U));
+    p.b[1] = (uint8_t)(0xf8U | (reg & 7U));
+    p.b[2] = count;
+    return ta_stencil(a, ST_tr_sar_imm, &p);
+}
+/* the value of an integer constant defined in this trace, for strength-reducing divisions by a constant */
+static int ta_const_i64(const SpTraceIR *ir, SpTIRValue v, int64_t *out) {
+    for (size_t i = 0U; i < ir->count; i++)
+        if (ir->inst[i].dst == v && ir->inst[i].op == SP_TIR_CONST_I64) { *out = (int64_t)ir->inst[i].imm; return 1; }
+    return 0;
+}
+static int ta_plain(TraceAsm *a, int sid) {
+    TracePatch p = ta_patch();
+    return ta_stencil(a, sid, &p);
+}
 static int ta_fcmp_ne_guard(TraceAsm *a) {
     TracePatch p = ta_patch();
     p.target = TA_EXIT;
@@ -498,6 +520,20 @@ static uint8_t ta_cmp_false_cc(SpTIROp op) {
     default: return 0U;
     }
 }
+/* idiv works in rax and rdx. A trace that divides allocates them last (the pool order), and saves them around a division only if
+ * some value was in fact assigned to one of them */
+static int ta_has_div(const SpTraceIR *ir) {
+    for (size_t i = 0U; i < ir->count; i++)
+        if (ir->inst[i].op == SP_TIR_IDIV || ir->inst[i].op == SP_TIR_IMOD) return 1;
+    return 0;
+}
+static const uint8_t TA_GPR_POOL_DIV[10] = {1U, 3U, 6U, 7U, 8U, 9U, 14U, 15U, 0U, 2U};
+static int ta_uses_rax_rdx(const SpTraceIR *ir, const uint8_t *regs) {
+    for (uint32_t v = 1U; v <= ir->nvalues; v++)
+        if (regs[v] == 0U || regs[v] == 2U) return 1;
+    return 0;
+}
+
 static int ta_alloc_regs(const SpTraceIR *ir, const int32_t *phi_local, uint8_t **regs_out) {
     size_t n = (size_t)ir->nvalues + 1U;
     uint8_t *regs = (uint8_t *)malloc(n);
@@ -506,7 +542,8 @@ static int ta_alloc_regs(const SpTraceIR *ir, const int32_t *phi_local, uint8_t 
     JitRegBank bank;
     int ok = 0;
     if (!regs || !pinned || !last || !phi_local || !regs_out) goto done;
-    jit_ra_init(&bank, JIT_TRACE_GPR_POOL, sizeof JIT_TRACE_GPR_POOL / sizeof JIT_TRACE_GPR_POOL[0]);
+    if (ta_has_div(ir)) jit_ra_init(&bank, TA_GPR_POOL_DIV, sizeof TA_GPR_POOL_DIV / sizeof TA_GPR_POOL_DIV[0]);
+    else jit_ra_init(&bank, JIT_TRACE_GPR_POOL, sizeof JIT_TRACE_GPR_POOL / sizeof JIT_TRACE_GPR_POOL[0]);
     memset(regs, UINT8_MAX, n);
 
     /* Loop-carried values and their entry parameters share one pinned register. */
@@ -708,7 +745,46 @@ static int ta_emit_trace_ir(const SpTraceIR *ir, const int32_t *phi_local,
                 ir->inst[i + 1U].a != in->dst || !ta_f64_compare(a, ra, rb) ||
                 !ta_f64_guard_false(a, in->op)) goto done;
             break;
-        case SP_TIR_IDIV: case SP_TIR_IMOD: case SP_TIR_RETURN:
+        case SP_TIR_IDIV: case SP_TIR_IMOD:
+            /* floor division / modulo; a zero or -1 divisor deoptimises (the interpreter raises the error, and handles
+             * INT64_MIN / -1 without the idiv trap). rax and rdx belong to the division (see ta_has_div). */
+            if (dst == UINT8_MAX || ra == UINT8_MAX || rb == UINT8_MAX) goto done;
+            {
+                int64_t c;
+                const int save = ta_uses_rax_rdx(ir, regs);
+                if (ta_const_i64(ir, in->b, &c) && c > 0 && (c & (c - 1)) == 0) {
+                    /* a power of two: floor division is an arithmetic shift, floor modulo a mask; no divide at all */
+                    if (!ta_reg_mov(a, dst, ra)) goto done;
+                    if (in->op == SP_TIR_IDIV) {
+                        if (c > 1 && !ta_sar_imm(a, dst, (uint8_t)__builtin_ctzll((unsigned long long)c))) goto done;
+                    } else if (!ta_reg_imm(a, 10U, (uint64_t)(c - 1)) || !ta_reg_binop(a, dst, 10U, 0x21U)) goto done;
+                    break;
+                }
+                if (ta_const_i64(ir, in->b, &c) && c > 1 && c < ((int64_t)1 << 31)) {
+                    /* another small constant divisor: multiply by its reciprocal (nothing to guard) */
+                    TracePatch mp = ta_patch();
+                    uint64_t magic;
+                    int shift = jit_magic_of(c, &magic);
+                    mp.q = magic; mp.h[0] = (int32_t)c; mp.b[0] = (uint8_t)shift;
+                    if ((save && !ta_plain(a, ST_tr_div_save)) || !ta_reg_mov(a, 0U, ra) ||
+                        !ta_stencil(a, in->op == SP_TIR_IDIV ? ST_tr_idiv_magic : ST_tr_imod_magic, &mp) ||
+                        (save && !ta_plain(a, ST_tr_div_restore)) || !ta_reg_mov(a, dst, 10U)) goto done;
+                    break;
+                }
+                if (ta_const_i64(ir, in->b, &c) && c > 1) {
+                    /* another constant divisor: nothing to guard */
+                    if (!ta_reg_imm(a, 10U, (uint64_t)c) || (save && !ta_plain(a, ST_tr_div_save)) || !ta_reg_mov(a, 0U, ra) ||
+                        !ta_plain(a, in->op == SP_TIR_IDIV ? ST_tr_idiv_core : ST_tr_imod_core) ||
+                        (save && !ta_plain(a, ST_tr_div_restore)) || !ta_reg_mov(a, dst, 10U)) goto done;
+                    break;
+                }
+                if (!ta_reg_mov(a, 10U, rb) || !ta_div_guard(a) || (save && !ta_plain(a, ST_tr_div_save)) ||
+                    !ta_reg_mov(a, 0U, ra) ||
+                    !ta_plain(a, in->op == SP_TIR_IDIV ? ST_tr_idiv_core : ST_tr_imod_core) ||
+                    (save && !ta_plain(a, ST_tr_div_restore)) || !ta_reg_mov(a, dst, 10U)) goto done;
+            }
+            break;
+        case SP_TIR_RETURN:
             goto done;
         default:
             goto done;
@@ -1295,6 +1371,9 @@ static int trace_build_ir(Proto *p, const SpValue *locals, uint32_t stack_depth,
         case OP_DIV:
             if (op == OP_DIV && !is_float) goto done;
             break;
+        case OP_MOD: case OP_FLOOR_DIV:
+            if (is_float) goto done;
+            break;
         default:
             goto done;
         }
@@ -1372,6 +1451,13 @@ static int trace_build_ir(Proto *p, const SpValue *locals, uint32_t stack_depth,
                     op->op == OP_ADD ? SP_TIR_IADD : op->op == OP_SUB ? SP_TIR_ISUB : SP_TIR_IMUL,
                     a, b, &result)) goto done;
             } else goto done;
+            stack[depth++] = result;
+            break;
+        case OP_MOD: case OP_FLOOR_DIV:
+            if (depth < 2U) goto done;
+            b = stack[--depth]; a = stack[--depth];
+            if (ir->value_types[a] != SP_TIR_T_I64 || ir->value_types[b] != SP_TIR_T_I64 ||
+                !sp_tir_emit_binary(ir, op->op == OP_MOD ? SP_TIR_IMOD : SP_TIR_IDIV, a, b, &result)) goto done;
             stack[depth++] = result;
             break;
         case OP_NEG:

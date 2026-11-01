@@ -37,6 +37,7 @@ int32_t jit_ra_owner(const JitRegBank *bank, int reg);
 void jit_ra_release(JitRegBank *bank, int reg);
 
 struct JitProto *jit_proto(Proto *p);
+int jit_magic_of(int64_t d, uint64_t *m); /* reciprocal of a constant divisor, shared by the region JIT and the TraceJIT */
 void *jit_code_publish(const void *bytes, size_t length, size_t *mapped_size);
 void jit_code_unmap(void *mem, size_t mapped_size);
 void jit_trace_free_all(struct JitProto *jp);

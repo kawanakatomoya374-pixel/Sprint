@@ -5,7 +5,7 @@
 #if defined(__GNUC__) && !defined(__clang__) && __GNUC__ >= 11
 __attribute__((no_stack_protector))
 #endif
-static RunStatus RUN_LOOP_NAME(VM *vm, VMTraceCapture **capp, int trace_jit_enabled, int trace_record_enabled) {
+static RunStatus RUN_LOOP_NAME(VM *vm, VMTraceCapture **capp, RunCold *ccold, int trace_jit_enabled, int trace_record_enabled) {
     VMTraceCapture *trace_cap = *capp; /* created at the first loop back edge, see JIT_HOOK */
     Frame *fr = &vm->frames[vm->nframes - 1];
     const uint8_t *pc = fr->pc;
@@ -17,9 +17,7 @@ static RunStatus RUN_LOOP_NAME(VM *vm, VMTraceCapture **capp, int trace_jit_enab
     const int jit_enabled = vm->jit_on;
     /* Rarely used state lives in memory so the hot interpreter state (pc, sp,
      * base, left) can stay in registers. */
-    struct Cold { int nargs, call_kind, defer_mode; SpValue call_uev, ev, defer_ev; } cold;
-    cold.nargs = 0; cold.call_kind = FK_NORMAL; cold.defer_mode = FK_NORMAL;
-    cold.call_uev = v_nil(); cold.ev = v_nil(); cold.defer_ev = v_nil();
+    RunCold cold = *ccold; /* continues the state of the other variant when run_loop() switched here */
     __asm__ volatile("" : : "r"(&cold) : "memory");
 #define nargs cold.nargs
 #define call_kind cold.call_kind
@@ -81,14 +79,12 @@ static RunStatus RUN_LOOP_NAME(VM *vm, VMTraceCapture **capp, int trace_jit_enab
                     if (jit_site(vm, proto, (HDR), base, sp)) { left = vm->ileft; sp = vm->sp; LOAD_FRAME(); JR = pc; } \
                 } \
             } \
-            /* A loop recording just started (or ended): continue in the other interpreter variant. This is only done between \
-             * instructions with no in-flight deferred-call state; otherwise a recording is abandoned / the variant kept. */ \
+            /* A loop recording just started (or ended): continue in the other interpreter variant. The cold state \
+             * (in-flight deferred-call errors) travels with the frame, so the switch is possible between any two instructions. */ \
             if (RUN_LOOP_RECORDING ? (trace_cap && !trace_cap->active) : (trace_cap && trace_cap->active)) { \
-                if (defer_mode == FK_NORMAL && call_kind == FK_NORMAL && ev.type == T_NIL && call_uev.type == T_NIL && defer_ev.type == T_NIL) { \
-                    vm->sp = sp; vm->ileft = left; fr->pc = (JR) ? (JR) : (RESUME); \
-                    return RUN_LOOP_RECORDING ? RS_SW_NORMAL : RS_SW_RECORD; \
-                } \
-                if (!RUN_LOOP_RECORDING) { trace_cap->active = 0; trace_cap->overflow = 1; } \
+                vm->sp = sp; vm->ileft = left; fr->pc = (JR) ? (JR) : (RESUME); \
+                *ccold = cold; \
+                return RUN_LOOP_RECORDING ? RS_SW_NORMAL : RS_SW_RECORD; \
             } \
         } \
     } while (0)
@@ -232,10 +228,9 @@ static RunStatus RUN_LOOP_NAME(VM *vm, VMTraceCapture **capp, int trace_jit_enab
                 trace_cap->active = 0; \
                 trace_cap->overflow = 1; \
                 if (!trace_cap->is_side) proto_trace_reject((Proto *)(uintptr_t)trace_cap->root, trace_cap->header); \
-                if (defer_mode == FK_NORMAL && call_kind == FK_NORMAL && ev.type == T_NIL && call_uev.type == T_NIL && defer_ev.type == T_NIL) { \
-                    fr->pc = (IP); vm->sp = sp; vm->ileft = left; \
-                    return RS_SW_NORMAL; \
-                } \
+                fr->pc = (IP); vm->sp = sp; vm->ileft = left; \
+                *ccold = cold; \
+                return RS_SW_NORMAL; \
             } \
         } \
     } while (0)

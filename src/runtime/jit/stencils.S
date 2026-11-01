@@ -1667,6 +1667,126 @@ ST tr_fcmp_ne_guard
 1:
 
 
+# ---- TraceJIT integer floor division / modulo (IDIV / IMOD) -----------------------------------------------------
+# Sequence emitted by jit_trace.c: mov r10,<divisor>; tr_div_guard; [tr_div_save]; mov rax,<dividend>; tr_idiv_core | tr_imod_core;
+# [tr_div_restore]; mov <dst>,r10. rax and rdx are allocatable registers of the trace; a trace that divides allocates them last,
+# and only when some value really lives there is the save / restore pair emitted (ta_uses_rax_rdx).
+ST tr_sar_imm                   # HB0 = REX.W(+B), HB1 = modrm (/7 + register), HB2 = shift count: sar reg, imm8
+    .byte HB0, 0xc1, HB1, HB2
+
+ST tr_div_guard                 # r10 = divisor; 0 and -1 leave through JIT_T (deopt): the interpreter raises the error / handles INT64_MIN / -1
+    inc %r10
+    cmp $1,%r10
+    jbe JIT_T
+    dec %r10
+
+ST tr_div_save
+    push %rax
+    push %rdx
+
+ST tr_div_restore
+    pop %rdx
+    pop %rax
+
+ST tr_idiv_core                 # rax = dividend, r10 = divisor -> r10 = floor(dividend / divisor)
+    mov %rax,%rdx
+    or %r10,%rdx
+    shr $32,%rdx
+    jnz 2f
+    xor %edx,%edx               # both operands are non-negative and fit 32 bits: the cheap unsigned divide, floor == truncation
+    div %r10d
+    mov %eax,%r10d
+    jmp 3f
+2:
+    cqo
+    idiv %r10
+    test %rdx,%rdx
+    jz 1f
+    xor %r10,%rdx               # remainder and divisor of opposite signs: C truncates towards zero, floor needs one less
+    jns 1f
+    dec %rax
+1:
+    mov %rax,%r10
+3:
+
+ST tr_imod_core                 # rax = dividend, r10 = divisor -> r10 = dividend - floor(dividend / divisor) * divisor
+    mov %rax,%rdx
+    or %r10,%rdx
+    shr $32,%rdx
+    jnz 2f
+    xor %edx,%edx
+    div %r10d
+    mov %edx,%r10d
+    jmp 3f
+2:
+    cqo
+    idiv %r10
+    test %rdx,%rdx
+    jz 1f
+    mov %rdx,%rax
+    xor %r10,%rax
+    jns 1f
+    add %r10,%rdx
+1:
+    mov %rdx,%r10
+3:
+
+# division by a constant d (2 <= d < 2^31, not a power of two) through its reciprocal, like imod_m / ifdiv_m of the region JIT:
+# rax = x, HQ = magic, HB0 = shift, H0 = d. A negative x takes the idiv path. Result in r10; clobbers rax, rdx, r10.
+ST tr_idiv_magic
+    test %rax,%rax
+    js 2f
+    mov %rax,%r10
+    movabs $HQ,%rdx
+    mul %rdx
+    mov %r10,%rax
+    sub %rdx,%rax
+    shr $1,%rax
+    add %rdx,%rax
+    .byte 0x48, 0xc1, 0xe8, HB0     # shr $shift,%rax
+    mov %rax,%r10
+    jmp 3f
+2:
+    mov $H0,%r10d
+    cqo
+    idiv %r10
+    test %rdx,%rdx
+    jz 1f
+    xor %r10,%rdx
+    jns 1f
+    dec %rax
+1:
+    mov %rax,%r10
+3:
+
+ST tr_imod_magic
+    test %rax,%rax
+    js 2f
+    mov %rax,%r10
+    movabs $HQ,%rdx
+    mul %rdx
+    mov %r10,%rax
+    sub %rdx,%rax
+    shr $1,%rax
+    add %rdx,%rax
+    .byte 0x48, 0xc1, 0xe8, HB0
+    imul $H0,%rax,%rax
+    sub %rax,%r10
+    jmp 3f
+2:
+    mov $H0,%r10d
+    cqo
+    idiv %r10
+    test %rdx,%rdx
+    jz 1f
+    mov %rdx,%rax
+    xor %r10,%rax
+    jns 1f
+    add %r10,%rdx
+1:
+    mov %rdx,%r10
+3:
+
 ST tr_load_budget
     mov 0(%r13),%r11
 

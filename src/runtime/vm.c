@@ -429,6 +429,9 @@ static uint64_t tick_refill(VM *vm) {
  * the recording one logs every executed instruction. A loop recording starts and ends at a back edge, between two
  * instructions; there the running variant saves its state into the VM frame and returns RS_SW_RECORD / RS_SW_NORMAL, and this
  * wrapper continues the same frame in the other variant. */
+/* the rarely used interpreter state that must survive a switch between the two variants */
+typedef struct RunCold { int nargs, call_kind, defer_mode; SpValue call_uev, ev, defer_ev; } RunCold;
+
 #define RUN_LOOP_NAME run_loop_plain
 #define RUN_LOOP_RECORDING 0
 #include "vm_loop.inc"
@@ -454,11 +457,14 @@ static RunStatus run_loop(VM *vm) {
     const int trace_jit_enabled = vm->jit_on && (es & 2);
     const int trace_record_enabled = es & 1;
     VMTraceCapture *trace_cap = NULL; /* created lazily by the variants at the first loop back edge */
+    RunCold cold;
+    cold.nargs = 0; cold.call_kind = FK_NORMAL; cold.defer_mode = FK_NORMAL;
+    cold.call_uev = v_nil(); cold.ev = v_nil(); cold.defer_ev = v_nil();
     RunStatus st;
     int recording = 0;
     for (;;) {
-        st = recording ? run_loop_rec(vm, &trace_cap, trace_jit_enabled, trace_record_enabled)
-                       : run_loop_plain(vm, &trace_cap, trace_jit_enabled, trace_record_enabled);
+        st = recording ? run_loop_rec(vm, &trace_cap, &cold, trace_jit_enabled, trace_record_enabled)
+                       : run_loop_plain(vm, &trace_cap, &cold, trace_jit_enabled, trace_record_enabled);
         if (st == RS_SW_RECORD) recording = 1;
         else if (st == RS_SW_NORMAL) recording = 0;
         else break;

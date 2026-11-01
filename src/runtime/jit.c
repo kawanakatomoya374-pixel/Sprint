@@ -737,7 +737,7 @@ static const int ST_IBR[6][2][2] = {IB(lt), IB(le), IB(gt), IB(ge), IB(eq), IB(n
 static const int ST_FBR[6][2][3][2] = {FB(lt), FB(le), FB(gt), FB(ge), FB(eq), FB(ne)};
 
 /* reciprocal for unsigned division by a constant d (2 <= d < 2^31, not a power of two): see imod_m in stencils.S */
-static int magic_of(int64_t d, uint64_t *m) {
+int jit_magic_of(int64_t d, uint64_t *m) {
     int l = 0;
     while (((int64_t)1 << l) < d) l++;
     uint64_t num = ((uint64_t)1 << l) - (uint64_t)d, q = 0, r = num;
@@ -749,6 +749,7 @@ static int magic_of(int64_t d, uint64_t *m) {
     *m = q + 1;
     return l - 1;
 }
+#define magic_of jit_magic_of
 static int is_pow2(int64_t v) { return v > 0 && (v & (v - 1)) == 0; }
 static int log2i(int64_t v) { int k = 0; while (v > 1) { v >>= 1; k++; } return k; }
 
