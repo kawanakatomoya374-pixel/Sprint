@@ -59,6 +59,8 @@ struct TraceRegion {
     size_t meta_size;
     uint64_t signature_hash;
     uint64_t side_attempts[TRACE_SIDE_ATTEMPT_MAX];
+    uint64_t deopts, deopt_iters; /* deopt exits taken, and loop iterations completed between them (demotion policy) */
+    uint8_t dead;                 /* demoted: the loop is left to the region JIT */
     uint8_t slot;
     uint8_t is_side;
     uint8_t side_count;
@@ -418,26 +420,26 @@ static int ta_plain(TraceAsm *a, int sid) {
     TracePatch p = ta_patch();
     return ta_stencil(a, sid, &p);
 }
-static int ta_fcmp_ne_guard(TraceAsm *a) {
+static int ta_fcmp_ne_guard(TraceAsm *a, unsigned target) {
     TracePatch p = ta_patch();
-    p.target = TA_EXIT;
+    p.target = target;
     return ta_stencil(a, ST_tr_fcmp_ne_guard, &p);
 }
-static int ta_f64_guard_false(TraceAsm *a, SpTIROp op) {
+static int ta_f64_guard_false(TraceAsm *a, SpTIROp op, unsigned target) {
     /* UCOMISD sets PF for unordered operands. Preserve the VM's IEEE rules. */
     switch (op) {
     case SP_TIR_FCMP_EQ:
-        return ta_jcc(a, 0x8aU, TA_EXIT) && ta_jcc(a, 0x85U, TA_EXIT);
+        return ta_jcc(a, 0x8aU, target) && ta_jcc(a, 0x85U, target);
     case SP_TIR_FCMP_NE:
-        return ta_fcmp_ne_guard(a);
+        return ta_fcmp_ne_guard(a, target);
     case SP_TIR_FCMP_LT:
-        return ta_jcc(a, 0x8aU, TA_EXIT) && ta_jcc(a, 0x83U, TA_EXIT);
+        return ta_jcc(a, 0x8aU, target) && ta_jcc(a, 0x83U, target);
     case SP_TIR_FCMP_LE:
-        return ta_jcc(a, 0x8aU, TA_EXIT) && ta_jcc(a, 0x87U, TA_EXIT);
+        return ta_jcc(a, 0x8aU, target) && ta_jcc(a, 0x87U, target);
     case SP_TIR_FCMP_GT:
-        return ta_jcc(a, 0x86U, TA_EXIT);
+        return ta_jcc(a, 0x86U, target);
     case SP_TIR_FCMP_GE:
-        return ta_jcc(a, 0x82U, TA_EXIT);
+        return ta_jcc(a, 0x82U, target);
     case SP_TIR_PARAM: case SP_TIR_CONST_I64: case SP_TIR_CONST_F64:
     case SP_TIR_CONST_BOOL: case SP_TIR_PHI: case SP_TIR_IADD:
     case SP_TIR_ISUB: case SP_TIR_IMUL: case SP_TIR_IDIV:
@@ -677,7 +679,9 @@ static int ta_emit_trace_ir(const SpTraceIR *ir, const int32_t *phi_local,
             if (dst == UINT8_MAX || !ta_reg_imm(a, dst, in->imm)) goto done;
             break;
         case SP_TIR_GUARD_TRUE:
-            if (ra != UINT8_MAX && (!ta_reg_test(a, ra) || !ta_jcc(a, 0x84U, TA_EXIT))) goto done;
+            if (ra != UINT8_MAX && (!ta_reg_test(a, ra) ||
+                !ta_jcc(a, (in->imm & SP_TIR_GUARD_INVERT) ? 0x85U : 0x84U,
+                        (in->imm & SP_TIR_GUARD_DEOPT) ? TA_DEOPT : TA_EXIT))) goto done;
             break;
         case SP_TIR_IADD: case SP_TIR_ISUB: case SP_TIR_IMUL:
             if (dst == UINT8_MAX || ra == UINT8_MAX || rb == UINT8_MAX) goto done;
@@ -705,7 +709,13 @@ static int ta_emit_trace_ir(const SpTraceIR *ir, const int32_t *phi_local,
             if (ra == UINT8_MAX || rb == UINT8_MAX || cc == 0U || !ta_reg_cmp(a, ra, rb)) goto done;
             if (dst == UINT8_MAX) {
                 if (i + 1U >= ir->count || ir->inst[i + 1U].op != SP_TIR_GUARD_TRUE ||
-                    ir->inst[i + 1U].a != in->dst || !ta_jcc(a, cc, TA_EXIT)) goto done;
+                    ir->inst[i + 1U].a != in->dst) goto done;
+                {
+                    const uint64_t gf = ir->inst[i + 1U].imm;
+                    /* the guard leaves when the comparison is false (cc), or, inverted, when it is true (setcc code - 0x10 = jcc) */
+                    const uint8_t gcc = (gf & SP_TIR_GUARD_INVERT) ? (uint8_t)(ta_cmp_cc(in->op) - 0x10U) : cc;
+                    if (!ta_jcc(a, gcc, (gf & SP_TIR_GUARD_DEOPT) ? TA_DEOPT : TA_EXIT)) goto done;
+                }
             } else {
                 uint8_t truth_cc = ta_cmp_cc(in->op);
                 if (truth_cc == 0U || !ta_reg_setcc(a, dst, truth_cc)) goto done;
@@ -742,8 +752,9 @@ static int ta_emit_trace_ir(const SpTraceIR *ir, const int32_t *phi_local,
             }
             if (ra == UINT8_MAX || rb == UINT8_MAX || dst != UINT8_MAX ||
                 i + 1U >= ir->count || ir->inst[i + 1U].op != SP_TIR_GUARD_TRUE ||
-                ir->inst[i + 1U].a != in->dst || !ta_f64_compare(a, ra, rb) ||
-                !ta_f64_guard_false(a, in->op)) goto done;
+                ir->inst[i + 1U].a != in->dst || (ir->inst[i + 1U].imm & SP_TIR_GUARD_INVERT) ||
+                !ta_f64_compare(a, ra, rb) ||
+                !ta_f64_guard_false(a, in->op, (ir->inst[i + 1U].imm & SP_TIR_GUARD_DEOPT) ? TA_DEOPT : TA_EXIT)) goto done;
             break;
         case SP_TIR_IDIV: case SP_TIR_IMOD:
             /* floor division / modulo; a zero or -1 divisor deoptimises (the interpreter raises the error, and handles
@@ -933,6 +944,11 @@ static void trace_index_remove(struct JitProto *jp, uint32_t header) {
         }
     }
 }
+
+/* Demotion: a trace that keeps leaving through its deopt exit gains nothing, because every deopt re-runs an iteration in the
+ * interpreter (an unpredictable branch made 23x worse than the region JIT in the first measurement). After TRACE_DEOPT_MIN
+ * deopts, if fewer than TRACE_DEOPT_ITERS iterations ran per deopt on average, the loop goes back to the region JIT. */
+enum { TRACE_DEOPT_MIN = 16, TRACE_DEOPT_ITERS = 512 };
 
 static TraceRegion *trace_find(struct JitProto *jp, uint32_t header) {
     if (jp->trace_index) {
@@ -1201,6 +1217,61 @@ static const char *trace_debug_env(void) {
     return value;
 }
 
+/* The part every builder shares once the loop body is in the IR: verify, optimise, verify again, apply the f64 gate and map every
+ * PHI to its local slot. On failure the caller destroys the IR. */
+static int trace_finish_ir(SpTraceIR *ir, uint32_t slot_count, int32_t **phi_local_out) {
+    char verify_message[128];
+    int32_t *phi_local = NULL;
+    if (!sp_tir_verify(ir, verify_message, sizeof verify_message)) {
+        if (trace_debug_env()) fprintf(stderr, "trace-jit: initial IR verify: %s\n", verify_message);
+        return 0;
+    }
+    if (!sp_tir_optimize(ir, NULL, NULL)) {
+        if (trace_debug_env()) fprintf(stderr, "trace-jit: IR optimize rejected\n");
+        return 0;
+    }
+    if (!sp_tir_verify(ir, verify_message, sizeof verify_message)) {
+        if (trace_debug_env()) fprintf(stderr, "trace-jit: optimized IR verify: %s\n", verify_message);
+        return 0;
+    }
+    /* The TraceJIT backend keeps f64 values in general registers and moves them through XMM0/XMM1 around every operation,
+     * which measured 2x slower than the region JIT on float loops. Until f64 values are register-allocated in XMM registers
+     * (docs/design/tiered-jit.md, phase 1) such loops are left to the region JIT. SPRINT_TRACE_JIT_F64=1 lifts the gate for
+     * backend development and the trace regression tests. */
+    {
+        static int f64_gate = -1;
+        if (f64_gate < 0) { const char *e = getenv("SPRINT_TRACE_JIT_F64"); f64_gate = !(e && e[0] && e[0] != '0'); }
+        if (f64_gate) {
+            for (size_t i = 0U; i < ir->count; i++) {
+                const SpTIROp o = ir->inst[i].op;
+                if (o == SP_TIR_FADD || o == SP_TIR_FSUB || o == SP_TIR_FMUL || o == SP_TIR_FDIV || o == SP_TIR_FNEG) {
+                    if (trace_debug_env()) fprintf(stderr, "trace-jit: f64 trace left to the region JIT (slower in the trace backend)\n");
+                    goto fail;
+                }
+            }
+        }
+    }
+
+    phi_local = (int32_t *)malloc(((size_t)ir->nvalues + 1U) * sizeof *phi_local);
+    if (!phi_local) goto fail;
+    for (uint32_t i = 0U; i <= ir->nvalues; i++) phi_local[i] = -1;
+    for (size_t i = 0U; i < ir->count; i++) {
+        const SpTIRInst *in = &ir->inst[i];
+        if (in->op == SP_TIR_PHI) {
+            uint32_t param_id = in->a;
+            const SpTIRInst *pin = NULL;
+            for (size_t k = 0U; k < ir->count; k++) if (ir->inst[k].dst == param_id && ir->inst[k].op == SP_TIR_PARAM) { pin = &ir->inst[k]; break; }
+            if (!pin || pin->imm >= (uint64_t)slot_count) goto fail;
+            phi_local[in->dst] = (int32_t)pin->imm;
+        }
+    }
+    *phi_local_out = phi_local;
+    return 1;
+fail:
+    free(phi_local);
+    return 0;
+}
+
 static int trace_build_ir(Proto *p, const SpValue *locals, uint32_t stack_depth,
                           uint32_t header, const TraceStep *steps, unsigned count,
                           SpTraceIR *ir, int32_t **phi_local_out,
@@ -1223,7 +1294,6 @@ static int trace_build_ir(Proto *p, const SpValue *locals, uint32_t stack_depth,
     SpTIRValue cond, rhs;
     int ok = 0;
     int build_stage = 1;
-    char verify_message[128];
 
     if (!p || !locals || !code || !steps || count < 2U || count > 256U ||
         p->nlocals <= 0 || p->nlocals > 512 || stack_depth > UINT16_MAX - (uint32_t)p->nlocals) return 0;
@@ -1493,53 +1563,7 @@ static int trace_build_ir(Proto *p, const SpValue *locals, uint32_t stack_depth,
     build_stage = 64;
     if (!sp_tir_emit_loop(ir)) goto done;
     build_stage = 65;
-    if (!sp_tir_verify(ir, verify_message, sizeof verify_message)) {
-        if (trace_debug_env()) fprintf(stderr, "trace-jit: initial IR verify: %s\n", verify_message);
-        goto done;
-    }
-    build_stage = 66;
-    if (!sp_tir_optimize(ir, NULL, NULL)) {
-        if (trace_debug_env()) fprintf(stderr, "trace-jit: IR optimize rejected\n");
-        goto done;
-    }
-    build_stage = 67;
-    if (!sp_tir_verify(ir, verify_message, sizeof verify_message)) {
-        if (trace_debug_env()) fprintf(stderr, "trace-jit: optimized IR verify: %s\n", verify_message);
-        goto done;
-    }
-
-    /* The TraceJIT backend keeps f64 values in general registers and moves them through XMM0/XMM1 around every operation,
-     * which measured 2x slower than the region JIT on float loops. Until f64 values are register-allocated in XMM registers
-     * (docs/design/tiered-jit.md, phase 1) such loops are left to the region JIT. SPRINT_TRACE_JIT_F64=1 lifts the gate for
-     * backend development and the trace regression tests. */
-    {
-        static int f64_gate = -1;
-        if (f64_gate < 0) { const char *e = getenv("SPRINT_TRACE_JIT_F64"); f64_gate = !(e && e[0] && e[0] != '0'); }
-        if (f64_gate) {
-            for (size_t i = 0U; i < ir->count; i++) {
-                const SpTIROp o = ir->inst[i].op;
-                if (o == SP_TIR_FADD || o == SP_TIR_FSUB || o == SP_TIR_FMUL || o == SP_TIR_FDIV || o == SP_TIR_FNEG) {
-                    if (trace_debug_env()) fprintf(stderr, "trace-jit: f64 trace left to the region JIT (slower in the trace backend)\n");
-                    goto done;
-                }
-            }
-        }
-    }
-
-    build_stage = 7;
-    phi_local = (int32_t *)malloc(((size_t)ir->nvalues + 1U) * sizeof *phi_local);
-    if (!phi_local) goto done;
-    for (uint32_t i = 0U; i <= ir->nvalues; i++) phi_local[i] = -1;
-    for (size_t i = 0U; i < ir->count; i++) {
-        const SpTIRInst *in = &ir->inst[i];
-        if (in->op == SP_TIR_PHI) {
-            uint32_t param_id = in->a;
-            const SpTIRInst *pin = NULL;
-            for (size_t k = 0U; k < ir->count; k++) if (ir->inst[k].dst == param_id && ir->inst[k].op == SP_TIR_PARAM) { pin = &ir->inst[k]; break; }
-            if (!pin || pin->imm >= (uint64_t)slot_count) goto done;
-            phi_local[in->dst] = (int32_t)pin->imm;
-        }
-    }
+    if (!trace_finish_ir(ir, slot_count, &phi_local)) goto done;
     *phi_local_out = phi_local; phi_local = NULL;
     *exit_pc_out = exit_pc;
     *backedge_pc_out = backedge_pc;
@@ -1560,6 +1584,294 @@ done:
     if (current) free(current);
     if (stack) free(stack);
     if (phi_local) free(phi_local);
+    if (!ok) sp_tir_destroy(ir);
+    return ok;
+}
+
+/* ---- general path builder ---------------------------------------------------------------------------------------------
+ * trace_build_ir above only understands "while LOCAL <cmp> LOCAL/CONST" with a straight-line body of one numeric type. This builder
+ * follows the path the recorder actually executed instead: it walks the pristine bytecode from the loop header, decides every
+ * conditional branch from the next recorded step, and turns each one into a guard in the direction that was observed. Locals are
+ * loop-carried SSA values exactly as before. A guard that fails leaves through the deopt exit (the iteration-start state is
+ * restored and the interpreter re-runs the iteration, which is sound because an iteration only changes locals), except the first
+ * guard of an iteration when it leaves the loop: that one uses the loop exit and resumes right after the loop.
+ * Supported: LOAD/STORE_LOCAL, int and float constants, + - * (same type), float /, int // and %, unary -, comparisons that feed a
+ * conditional jump, forward JUMP / JUMP_IF_FALSE / JUMP_IF_TRUE, POP / DUP / DUP2. Anything else rejects the trace. */
+typedef struct {
+    uint32_t pc;
+    uint32_t target;  /* conditional jumps: where the jump goes */
+    uint16_t arg;
+    uint8_t op, taken;
+} PathOp;
+
+static int trace_build_ir_path(Proto *p, const SpValue *locals, uint32_t stack_depth, uint32_t header,
+                               const TraceStep *steps, unsigned count, SpTraceIR *ir,
+                               int32_t **phi_local_out, uint32_t *exit_pc_out, uint32_t *backedge_pc_out) {
+    const uint8_t *code = p->ocode ? p->ocode : p->code;
+    PathOp path[256];
+    unsigned np = 0U;
+    uint8_t *used = NULL;
+    SpTIRValue *param = NULL, *phi = NULL, *current = NULL, *stack = NULL;
+    int32_t *phi_local = NULL;
+    uint32_t slot_count, backedge = 0U, exit_pc = 0U;
+    size_t stack_capacity;
+    unsigned depth;
+    int have_exit = 0, stored = 0, ok = 0;
+    const char *why = "path builder: unsupported";
+
+    if (!p || !locals || !code || !steps || count < 2U || count > 256U || p->nlocals <= 0 || p->nlocals > 512 ||
+        stack_depth > UINT16_MAX - (uint32_t)p->nlocals || steps[0].proto != p) return 0;
+    slot_count = (uint32_t)p->nlocals + stack_depth;
+    for (unsigned i = 0U; i < count; i++)
+        if (steps[i].proto != p || steps[i].pc < header || steps[i].pc >= p->code_len ||
+            (i != 0U && steps[i].pc <= steps[i - 1U].pc)) return 0;
+
+    /* 1. follow the executed path through the bytecode */
+    {
+        uint32_t pc = header;
+        for (;;) {
+            int op, len;
+            PathOp *po;
+            if (pc >= p->code_len || np >= 256U) { why = "path too long"; goto done; }
+            op = code[pc];
+            len = op_len(op);
+            if (len <= 0 || pc + (uint32_t)len > p->code_len) { why = "bad instruction"; goto done; }
+            po = &path[np++];
+            po->pc = pc; po->op = (uint8_t)op; po->arg = 0U; po->taken = 0U; po->target = 0U;
+            switch (op) {
+            case OP_JUMP: {
+                int32_t off = rd32s(code + pc + 1U);
+                int64_t t = (int64_t)pc + 5 + off;
+                if (off < 0) {
+                    if (t != (int64_t)header) { why = "backward jump is not the loop edge"; goto done; }
+                    backedge = pc;
+                    goto walked;
+                }
+                if (t >= (int64_t)p->code_len) goto done;
+                pc = (uint32_t)t;
+                continue;
+            }
+            case OP_JUMP_IF_FALSE: case OP_JUMP_IF_TRUE: {
+                int32_t off = rd32s(code + pc + 1U);
+                int64_t t = (int64_t)pc + 5 + off;
+                uint32_t next = UINT32_MAX;
+                if (off <= 0 || t >= (int64_t)p->code_len) goto done;
+                for (unsigned k = 0U; k < count; k++)
+                    if (steps[k].pc > pc && steps[k].pc < next) next = steps[k].pc;
+                if (next == (uint32_t)t) po->taken = 1U;
+                else if (next != pc + 5U) { why = "cannot tell the branch direction"; goto done; }
+                po->target = (uint32_t)t;
+                pc = po->taken ? (uint32_t)t : pc + 5U;
+                continue;
+            }
+            case OP_LOAD_LOCAL: case OP_STORE_LOCAL:
+                po->arg = (uint16_t)rd16(code + pc + 1U);
+                if (po->arg >= (unsigned)p->nlocals) goto done;
+                break;
+            case OP_SMALLINT:
+                po->arg = (uint16_t)rd16(code + pc + 1U);
+                break;
+            case OP_CONST:
+                po->arg = (uint16_t)rd16(code + pc + 1U);
+                if (po->arg >= (unsigned)p->nconsts || (p->consts[po->arg].type != T_INT && p->consts[po->arg].type != T_FLOAT)) goto done;
+                break;
+            case OP_NOP: case OP_POP: case OP_DUP: case OP_DUP2:
+            case OP_ADD: case OP_SUB: case OP_MUL: case OP_DIV: case OP_FLOOR_DIV: case OP_MOD: case OP_NEG:
+            case OP_EQ: case OP_NE: case OP_LT: case OP_LE: case OP_GT: case OP_GE:
+                break;
+            default:
+                why = "unsupported bytecode";
+                goto done;
+            }
+            pc += (uint32_t)len;
+        }
+    }
+walked:
+    /* the walk must be the recorded path: every recorded step is an instruction of it, and the last one is the back edge */
+    if (steps[count - 1U].pc != backedge) { why = "path does not end at the back edge"; goto done; }
+    for (unsigned k = 0U; k < count; k++) {
+        int found = 0;
+        for (unsigned i = 0U; i < np && !found; i++) found = path[i].pc == steps[k].pc;
+        if (!found) { why = "walked path differs from the recorded one"; goto done; }
+    }
+
+    /* 2. which slots are loop-carried */
+    stack_capacity = (size_t)stack_depth + (size_t)np + 4U;
+    used = (uint8_t *)calloc((size_t)slot_count, sizeof *used);
+    param = (SpTIRValue *)calloc((size_t)slot_count, sizeof *param);
+    phi = (SpTIRValue *)calloc((size_t)slot_count, sizeof *phi);
+    current = (SpTIRValue *)calloc((size_t)slot_count, sizeof *current);
+    stack = (SpTIRValue *)calloc(stack_capacity, sizeof *stack);
+    if (!used || !param || !phi || !current || !stack) goto done;
+    for (uint32_t i = 0U; i < stack_depth; i++) {
+        SpTIRType t;
+        if (!trace_value_type((SpType)locals[(uint32_t)p->nlocals + i].type, &t)) goto done;
+        used[(uint32_t)p->nlocals + i] = 1U;
+    }
+    for (unsigned i = 0U; i < np; i++) {
+        if (path[i].op == OP_LOAD_LOCAL || path[i].op == OP_STORE_LOCAL) {
+            SpTIRType t;
+            if (!trace_value_type((SpType)locals[path[i].arg].type, &t)) goto done;
+            used[path[i].arg] = 1U;
+        }
+    }
+
+    /* 3. parameters, phis, then the body in path order */
+    sp_tir_init(ir);
+    for (uint32_t i = 0U; i < slot_count; i++) {
+        SpTIRType t;
+        if (!used[i]) continue;
+        if (!trace_value_type((SpType)locals[i].type, &t) ||
+            !sp_tir_emit_param_ex(ir, t, i, t == SP_TIR_T_REF ? locals[i].type : 0U, &param[i])) goto done;
+    }
+    for (uint32_t i = 0U; i < slot_count; i++) {
+        if (!used[i]) continue;
+        if (!sp_tir_emit_phi(ir, ir->value_types[param[i]], param[i], &phi[i])) goto done;
+        current[i] = phi[i];
+    }
+    depth = stack_depth;
+    for (uint32_t i = 0U; i < stack_depth; i++) stack[i] = phi[(uint32_t)p->nlocals + i];
+
+    for (unsigned i = 0U; i < np; i++) {
+        const PathOp *po = &path[i];
+        SpTIRValue a = 0U, b = 0U, r = 0U;
+        switch (po->op) {
+        case OP_JUMP: case OP_NOP: break;
+        case OP_LOAD_LOCAL:
+            if (depth >= stack_capacity || !current[po->arg]) goto done;
+            stack[depth++] = current[po->arg];
+            break;
+        case OP_STORE_LOCAL:
+            if (depth == 0U) goto done;
+            current[po->arg] = stack[--depth];
+            if (ir->value_types[current[po->arg]] != ir->value_types[phi[po->arg]] ||
+                trace_ir_runtime_type(ir, current[po->arg]) != locals[po->arg].type) { why = "a local changes type"; goto done; }
+            stored = 1;
+            break;
+        case OP_SMALLINT:
+            if (depth >= stack_capacity || !sp_tir_emit_const_i64(ir, (int64_t)(int16_t)po->arg, &r)) goto done;
+            stack[depth++] = r;
+            break;
+        case OP_CONST:
+            if (depth >= stack_capacity) goto done;
+            if (p->consts[po->arg].type == T_FLOAT ? !sp_tir_emit_const_f64(ir, p->consts[po->arg].as.f, &r)
+                                                   : !sp_tir_emit_const_i64(ir, p->consts[po->arg].as.i, &r)) goto done;
+            stack[depth++] = r;
+            break;
+        case OP_POP:
+            if (depth == 0U) goto done;
+            depth--;
+            break;
+        case OP_DUP:
+            if (depth == 0U || depth >= stack_capacity) goto done;
+            stack[depth] = stack[depth - 1U]; depth++;
+            break;
+        case OP_DUP2:
+            if (depth < 2U || (size_t)depth + 2U > stack_capacity) goto done;
+            stack[depth] = stack[depth - 2U]; stack[depth + 1U] = stack[depth - 1U]; depth += 2U;
+            break;
+        case OP_ADD: case OP_SUB: case OP_MUL: case OP_DIV: case OP_FLOOR_DIV: case OP_MOD: {
+            SpTIRType ta, tb;
+            int isf;
+            if (depth < 2U) goto done;
+            b = stack[--depth]; a = stack[--depth];
+            ta = ir->value_types[a]; tb = ir->value_types[b];
+            if (ta != tb || (ta != SP_TIR_T_I64 && ta != SP_TIR_T_F64)) { why = "mixed or non-numeric operands"; goto done; }
+            isf = ta == SP_TIR_T_F64;
+            if (po->op == OP_DIV ? !isf : (po->op == OP_FLOOR_DIV || po->op == OP_MOD) ? isf : 0) goto done;
+            if (!sp_tir_emit_binary(ir,
+                    po->op == OP_ADD ? (isf ? SP_TIR_FADD : SP_TIR_IADD) :
+                    po->op == OP_SUB ? (isf ? SP_TIR_FSUB : SP_TIR_ISUB) :
+                    po->op == OP_MUL ? (isf ? SP_TIR_FMUL : SP_TIR_IMUL) :
+                    po->op == OP_DIV ? SP_TIR_FDIV : po->op == OP_FLOOR_DIV ? SP_TIR_IDIV : SP_TIR_IMOD, a, b, &r)) goto done;
+            stack[depth++] = r;
+            break;
+        }
+        case OP_NEG:
+            if (depth == 0U) goto done;
+            a = stack[--depth];
+            if (ir->value_types[a] == SP_TIR_T_F64 ? !sp_tir_emit_unary(ir, SP_TIR_FNEG, a, &r)
+              : ir->value_types[a] == SP_TIR_T_I64 ? !sp_tir_emit_unary(ir, SP_TIR_INEG, a, &r) : 1) goto done;
+            stack[depth++] = r;
+            break;
+        case OP_EQ: case OP_NE: case OP_LT: case OP_LE: case OP_GT: case OP_GE: {
+            SpTIROp cmp;
+            SpTIRType ta, tb;
+            if (depth < 2U || i + 1U >= np ||
+                (path[i + 1U].op != OP_JUMP_IF_FALSE && path[i + 1U].op != OP_JUMP_IF_TRUE)) { why = "comparison not feeding a branch"; goto done; }
+            b = stack[--depth]; a = stack[--depth];
+            ta = ir->value_types[a]; tb = ir->value_types[b];
+            if (ta != tb || (ta != SP_TIR_T_I64 && ta != SP_TIR_T_F64) ||
+                !trace_cmp_ir(po->op, ta == SP_TIR_T_F64, &cmp) || !sp_tir_emit_binary(ir, cmp, a, b, &r)) goto done;
+            stack[depth++] = r;
+            break;
+        }
+        case OP_JUMP_IF_FALSE: case OP_JUMP_IF_TRUE: {
+            SpTIRValue cond;
+            const SpTIRInst *last;
+            int need_true, is_float_cmp;
+            unsigned flags = SP_TIR_GUARD_DEOPT;
+            uint32_t leave;
+            if (depth == 0U || ir->count == 0U) goto done;
+            cond = stack[--depth];
+            last = &ir->inst[ir->count - 1U];
+            if (last->dst != cond) { why = "branch condition is not the preceding comparison"; goto done; }
+            is_float_cmp = last->op >= SP_TIR_FCMP_EQ && last->op <= SP_TIR_FCMP_GE;
+            need_true = (po->op == OP_JUMP_IF_FALSE) != (po->taken != 0U);
+            if (!need_true) flags |= SP_TIR_GUARD_INVERT;
+            if (!need_true && is_float_cmp) { why = "inverted float guard"; goto done; }
+            leave = po->taken ? po->pc + 5U : po->target;   /* where the other direction would go */
+            if (!have_exit && !stored && depth == stack_depth && leave > backedge) {
+                flags &= ~(unsigned)SP_TIR_GUARD_DEOPT;     /* the iteration's first test leaves the loop */
+                exit_pc = leave;
+                have_exit = 1;
+            }
+            if (!sp_tir_emit_guard(ir, cond, i + 1U, flags)) goto done;
+            break;
+        }
+        default:
+            goto done;
+        }
+    }
+    if (depth != stack_depth) { why = "stack height changes"; goto done; }
+    if (!have_exit) exit_pc = backedge + 5U;
+
+    /* the loop label is planted at the first comparison, and only its operands live across trips: that comparison must sit at the
+     * start of the iteration, with nothing but its own constants before it */
+    {
+        size_t first_cmp = ir->count, last_phi = 0U;
+        for (size_t i = 0U; i < ir->count; i++) {
+            const SpTIROp o = ir->inst[i].op;
+            if (o == SP_TIR_PHI) last_phi = i;
+            if (first_cmp == ir->count && o >= SP_TIR_ICMP_EQ && o <= SP_TIR_FCMP_GE) first_cmp = i;
+        }
+        if (first_cmp == ir->count) { why = "no comparison"; goto done; }
+        for (size_t i = last_phi + 1U; i < first_cmp; i++) {
+            const SpTIRInst *in = &ir->inst[i];
+            if ((in->op != SP_TIR_CONST_I64 && in->op != SP_TIR_CONST_F64) ||
+                (in->dst != ir->inst[first_cmp].a && in->dst != ir->inst[first_cmp].b)) { why = "work before the first comparison"; goto done; }
+        }
+        for (int side = 0; side < 2; side++) {
+            SpTIRValue v = side ? ir->inst[first_cmp].b : ir->inst[first_cmp].a;
+            int def_ok = 0;
+            for (size_t i = 0U; i < first_cmp && !def_ok; i++)
+                def_ok = ir->inst[i].dst == v && (ir->inst[i].op == SP_TIR_PHI || ir->inst[i].op == SP_TIR_CONST_I64 ||
+                                                  ir->inst[i].op == SP_TIR_CONST_F64);
+            if (!def_ok) { why = "first comparison operand is computed"; goto done; }
+        }
+    }
+
+    for (uint32_t i = 0U; i < slot_count; i++)
+        if (used[i] && !sp_tir_set_phi_backedge(ir, phi[i], current[i])) goto done;
+    if (!sp_tir_emit_loop(ir) || !trace_finish_ir(ir, slot_count, &phi_local)) goto done;
+    *phi_local_out = phi_local; phi_local = NULL;
+    *exit_pc_out = exit_pc;
+    *backedge_pc_out = backedge;
+    ok = 1;
+    p->trace_any = 1;
+done:
+    if (!ok && trace_debug_env()) (void)fprintf(stderr, "trace-jit: path builder rejected %s@%u: %s\n", p->name ? p->name : "?", header, why);
+    free(used); free(param); free(phi); free(current); free(stack); free(phi_local);
     if (!ok) sp_tir_destroy(ir);
     return ok;
 }
@@ -1603,7 +1915,12 @@ int jit_trace_compile(VM *vm, Proto *p, uint32_t header, const TraceStep *steps,
     trace_base = vm->frames[vm->nframes - 1].base;
     if (!trace_build_ir(p, trace_base, stack_depth,
                         header, steps, count,
-                        &ir, &phi_local, &exit_pc, &backedge_pc)) { fail_reason = "trace IR build rejected path"; goto done; }
+                        &ir, &phi_local, &exit_pc, &backedge_pc)) {
+        /* the narrow builder refused (it destroyed its IR): try the general path builder */
+        sp_tir_init(&ir);
+        if (!trace_build_ir_path(p, trace_base, stack_depth, header, steps, count,
+                                 &ir, &phi_local, &exit_pc, &backedge_pc)) { fail_reason = "trace IR build rejected path"; goto done; }
+    }
     as = (TraceAsm *)calloc(1U, sizeof *as);
     tr = (TraceRegion *)calloc(1U, sizeof *tr);
     if (!as || !tr) { fail_reason = "out of memory allocating trace"; goto done; }
@@ -1721,7 +2038,7 @@ int jit_trace_site(VM *vm, Proto *p, const uint8_t *hdr, SpValue *base, SpValue 
     jp = p->jit;
     header = (uint32_t)(hdr - p->code);
     root = trace_find(jp, header);
-    if (!root || !root->entry) return 0;
+    if (!root || !root->entry || root->dead) return 0;
     debug = trace_debug_env();
     if (debug && debug[0] && debug[0] != '0') {
         (void)fprintf(stderr, "trace-jit: site %s@%u locals=", p->name ? p->name : "?", header);
@@ -1747,6 +2064,7 @@ int jit_trace_site(VM *vm, Proto *p, const uint8_t *hdr, SpValue *base, SpValue 
 
     /* A linked exit is a native tail jump.  The final side exit returns here
      * with the exact bytecode PC and the VM budget already materialized. */
+    const uint64_t budget_before = vm->ileft;
     result = first->entry(base, &vm->ileft);
     if (result == UINT32_MAX ||
         !sp_jit_snapshot_decode_token(result, &snapshot_slot, &snapshot_kind)) return 0;
@@ -1757,6 +2075,20 @@ int jit_trace_site(VM *vm, Proto *p, const uint8_t *hdr, SpValue *base, SpValue 
                       owner && owner->is_side ? "side" : (p->name ? p->name : "?"),
                       owner ? owner->header : 0U);
     if (!owner || !owner->mem || owner->snapshot_set.snapshots[snapshot_kind].kind != snapshot_kind) return 0;
+    if (snapshot_kind == SP_JIT_SNAPSHOT_DEOPT) {
+        TraceRegion *rt = trace_root_region(owner);
+        if (rt != NULL) {
+            rt->deopts++;
+            rt->deopt_iters += budget_before >= vm->ileft ? budget_before - vm->ileft : 0U;
+            if (rt->deopts >= (uint64_t)TRACE_DEOPT_MIN && rt->deopt_iters < rt->deopts * (uint64_t)TRACE_DEOPT_ITERS) {
+                rt->dead = 1;
+                if (trace_debug_env())
+                    (void)fprintf(stderr, "trace-jit: demoted %s@%u to the region JIT (%llu deopts, %llu iterations)\n",
+                                  p->name ? p->name : "?", rt->header, (unsigned long long)rt->deopts,
+                                  (unsigned long long)rt->deopt_iters);
+            }
+        }
+    }
     miss_parent = owner;
     SpValue *restored_sp = NULL;
     const uint8_t *restored_pc = NULL;
@@ -1771,7 +2103,7 @@ int jit_trace_site(VM *vm, Proto *p, const uint8_t *hdr, SpValue *base, SpValue 
     /* Publish the edge after the source trace has executed at least once.
      * Its Copy-and-Patch exit stencil reads this cell on subsequent runs. */
     next = trace_find(jp, first->exit_pc);
-    if (next == first || (next && !next->entry)) next = NULL;
+    if (next == first || (next && (!next->entry || next->dead))) next = NULL;
     TraceEntry link_target = next && next->side_count == 0U &&
         next->snapshot_set.loop_map.stack_depth == first->snapshot_set.loop_map.stack_depth &&
         next->snapshot_set.loop_map.local_count == first->snapshot_set.loop_map.local_count ?

@@ -52,7 +52,11 @@ int sp_tir_emit_phi(SpTraceIR *ir, SpTIRType type, SpTIRValue entry, SpTIRValue 
 int sp_tir_set_phi_backedge(SpTraceIR *ir, SpTIRValue phi, SpTIRValue backedge);
 int sp_tir_emit_binary(SpTraceIR *ir, SpTIROp op, SpTIRValue a, SpTIRValue b, SpTIRValue *out);
 int sp_tir_emit_unary(SpTraceIR *ir, SpTIROp op, SpTIRValue a, SpTIRValue *out);
+/* flags of a guard (stored in the instruction's imm): where a failed guard leaves, and which truth value it demands */
+enum { SP_TIR_GUARD_DEOPT = 1U,   /* leave through the deopt exit: restore the iteration-start state and re-run the iteration in the interpreter (default: the loop exit) */
+       SP_TIR_GUARD_INVERT = 2U   /* the guard holds when the condition is FALSE (integer comparisons only in the native backend) */ };
 int sp_tir_emit_guard_true(SpTraceIR *ir, SpTIRValue condition, uint32_t side_exit);
+int sp_tir_emit_guard(SpTraceIR *ir, SpTIRValue condition, uint32_t side_exit, unsigned flags);
 int sp_tir_emit_loop(SpTraceIR *ir);
 int sp_tir_emit_return(SpTraceIR *ir, SpTIRValue value);
 int sp_tir_verify(const SpTraceIR *ir, char *message, size_t message_size);

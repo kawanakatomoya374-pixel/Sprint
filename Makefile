@@ -278,6 +278,12 @@ test-trace-jit: $(BUILD)/sprint $(FFI_LIBS) test-trace-snapshot test-trace-snaps
 	@SPRINT_JIT_THRESHOLD=2 SPRINT_TRACE_JIT=1 SPRINT_TRACE_JIT_F64=1 SPRINT=$(BUILD)/sprint sh tests/run_tests.sh
 .PHONY: test-trace-jit
 
+# Differential fuzz of the TraceJIT path builder (random branchy int/float loops under four JIT configurations)
+fuzz-trace: $(BUILD)/sprint
+	python3 tools/jitfuzz_trace.py $(BUILD)/sprint 300 1
+	python3 tools/jitfuzz_trace.py $(BUILD)/sprint 300 2
+.PHONY: fuzz-trace
+
 # Run the in-file TraceIR verifier/optimizer invariant suite under the strict diagnostics.
 test-trace-ir: | $(BUILD)
 	$(CC) $(STD) $(WARN) $(HARDEN) -O2 $(INC) -DSPRINT_TRACE_IR_TEST -o $(BUILD)/trace-ir-test src/runtime/trace_ir.c
