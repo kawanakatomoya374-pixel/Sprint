@@ -21,6 +21,8 @@
 #define L_SFUNC_PROTO 16
 #define L_SFUNC_UP 40
 #define L_SFUNC_NAT 24
+#define L_SSTR_LEN 16
+#define L_SSTR_DATA 24
 #define L_CELL_V 16
 #define L_PROTO_JUNIT 136
 #define L_JU_ENTRY 0

@@ -19,6 +19,7 @@
 #define T_INT 2
 #define T_FLOAT 3
 #define T_ARRAY 5
+#define T_STRING 4
 
 .macro ST name
     .section .text.\name,"ax",@progbits
@@ -1408,6 +1409,22 @@ ST hset                         # HQ(vm, slot H1, slot H2, slot H3) stores; H0 =
     call *%rax
     test %eax,%eax
     jz JIT_X
+
+# s[i] on a string: slot H0 <- the byte at int slot H2 of string slot H1. Any other type, or an index outside 0 .. len-1, leaves
+# for the interpreter (which reports the error). One unsigned compare covers a negative index.
+ST sget
+    cmpq $T_STRING,H1(%r12)
+    jne JIT_X
+    cmpq $T_INT,H2(%r12)
+    jne JIT_X
+    mov H1+8(%r12),%rax
+    mov H2+8(%r12),%rcx
+    mov L_SSTR_LEN(%rax),%edx
+    cmp %rdx,%rcx
+    jae JIT_X
+    movzbl L_SSTR_DATA(%rax,%rcx),%eax
+    movq $T_INT,H0(%r12)
+    mov %rax,H0+8(%r12)
 
 ST hconcat                      # slot H0 <- HQ(vm, the H2 slots from slot H1): string concatenation; H3 = stack top for the collector
     lea H3(%r12),%rax

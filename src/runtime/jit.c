@@ -2483,6 +2483,23 @@ static int hint_is_container(const Ent *a) {
     return a->ty != TY_ARR && a->hint && (a->hint->type == T_TABLE || a->hint->type == T_STRING || (a->hint->type == T_NATIVE && typed_is(*a->hint)));
 }
 
+/* s[i] where the container was seen to be a string: inline bounds-checked byte load, an int result */
+static int do_get_index_s(JC *c, uint32_t pc) {
+    int pb = c->dep - 1, pa = c->dep - 2;
+    if (!flush_regs(c)) return 0;
+    for (int q = pa; q <= pb; q++) if (c->st[q].kind != EK_MEM && c->st[q].kind != EK_LOC && !materialize(c, q)) return 0;
+    Ent *a = &c->st[pa], *b = &c->st[pb];
+    c->xe = gexit(c);
+    if (c->xe < 0) FAIL("out of memory");
+    EM(ST_sget, soff(c, pa), roff(c, a, pa), roff(c, b, pb), 0, 0, 0);
+    c->dep -= 2;
+    Ent *r = push(c, EK_MEM, TY_INT, 0);
+    if (!r) return 0;
+    r->ppc = pc;
+    c->rax_off = -1; c->xmm_off = -1; c->skip1 = 0; c->skipx = 0;
+    return 1;
+}
+
 static int do_get_index_h(JC *c, uint32_t pc) {
     int pb = c->dep - 1, pa = c->dep - 2;
     if (!flush_regs(c)) return 0;
@@ -2644,6 +2661,7 @@ static int do_get_index(JC *c, uint32_t pc, int len, uint32_t *skip) {
         int tk = ta_kind(a);
         if (tk >= 0 && c->reg_on && (b->kind == EK_LOC || b->kind == EK_REG || b->kind == EK_MEM || b->kind == EK_K)) return do_get_index_ta(c, tk, pa, pb);
     }
+    if (a->kind != EK_K && a->kind != EK_MOD && a->ty != TY_ARR && a->hint && a->hint->type == T_STRING) { (void)len; (void)skip; return do_get_index_s(c, pc); }
     if (a->kind != EK_K && a->kind != EK_MOD && hint_is_container(a)) { (void)len; (void)skip; return do_get_index_h(c, pc); }
     if (a->kind == EK_K || a->kind == EK_MOD) FAIL("index of a constant");
     if (!need(c, pa, TY_ARR) || !need(c, pb, TY_INT)) FAIL("index types");
