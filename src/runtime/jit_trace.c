@@ -1424,7 +1424,7 @@ static int trace_build_ir(Proto *p, const SpValue *locals, uint32_t stack_depth,
 
     /* The TraceJIT backend keeps f64 values in general registers and moves them through XMM0/XMM1 around every operation,
      * which measured 2x slower than the region JIT on float loops. Until f64 values are register-allocated in XMM registers
-     * (docs/design/tiered-jit.md, phase 2) such loops are left to the region JIT. SPRINT_TRACE_JIT_F64=1 lifts the gate for
+     * (docs/design/tiered-jit.md, phase 1) such loops are left to the region JIT. SPRINT_TRACE_JIT_F64=1 lifts the gate for
      * backend development and the trace regression tests. */
     {
         static int f64_gate = -1;

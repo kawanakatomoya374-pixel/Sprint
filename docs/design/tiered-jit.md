@@ -16,7 +16,7 @@ TraceJIT のバックエンドは領域 JIT と同じ stencil 表（`stencils.h`
 1. **TraceJIT は領域 JIT より遅くならない**。`tools/bench/trace_cmp.sh` で全ベンチの on/off 比が 1.05 を超えたら不具合として扱う。
 2. ループのルート記録は 1 回だけ（コンパイル成功でも拒否でも「確定済み」として再記録しない。`Proto.trace_settled` のビットセット）。
 3. トレースが拒否・未対応なら、そのループは何も失わず領域 JIT に進む（`JIT_HOOK`）。
-4. （フェーズ1）トレースの side exit が頻発するループは降格して領域 JIT に戻す（exit 率の計測で判断）。
+4. （フェーズ2）トレースの side exit が頻発するループは降格して領域 JIT に戻す（exit 率の計測で判断）。
 
 ## 2. フェーズ0（実装済み）で解決した問題
 
@@ -41,19 +41,29 @@ TraceJIT を既定オンにするために、まず「オンにしただけで�
 
 結論: 現時点では TraceJIT は「安全に既定オンにできた基盤」であって、速度の利得はまだ無い。利得を出すにはフェーズ1〜3が必要。
 
-## 4. 今後のフェーズ
+## 4. 今後のフェーズ（バックエンド → ビルダーの順に修正）
 
-### フェーズ1: 汎用の経路ベース IR ビルダー
-- 記録済みステップ列（`TraceStep`、実行された pc の列）を ocode 上でデコードし、型付き SSA に抽象解釈する汎用ビルダーに置き換える。対象: ローカル、整数・float の混在演算（int+float は float）、`%` `//`、比較＋条件分岐（取った方向のガードとして出す）、`for ... in range`（RANGE_NEXT の cur/stop/step を整数の loop-carried 値として扱う）、module 変数（entry で型ガードし、全 exit で書き戻す疑似ローカル）。
-- exit は「反復の先頭状態を復元してヘッダからインタプリタで再実行」で統一できる（反復内に副作用が無いため。既存の arith deopt と同じ考え方）。
-- 降格: exit が一定回数・一定率を超えたトレースは無効化し領域 JIT へ戻す。偏りのない分岐（collatz の `n % 2`）での性能崖を防ぐ。side trace（既存）で分岐の両側を覆えるものは残す。
-- 検証: `tools/jitfuzz*.py` に分岐・混在型の生成を追加。`trace_cmp.sh` が全ベンチ 1.05 以下。
+フェーズ1の着手前調査で、**ビルダーだけ広げても速くならない**ことが分かった。バックエンドに次の欠落があるため、順序をバックエンド先行に改めた。
 
-### フェーズ2: f64 を XMM レジスタで保持
-- `ta_alloc_regs` に XMM プールを追加し、f64 の PHI・中間値を XMM に固定割当て。snapshot の exit stencil（FROM_IR 復元）も XMM 対応にする。ここで f64 ゲートを外し、nbody 系で領域 JIT（0.19s）と LuaJIT（0.17s）の双方を上回ることを目標にする。
+| 欠落 | 根拠 | 影響 |
+|---|---|---|
+| `IDIV` / `IMOD` を生成しない | `jit_trace.c:711` で `RETURN` と同じ「未対応」扱い | `%` `//` を含むループ（collatz、tokenize、loop）を通せない |
+| ガードの出口が 1 種類 | 全 `GUARD_TRUE` が `TA_EXIT`（ループ条件偽の出口）へ飛ぶ | 本体内 `if` を「反復先頭へ戻して再実行」する deopt 出口で表せない |
+| f64 を GPR に置く | `ta_f64_binop` が演算ごとに `GPR→xmm0→演算→GPR` | float ループが領域 JIT の 2 倍遅い（§3） |
+
+### フェーズ1（バックエンド）
+1. `IDIV` / `IMOD`: Sprint の床除算・床剰余の意味論で生成（2 のべき乗は `sar` / `and`、それ以外は `cqo; idiv` ＋符号補正、除数 0 と `INT64_MIN / -1` は deopt 出口）。
+2. `GUARD_TRUE` の `aux` で出口を選べるようにする: 0 = ループ出口（従来）、1 = deopt（反復先頭の状態へ復元してヘッダからインタプリタで再実行）。スナップショットは既存の DEOPT 記述子を再利用。
+3. f64 を XMM レジスタに割当て（`ta_alloc_regs` に XMM プール。PHI は固定割当て、exit stencil の FROM_IR 復元も XMM 対応）。完了後に f64 ゲート（§3）を外す。
+4. 検証: 既存の IR 単体テスト（`trace_ir.c` 末尾の不変条件テスト）に IDIV/IMOD/新ガードを追加、`jitfuzz*.py` に生成パターンを追加。`trace_cmp.sh` で整数・float ループが領域 JIT 以上であること。
+
+### フェーズ2（ビルダー）
+- 記録済みステップ列（`TraceStep`）を ocode 上でデコードし、型付き SSA に抽象解釈する汎用ビルダーへ置き換える。対象: ローカル、整数・float の混在演算、`%` `//`、比較＋条件分岐（取った方向を deopt ガードとして出す）、`for ... in range`（RANGE_NEXT の cur/stop/step を整数の loop-carried 値に）、module 変数（entry で型ガードし、全 exit で書き戻す疑似ローカル）。
+- 降格: exit が一定率を超えたトレースは無効化し領域 JIT へ戻す。偏りのない分岐（collatz の `n % 2`）での性能崖を防ぐ。
+- 検証: fuzz に分岐・混在型を追加。`trace_cmp.sh` が全ベンチ 1.05 以下、かつ loop / collatz / nbody で領域 JIT 以上。
 
 ### フェーズ3: メモリ・呼出し・割当て
-- `trace-memory-v2.md` の段階A〜C（load/store と前方伝搬・LICM、呼出しの展開、allocation sinking）。closure / oop の LuaJIT 比 4〜10x の差を詰める本命。
+- `trace-memory-v2.md` の段階A〜C。closure / oop の LuaJIT 比 4〜10x の差を詰める本命。
 
 ## 5. 作業ルール
 - 各フェーズで `make test` / `test-jit` / `test-trace-jit` / `test-san` / `test-embed` / `strict-clang` / `analyze` を全て通す。
