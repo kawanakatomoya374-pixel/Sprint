@@ -204,6 +204,8 @@ test-san: $(BUILD)/sprint-san $(FFI_LIBS) test-trace-snapshot-san test-gc-stress
 test-gc-stress: $(BUILD)/sprint
 	@SPRINT_GC_STRESS=1 SPRINT_GC_MARK_LIMIT=1 $(BUILD)/sprint run tests/cases/lang/gc.sp > $(BUILD)/gc-stress.out
 	@cmp $(BUILD)/gc-stress.out tests/cases/lang/gc.out && echo 'gc: stress + one-slot mark fallback + cyclic graph + stats verified'
+	@SPRINT_GC_STRESS=1 $(BUILD)/sprint run tests/cases/lang/ctor_fast.sp > $(BUILD)/ctor-stress.out
+	@cmp $(BUILD)/ctor-stress.out tests/cases/lang/ctor_fast.out && echo 'gc: constructors (including failed ones) survive a collection at every allocation'
 
 test-gc-stress-san: $(BUILD)/sprint-san
 	@SPRINT_GC_STRESS=1 SPRINT_GC_MARK_LIMIT=1 ASAN_OPTIONS=detect_leaks=1 $(BUILD)/sprint-san run tests/cases/lang/gc.sp > $(BUILD)/gc-stress-san.out

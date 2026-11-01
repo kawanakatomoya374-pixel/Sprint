@@ -1872,6 +1872,9 @@ static RunStatus RUN_LOOP_NAME(VM *vm, VMTraceCapture **capp, RunCold *ccold, in
         SYNC();
         fr->pc = ipc;
         ev = take_pending(vm);
+        /* A constructor call that failed before its frame existed (wrong arity...) leaves its new instance in call_uev, which is
+         * not a GC root: the stale pointer would end up in the next frame's uev after the instance had been collected. */
+        call_uev = v_nil();
     unwind:
         for (;;) {
             int top = vm->nframes - 1;
