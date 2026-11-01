@@ -106,7 +106,9 @@ static void *pool_alloc(VM *vm, size_t size) {
     return p;
 }
 
-void *new_obj(VM *vm, size_t size, int type, int with_id) {
+/* zsize: how many leading bytes start out zeroed. The rest is left as the allocator returned it, for callers that
+ * overwrite it completely right away (string payloads: zeroing them first doubled the cost of every concatenation). */
+static void *new_obj_z(VM *vm, size_t size, size_t zsize, int type, int with_id) {
     Obj *o;
     if (size <= POOL_MAX) {
         if (vm->bytes + size > vm->lim.max_heap_bytes)
@@ -116,13 +118,14 @@ void *new_obj(VM *vm, size_t size, int type, int with_id) {
     } else {
         o = vm_mem(vm, NULL, 0, size);
     }
-    memset(o, 0, size);
+    memset(o, 0, zsize);
     o->type = (uint8_t)type;
     o->id = with_id ? ++vm->next_id : 0u;
     o->next = vm->objs;
     vm->objs = o;
     return o;
 }
+void *new_obj(VM *vm, size_t size, int type, int with_id) { return new_obj_z(vm, size, size, type, with_id); }
 
 /* size of the object header block as allocated by new_obj */
 static size_t obj_hdr_size(const Obj *o) {
@@ -172,7 +175,7 @@ uint32_t sp_hash_bytes(const char *s, size_t n) {
 SString *vm_alloc_string(VM *vm, size_t len) {
     if (len > vm->lim.max_string_bytes)
         vm_fatal(vm, RS_MEMORY, "string length limit exceeded");
-    SString *s = new_obj(vm, offsetof(SString, data) + len + 1, T_STRING, 0);
+    SString *s = new_obj_z(vm, offsetof(SString, data) + len + 1, offsetof(SString, data), T_STRING, 0);
     s->len = (uint32_t)len;
     s->data[len] = 0;
     return s;
