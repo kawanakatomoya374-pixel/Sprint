@@ -398,6 +398,7 @@ static SpStatus map_result(VM *vm, RunStatus st) {
     case RS_TIMEOUT: return SP_E_TIMEOUT;
     case RS_INTERRUPT: return SP_E_INTERRUPT;
     case RS_ERROR:
+    case RS_SW_RECORD: case RS_SW_NORMAL: /* never leave run_loop() */
     default:
         if (vm->uncaught.type == T_ERROR && AS_ERROR(vm->uncaught)->code == E_PERM) return SP_E_PERMISSION;
         return SP_E_RUNTIME;

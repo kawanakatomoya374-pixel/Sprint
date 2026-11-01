@@ -122,6 +122,7 @@ static void proto_free(Proto *p) {
     free(p->consts);
     free(p->default_pcs);
     jit_free_proto(p);
+    free(p->trace_settled);
     free(p->ocode);
     free(p->code);
     free(p->lines);

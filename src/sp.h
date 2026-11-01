@@ -403,6 +403,11 @@ struct Proto {
     struct JitUnit *junit; /* native entry of the whole function (JIT), NULL = not compiled */
     int jcall;             /* call countdown until the JIT is asked to compile the function (0 = not initialised) */
     int compile_index;     /* stable index in Program.protos while compiling */
+    /* TraceJIT: bit set of loop headers (by code offset) that are settled: their root recording was rejected or already
+     * produced a trace, so the loop is never recorded again (see proto_trace_blocked). NULL until the first loop settles. */
+    uint8_t *trace_settled;
+    uint32_t trace_settled_bytes;
+    uint8_t trace_any;     /* at least one TraceJIT trace was compiled for this function */
 };
 
 enum { LINK_PRELUDE = 0, LINK_MOD_EXPORT = 1, LINK_MOD_VALUE = 2 };
@@ -599,7 +604,8 @@ enum { SW_NONE = 0, SW_RESUME = 1, SW_CLOSE = 2 };
 typedef int RunStatusInt;
 typedef enum RunStatus {
     RS_OK = 0, RS_ERROR = 1, RS_PERM = 3, RS_MEMORY = 14, RS_PANIC = 101,
-    RS_TIMEOUT = 124, RS_INTERRUPT = 130, RS_EXIT = 256
+    RS_TIMEOUT = 124, RS_INTERRUPT = 130, RS_EXIT = 256,
+    RS_SW_RECORD = 1000, RS_SW_NORMAL = 1001 /* internal to vm.c: continue the frame in the other interpreter variant */
 } RunStatus;
 
 /* Direct-mapped (class, member name) -> field slot / method cache. Classes are
@@ -758,6 +764,12 @@ SError *vm_new_error_obj(VM *vm);
 STable *vm_new_table(VM *vm, int64_t cap);
 SCell *vm_new_cell(VM *vm, SpValue v);
 SFunc *vm_new_native(VM *vm, const NativeDesc *d);
+/* the loop at header has been settled (its recording was rejected, or it already has a root trace): do not record it
+ * again. Inline: it runs at every loop back edge. */
+static inline int proto_trace_blocked(const Proto *p, uint32_t header) {
+    return (header >> 3) < p->trace_settled_bytes && ((unsigned)(p->trace_settled[header >> 3] >> (header & 7U)) & 1U) != 0U;
+}
+void proto_trace_reject(Proto *p, uint32_t header);           /* the loop at header is settled: see proto_trace_blocked */
 SModule *vm_new_module(VM *vm, const char *name);
 SClass *vm_new_class(VM *vm, SString *name, SClass *parent);
 SInstance *vm_new_instance(VM *vm, SClass *cls);

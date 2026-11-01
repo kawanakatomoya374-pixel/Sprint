@@ -1117,6 +1117,14 @@ static int trace_cache_make_room(struct JitProto *jp, size_t bytes) {
     return 1;
 }
 
+/* SPRINT_TRACE_JIT_DEBUG is consulted on hot paths (every loop back edge): read it once */
+static const char *trace_debug_env(void) {
+    static int state = -1;
+    static const char *value;
+    if (state < 0) { value = getenv("SPRINT_TRACE_JIT_DEBUG"); state = 1; }
+    return value;
+}
+
 static int trace_build_ir(Proto *p, const SpValue *locals, uint32_t stack_depth,
                           uint32_t header, const TraceStep *steps, unsigned count,
                           SpTraceIR *ir, int32_t **phi_local_out,
@@ -1400,17 +1408,17 @@ static int trace_build_ir(Proto *p, const SpValue *locals, uint32_t stack_depth,
     if (!sp_tir_emit_loop(ir)) goto done;
     build_stage = 65;
     if (!sp_tir_verify(ir, verify_message, sizeof verify_message)) {
-        if (getenv("SPRINT_TRACE_JIT_DEBUG")) fprintf(stderr, "trace-jit: initial IR verify: %s\n", verify_message);
+        if (trace_debug_env()) fprintf(stderr, "trace-jit: initial IR verify: %s\n", verify_message);
         goto done;
     }
     build_stage = 66;
     if (!sp_tir_optimize(ir, NULL, NULL)) {
-        if (getenv("SPRINT_TRACE_JIT_DEBUG")) fprintf(stderr, "trace-jit: IR optimize rejected\n");
+        if (trace_debug_env()) fprintf(stderr, "trace-jit: IR optimize rejected\n");
         goto done;
     }
     build_stage = 67;
     if (!sp_tir_verify(ir, verify_message, sizeof verify_message)) {
-        if (getenv("SPRINT_TRACE_JIT_DEBUG")) fprintf(stderr, "trace-jit: optimized IR verify: %s\n", verify_message);
+        if (trace_debug_env()) fprintf(stderr, "trace-jit: optimized IR verify: %s\n", verify_message);
         goto done;
     }
 
@@ -1432,9 +1440,10 @@ static int trace_build_ir(Proto *p, const SpValue *locals, uint32_t stack_depth,
     *exit_pc_out = exit_pc;
     *backedge_pc_out = backedge_pc;
     ok = 1;
+    p->trace_any = 1;
 done:
     if (!ok) {
-        const char *debug_env = getenv("SPRINT_TRACE_JIT_DEBUG");
+        const char *debug_env = trace_debug_env();
         if (debug_env && debug_env[0] && debug_env[0] != '0')
             (void)fprintf(stderr, "trace-jit: IR build stage=%d header=%u pc=%u body=%u backedge=%u count=%u nbody=%u depth=%u first=%u last=%u op=%u\n",
                           build_stage, header, pc, body_pc, backedge_pc, count, nbody, depth,
@@ -1562,7 +1571,7 @@ int jit_trace_compile(VM *vm, Proto *p, uint32_t header, const TraceStep *steps,
     trace_mark_used(jp, tr);
     mem = MAP_FAILED;
     tr = NULL;
-    debug = getenv("SPRINT_TRACE_JIT_DEBUG");
+    debug = trace_debug_env();
     if (debug && debug[0] && debug[0] != '0') {
         (void)fprintf(stderr, "trace-jit: %s %s@%u depth=%u parent=%u body=%u exit=%u code=%zuB ir=%zu cache=%u/%zuB%s\n",
                       is_side ? "side-compiled" : "compiled", p->name ? p->name : "?",
@@ -1575,7 +1584,7 @@ int jit_trace_compile(VM *vm, Proto *p, uint32_t header, const TraceStep *steps,
     ok = 1;
 done:
     if (!ok) {
-        debug = getenv("SPRINT_TRACE_JIT_DEBUG");
+        debug = trace_debug_env();
         if (debug && debug[0] && debug[0] != '0')
             (void)fprintf(stderr, "trace-jit: rejected %s@%u: %s\n", p->name ? p->name : "?", header, fail_reason);
     }
@@ -1609,7 +1618,7 @@ int jit_trace_site(VM *vm, Proto *p, const uint8_t *hdr, SpValue *base, SpValue 
     header = (uint32_t)(hdr - p->code);
     root = trace_find(jp, header);
     if (!root || !root->entry) return 0;
-    debug = getenv("SPRINT_TRACE_JIT_DEBUG");
+    debug = trace_debug_env();
     if (debug && debug[0] && debug[0] != '0') {
         (void)fprintf(stderr, "trace-jit: site %s@%u locals=", p->name ? p->name : "?", header);
         for (uint16_t i = 0U; i < root->snapshot_set.loop_map.entry_count; i++) {
@@ -1667,7 +1676,7 @@ int jit_trace_site(VM *vm, Proto *p, const uint8_t *hdr, SpValue *base, SpValue 
         __atomic_load_n(&first->runtime.link_entry, __ATOMIC_ACQUIRE) != link_target) {
         first->link = next;
         __atomic_store_n(&first->runtime.link_entry, link_target, __ATOMIC_RELEASE);
-        debug = getenv("SPRINT_TRACE_JIT_DEBUG");
+        debug = trace_debug_env();
         if (link_target != NULL && debug && debug[0] && debug[0] != '0')
             (void)fprintf(stderr, "trace-jit: native-link %s@%u -> @%u\n",
                           p->name ? p->name : "?", first->header, next->header);
