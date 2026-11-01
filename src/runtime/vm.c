@@ -438,12 +438,19 @@ static RunStatus run_loop(VM *vm) {
     SpValue *base = fr->base;
     Proto *proto = fr->fn->proto;
     uint64_t left = vm->ileft; /* remaining step budget (UINT64_MAX = unlimited) */
-    const char *trace_env = getenv("SPRINT_TRACE_RECORD");
-    const char *trace_jit_env = getenv("SPRINT_TRACE_JIT");
+    /* run_loop is re-entered for every vm_call (sort comparators, map/filter callbacks...), and getenv is a linear scan of
+     * the environment: read the two switches once. The values are idempotent, so a racing first call is harmless. */
+    static int env_state = -1; /* -1 unread, else bit0 = trace record, bit1 = trace JIT */
+    int es = env_state;
+    if (es < 0) {
+        const char *te = getenv("SPRINT_TRACE_RECORD"), *tj = getenv("SPRINT_TRACE_JIT");
+        es = (te && te[0] && te[0] != '0' ? 1 : 0) | (tj && tj[0] && tj[0] != '0' ? 2 : 0);
+        env_state = es;
+    }
     const int jit_enabled = vm->jit_on;
     /* Keep trace recording off the normal JIT hot path unless explicitly requested. */
-    int trace_jit_enabled = jit_enabled && trace_jit_env && trace_jit_env[0] && trace_jit_env[0] != '0';
-    const int trace_record_enabled = trace_env && trace_env[0] && trace_env[0] != '0';
+    int trace_jit_enabled = jit_enabled && (es & 2);
+    const int trace_record_enabled = es & 1;
     VMTraceCapture *trace_cap = NULL;
     if ((trace_jit_enabled || trace_record_enabled) && vm->jit_on) {
         trace_cap = vm_trace_capture_begin(trace_record_enabled);
