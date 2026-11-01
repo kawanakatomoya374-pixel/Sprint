@@ -74,7 +74,8 @@ INC      := -Isrc
 comma    := ,
 TUNE_FLAG := -mtune-ctrl=^sse_unaligned_load_optimal$(comma)^sse_unaligned_store_optimal
 TUNE     := $(if $(filter x86_64,$(shell uname -m)),$(shell $(CC) $(TUNE_FLAG) -x c -c /dev/null -o /dev/null >/dev/null 2>&1 && echo $(TUNE_FLAG)),)
-CFLAGS_REL := $(STD) $(WARN) $(HARDEN) -O2 $(TUNE) -g $(INC) -DNDEBUG_SP
+PGO      ?=
+CFLAGS_REL := $(STD) $(WARN) $(HARDEN) -O2 $(TUNE) -g $(INC) -DNDEBUG_SP $(PGO)
 CFLAGS_DBG := $(STD) $(WARN) $(HARDEN) -O0 -g3 $(INC) \
               -fsanitize=address,undefined -fno-sanitize-recover=undefined \
               -fsanitize=bounds-strict,float-cast-overflow -fstack-protector-all -fno-omit-frame-pointer
@@ -105,6 +106,18 @@ $(GEN)/bundled.c: tools/embedsrc.c $(STDSRC) $(GEN)/gui.sp Makefile
 	$(CC) -O1 -o $(GEN)/embedsrc tools/embedsrc.c
 	$(GEN)/embedsrc $@ gui=$(GEN)/gui.sp $(foreach f,$(STDSRC),$(basename $(notdir $(f)))=$(f))
 
+# Profile-guided build (build/sprint-pgo): instrument, train on the benchmarks and the language tests, rebuild with the profile.
+# Slower to build, ~5-10% faster interpreter and JIT runtime. The default `make` stays profile-free and reproducible.
+pgo:
+	rm -rf $(BUILD)/pgo
+	$(MAKE) BUILD=$(BUILD)/pgo PGO="-fprofile-generate -fprofile-update=single" $(BUILD)/pgo/sprint
+	sh tools/pgo_train.sh $(BUILD)/pgo/sprint
+	find $(BUILD)/pgo -name '*.o' -delete
+	rm -f $(BUILD)/pgo/sprint
+	$(MAKE) BUILD=$(BUILD)/pgo PGO="-fprofile-use -fprofile-correction -Wno-error=coverage-mismatch -Wno-missing-profile" $(BUILD)/pgo/sprint
+	cp $(BUILD)/pgo/sprint $(BUILD)/sprint-pgo
+.PHONY: pgo
+
 .PHONY: all debug analyze test test-san test-embed test-gc-stress test-gc-stack-growth test-gc-stats test-gc-stress-san test-gc-stack-growth-san test-gc-stats-san fuzz bench clean lib
 all: $(BUILD)/sprint
 
@@ -125,7 +138,11 @@ $(BUILD)/sprint-san: $(DBG_OBJ)
 # The interpreter loop is the one file where -fno-strict-overflow costs ~30% (it blocks loop and branch folding in the
 # dispatch switch). vm.c does not rely on signed wrap-around: every checked operation uses unsigned or builtin overflow
 # helpers, and the UBSan build runs the whole suite. vm.c alone therefore uses the compiler default.
-$(BUILD)/rel/src/runtime/vm.o: CFLAGS_REL += -fstrict-overflow
+# Same reasoning for control-flow protection: every computed-goto handler is an indirect-branch target, and -fcf-protection=full
+# plants an endbr64 at each of them. The targets are labels inside this one function (a jump table of constants, never a
+# function pointer from data), so vm.o alone is built with -fcf-protection=none; everything else keeps =full.
+VMEXTRA ?= -fcf-protection=none
+$(BUILD)/rel/src/runtime/vm.o: CFLAGS_REL += -fstrict-overflow $(VMEXTRA)
 
 $(BUILD)/rel/%.o: %.c src/sp.h src/sprint.h Makefile
 	@mkdir -p $(dir $@)

@@ -1094,7 +1094,7 @@ static RunStatus RUN_LOOP_NAME(VM *vm, VMTraceCapture **capp, int trace_jit_enab
             SpValue qx = base[rd16(ipc + 1)];
             int64_t qk = (int16_t)(uint16_t)rd16(ipc + 4), qr;
             if (qx.type != T_INT || qk <= 0) goto q_deopt;
-            if (qx.as.i >= 0 && (qk & (qk - 1)) == 0) qr = qx.as.i & (qk - 1);
+            if ((qk & (qk - 1)) == 0) qr = qx.as.i & (qk - 1);
             else if ((((uint64_t)qx.as.i | (uint64_t)qk) >> 32) == 0) qr = (int64_t)((uint32_t)qx.as.i % (uint32_t)qk); /* 32-bit div is much cheaper */
             else { qr = qx.as.i % qk; if (qr < 0) qr += qk; }
             PUSH(v_int(qr)); pc = ipc + 7; NEXT();
@@ -1169,7 +1169,7 @@ static RunStatus RUN_LOOP_NAME(VM *vm, VMTraceCapture **capp, int trace_jit_enab
             SpValue qx = base[rd16(ipc + 1)];
             int64_t qm = (int16_t)(uint16_t)rd16(ipc + 4), qk = (int16_t)(uint16_t)rd16(ipc + 8), qr;
             if (qx.type != T_INT || qm <= 0) goto q_deopt;
-            if (qx.as.i >= 0 && (qm & (qm - 1)) == 0) qr = qx.as.i & (qm - 1);
+            if ((qm & (qm - 1)) == 0) qr = qx.as.i & (qm - 1);
             else if ((((uint64_t)qx.as.i | (uint64_t)qm) >> 32) == 0) qr = (int64_t)((uint32_t)qx.as.i % (uint32_t)qm);
             else { qr = qx.as.i % qm; if (qr < 0) qr += qm; }
             pc = ipc + 16;
@@ -1273,7 +1273,8 @@ static RunStatus RUN_LOOP_NAME(VM *vm, VMTraceCapture **capp, int trace_jit_enab
             SpValue qx = base[rd16(ipc + 1)];
             int64_t qk = (int16_t)(uint16_t)rd16(ipc + 4), qr;
             if (qx.type != T_INT || qk <= 0) goto q_deopt;
-            if (qx.as.i >= 0) qr = (((uint64_t)qx.as.i | (uint64_t)qk) >> 32) == 0 ? (int64_t)((uint32_t)qx.as.i / (uint32_t)qk) : qx.as.i / qk;
+            if ((qk & (qk - 1)) == 0) qr = qx.as.i >> __builtin_ctzll((unsigned long long)qk);   /* 2^n: an arithmetic shift is the floor division */
+            else if (qx.as.i >= 0) qr = (((uint64_t)qx.as.i | (uint64_t)qk) >> 32) == 0 ? (int64_t)((uint32_t)qx.as.i / (uint32_t)qk) : qx.as.i / qk;
             else { qr = qx.as.i / qk; if (qx.as.i % qk != 0) qr--; }
             PUSH(v_int(qr)); pc = ipc + 7; NEXT();
         }
@@ -1411,7 +1412,7 @@ static RunStatus RUN_LOOP_NAME(VM *vm, VMTraceCapture **capp, int trace_jit_enab
             if (qs_.type != T_INT || qx_.type != T_INT) goto q_deopt; \
             if ((ARITH) == OP_MOD) { \
                 if (qk_ <= 0) goto q_deopt; \
-                if (qx_.as.i >= 0 && (qk_ & (qk_ - 1)) == 0) qr_ = qx_.as.i & (qk_ - 1); \
+                if ((qk_ & (qk_ - 1)) == 0) qr_ = qx_.as.i & (qk_ - 1); \
                 else if ((((uint64_t)qx_.as.i | (uint64_t)qk_) >> 32) == 0) qr_ = (int64_t)((uint32_t)qx_.as.i % (uint32_t)qk_); \
                 else { qr_ = qx_.as.i % qk_; if (qr_ < 0) qr_ += qk_; } \
             } else if ((ARITH) == OP_MUL) { if (mul_ovf(qx_.as.i, qk_, &qr_)) goto q_deopt; } \
