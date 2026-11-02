@@ -63,7 +63,8 @@ TraceJIT を既定オンにするために、まず「オンにしただけで�
 ✅ **実装済み**（`trace_build_ir_path`、従来の狭いビルダーが拒否したときに試す）: 記録済みステップ列を ocode 上で辿り、各条件分岐を「観測した方向」のガードにする。対象: ローカル、整数・float の定数と演算（同型どうし。`/` は float、`//` `%` は整数）、単項 `-`、比較＋条件分岐、前方 `JUMP` / `JUMP_IF_FALSE` / `JUMP_IF_TRUE`、`POP` / `DUP` / `DUP2`。反復の最初のガードがループを抜ける向きならループ出口、それ以外は deopt 出口（反復先頭の状態を復元してインタプリタで再実行。反復内の副作用はローカルの更新だけなので成立する）。最初の比較のオペランドは PHI か定数に限る（ループラベルとレジスタ固定の前提）。
 ✅ **降格ポリシー**: deopt を 16 回以上経験し、deopt あたりの平均反復数が 512 未満のトレースは無効化して領域 JIT に戻す（反復数は `vm->ileft` の減少量で測る）。導入前は偏りのない分岐（`if i % 2 == 0`）が領域 JIT の **23 倍遅かった**（3.1s 対 0.137s）が、降格後は同等（0.14s）。
 ✅ **検証**: `tests/cases/jit/jit_trace_branch.sp`（偏った分岐・途中で反転する分岐・collatz・forward jump・deopt 後のエラー）、`tools/jitfuzz_trace.py`（`make fuzz-trace`。800 本・4 構成で差分 0、トレース化は約 65%、うち約 25% が降格）。
-未実装: `for ... in range`（RANGE_NEXT）、module 変数、`and` / `or`（`JUMP_IF_*_OR_POP`）、float の反転ガード、int と float の混在演算、最初の比較がループ先頭でない形、内側ループ。
+✅ `for ... in range`（RANGE_NEXT。cur/stop/step を整数の loop-carried 値とし、刻みの符号と値は deopt ガードで固定、加算の溢れは deopt でインタプリタに任せる）。
+未実装: module 変数、`and` / `or`（`JUMP_IF_*_OR_POP`）、float の反転ガード、int と float の混在演算、最初の比較がループ先頭でない形、内側ループ。
 
 ### フェーズ3: メモリ・呼出し・割当て
 - `trace-memory-v2.md` の段階A〜C。closure / oop の LuaJIT 比 4〜10x の差を詰める本命。

@@ -1668,6 +1668,14 @@ static int trace_build_ir_path(Proto *p, const SpValue *locals, uint32_t stack_d
                 po->arg = (uint16_t)rd16(code + pc + 1U);
                 if (po->arg >= (unsigned)p->nlocals) goto done;
                 break;
+            case OP_RANGE_NEXT: {   /* for i in range(...): state in locals arg, arg+1, arg+2 = cur, stop, step */
+                int32_t off = rd32s(code + pc + 3U);
+                int64_t t = (int64_t)pc + 7 + off;
+                po->arg = (uint16_t)rd16(code + pc + 1U);
+                if (off <= 0 || t >= (int64_t)p->code_len || (unsigned)po->arg + 2U >= (unsigned)p->nlocals) goto done;
+                po->target = (uint32_t)t;
+                break;
+            }
             case OP_SMALLINT:
                 po->arg = (uint16_t)rd16(code + pc + 1U);
                 break;
@@ -1713,6 +1721,13 @@ walked:
             SpTIRType t;
             if (!trace_value_type((SpType)locals[path[i].arg].type, &t)) goto done;
             used[path[i].arg] = 1U;
+        }
+        if (path[i].op == OP_RANGE_NEXT) {
+            for (unsigned k = 0U; k < 3U; k++) {
+                if (locals[path[i].arg + k].type != T_INT) { why = "range state is not an int"; goto done; }
+                used[path[i].arg + k] = 1U;
+            }
+            if (locals[path[i].arg + 2U].as.i == 0) goto done;
         }
     }
 
@@ -1804,6 +1819,29 @@ walked:
             if (ta != tb || (ta != SP_TIR_T_I64 && ta != SP_TIR_T_F64) ||
                 !trace_cmp_ir(po->op, ta == SP_TIR_T_F64, &cmp) || !sp_tir_emit_binary(ir, cmp, a, b, &r)) goto done;
             stack[depth++] = r;
+            break;
+        }
+        case OP_RANGE_NEXT: {
+            const int64_t stepv = locals[po->arg + 2U].as.i;
+            SpTIRValue cur = current[po->arg], stop = current[po->arg + 1U], step = current[po->arg + 2U], kstep, eq, nx, cond;
+            unsigned flags = SP_TIR_GUARD_DEOPT;
+            if (depth >= stack_capacity || !cur || !stop || !step) goto done;
+            /* continue while cur < stop (step > 0) or cur > stop (step < 0); the sign of the step is a property of this trace,
+             * so the step itself is checked below. The test leaves the loop, hence the loop exit when it is the iteration's
+             * first guard */
+            if (!sp_tir_emit_binary(ir, stepv > 0 ? SP_TIR_ICMP_LT : SP_TIR_ICMP_GT, cur, stop, &cond)) goto done;
+            if (!have_exit && !stored && depth == stack_depth && po->target > backedge) {
+                flags = 0U;
+                exit_pc = po->target;
+                have_exit = 1;
+            }
+            if (!sp_tir_emit_guard(ir, cond, i + 1U, flags)) goto done;
+            if (!sp_tir_emit_const_i64(ir, stepv, &kstep) || !sp_tir_emit_binary(ir, SP_TIR_ICMP_EQ, step, kstep, &eq) ||
+                !sp_tir_emit_guard(ir, eq, i + 1U, SP_TIR_GUARD_DEOPT)) goto done;
+            stack[depth++] = cur;
+            if (!sp_tir_emit_binary(ir, SP_TIR_IADD, cur, step, &nx)) goto done;   /* an overflow deoptimises: the interpreter ends the loop */
+            current[po->arg] = nx;
+            stored = 1;
             break;
         }
         case OP_JUMP_IF_FALSE: case OP_JUMP_IF_TRUE: {

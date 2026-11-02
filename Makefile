@@ -200,6 +200,40 @@ test: $(BUILD)/sprint $(FFI_LIBS) test-trace-snapshot test-gc-stress test-gc-sta
 test-san: $(BUILD)/sprint-san $(FFI_LIBS) test-trace-snapshot-san test-gc-stress-san test-gc-stack-growth-san test-gc-stats-san
 	@SPRINT=$(BUILD)/sprint-san sh tests/run_tests.sh
 
+# AddressSanitizer with the object pools off: every VM object is its own malloc block, so a dangling pointer to a collected object
+# (a missing GC root) is reported at the first use instead of corrupting a free list. This is how the failed-constructor bug was found.
+$(BUILD)/nopool/sprint-san: $(ALLSRC) src/sp.h src/sprint.h Makefile
+	@mkdir -p $(BUILD)/nopool
+	$(MAKE) BUILD=$(BUILD)/nopool CFLAGS_DBG_EXTRA=-DSP_POOL_MAX=0 $(BUILD)/nopool/dbg-nopool
+$(BUILD)/nopool/dbg-nopool: $(ALLSRC) src/sp.h src/sprint.h Makefile
+	@mkdir -p $(BUILD)/nopool
+	$(CC) $(CFLAGS_DBG) -DSP_POOL_MAX=0 -o $(BUILD)/nopool/sprint-san $(ALLSRC) -lm -ldl $(LDFLAGS_DBG)
+	@touch $@
+test-san-nopool: $(BUILD)/nopool/dbg-nopool $(FFI_LIBS)
+	@SPRINT=$(BUILD)/nopool/sprint-san sh tests/run_tests.sh
+# ... and with a collection at every allocation, on the language and class tests (an ASan run of the whole suite that way takes
+# half an hour): the output must still equal the expected output
+test-san-nopool-stress: $(BUILD)/nopool/dbg-nopool
+	@fail=0; for f in tests/cases/lang/*.sp tests/cases/class/class.sp tests/cases/class/cls_super2.sp tests/cases/syntax/*.sp; do \
+	  b=$${f%.sp}; [ -f $$b.out ] || continue; args=""; [ -f $$b.args ] && args=$$(cat $$b.args); \
+	  out=$$(SPRINT_GC_STRESS=1 ASAN_OPTIONS=detect_leaks=0 $(BUILD)/nopool/sprint-san run --deterministic $$args $$f 2>&1); \
+	  [ "$$out" = "$$(cat $$b.out)" ] || { echo "FAIL (gc stress, no pool) $$f"; fail=1; }; \
+	done; [ $$fail = 0 ] && echo 'gc stress without pools: language and class tests clean'
+
+# The whole suite with a collection at every allocation (and, second, with the JIT compiling every loop and function at its first
+# opportunity): any object a C frame or the compiled code forgot to keep reachable shows up as a crash or a wrong result.
+test-gc-stress-all: $(BUILD)/sprint $(FFI_LIBS)
+	@SPRINT_GC_STRESS=1 SPRINT=$(BUILD)/sprint sh tests/run_tests.sh
+	@SPRINT_GC_STRESS=1 SPRINT_JIT_THRESHOLD=2 SPRINT=$(BUILD)/sprint sh tests/run_tests.sh
+
+# valgrind memcheck over the language tests: reads of uninitialised memory (ASan does not see those) fail the build
+test-valgrind: $(BUILD)/sprint
+	@fail=0; for f in tests/cases/lang/*.sp tests/cases/class/class.sp tests/cases/stdlib/json.sp tests/cases/stdlib/stdlib_iter_str.sp tests/cases/jit/jit_trace_branch.sp tests/cases/jit/jit_strindex.sp; do \
+	  valgrind -q --error-exitcode=99 --exit-on-first-error=yes $(BUILD)/sprint run --deterministic $$f >/dev/null 2>$(BUILD)/valgrind.log; rc=$$?; \
+	  if [ $$rc = 99 ]; then echo "valgrind: $$f"; head -20 $(BUILD)/valgrind.log; fail=1; fi; \
+	done; [ $$fail = 0 ] && echo 'valgrind: no uninitialised reads or invalid accesses'
+.PHONY: test-san-nopool test-san-nopool-stress test-gc-stress-all test-valgrind
+
 # Force the mark stack to one entry so the allocation-free heap-rescan fallback is exercised.
 test-gc-stress: $(BUILD)/sprint
 	@SPRINT_GC_STRESS=1 SPRINT_GC_MARK_LIMIT=1 $(BUILD)/sprint run tests/cases/lang/gc.sp > $(BUILD)/gc-stress.out

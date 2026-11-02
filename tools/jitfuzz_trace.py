@@ -49,8 +49,11 @@ def gen(rng, fl):
     fdecl = "    let x = 0.5\n    let y = 1.5\n" if fl else ""
     ret = "return [a, b, c" + (", x, y" if fl else "") + "]"
     n = rng.choice([300, 2000, 6000])
-    return ("func f(n):\n    let a = 1\n    let b = 2\n    let c = 3\n%s    let i = 0\n    while i < n:\n%s        i += 1\n    %s\n"
-            "try:\n    print(f(%d))\ncatch e:\n    print(e.kind)\n") % (fdecl, body, ret, n)
+    pre = "func f(n):\n    let a = 1\n    let b = 2\n    let c = 3\n%s" % fdecl
+    if rng.random() < 0.5:   # a counted loop
+        rng_expr = rng.choice(["range(n)", "range(n)", "range(0, n, 2)", "range(0, n, 3)", "range(n, 0, -1)", "range(n, 0, -2)"])
+        return (pre + "    for i in %s:\n%s    %s\ntry:\n    print(f(%d))\ncatch e:\n    print(e.kind)\n") % (rng_expr, body, ret, n)
+    return (pre + "    let i = 0\n    while i < n:\n%s        i += 1\n    %s\ntry:\n    print(f(%d))\ncatch e:\n    print(e.kind)\n") % (body, ret, n)
 
 def run(sprint, path, env):
     e = dict(os.environ); e.update(env)

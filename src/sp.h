@@ -631,7 +631,11 @@ typedef struct MCEnt {
 enum { MC_SIZE = 256 };
 
 /* objects up to this many bytes come from the per-VM size-class pools (value.c, gc.c) */
+/* Largest object served from the per-VM size-class pools. 0 turns the pools off, so that every object is a malloc block and
+ * AddressSanitizer sees use-after-free and overflow of VM objects (make test-san-nopool). */
+#ifndef SP_POOL_MAX
 #define SP_POOL_MAX 256
+#endif
 struct VM {
     ICEnt ic[IC_SIZE];
     int no_quicken; /* --no-quicken: run the plain bytecode (differential testing) */
