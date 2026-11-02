@@ -13,6 +13,11 @@ make            # 厳格リリースビルド → build/sprint
 make test       # 回帰テスト（stdout と終了コードを比較）
 make debug && make test-san   # ASan + UBSan 版で同じテスト
 make analyze    # GCC 静的解析 (-fanalyzer)
+make test-san-nopool          # ASan with the object pools off: a dangling pointer to a collected VM object is reported at its first use
+make test-san-nopool-stress   # the same under a collection at every allocation (language and class tests)
+make test-gc-stress-all       # the whole suite with a collection at every allocation, then with the JIT compiling at once (~15 min)
+make test-valgrind            # valgrind memcheck over the language tests (uninitialised reads, which ASan cannot see)
+make fuzz-trace               # differential fuzz of the TraceJIT path builder
 make strict-clang # clang -Weverything -Werror（構文検査）。`make strict` は GCC厳格ビルド・ASan版・analyze・これを全部実行
 make fuzz       # .spc ローダ/verifier/VM の変異ファジング（ASan+UBSan）
 make lib        # 埋め込み用 build/libsprint.a（ヘッダ src/sprint.h。リンクは -lm -ldl）

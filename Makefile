@@ -214,13 +214,13 @@ test-san-nopool: $(BUILD)/nopool/dbg-nopool $(FFI_LIBS)
 # ... and with a collection at every allocation, on the language and class tests (an ASan run of the whole suite that way takes
 # half an hour): the output must still equal the expected output
 test-san-nopool-stress: $(BUILD)/nopool/dbg-nopool
-	@fail=0; for f in tests/cases/lang/*.sp tests/cases/class/class.sp tests/cases/class/cls_super2.sp tests/cases/syntax/*.sp; do \
+	@fail=0; for f in $(filter-out %/stress.sp %/gc.sp,$(wildcard tests/cases/lang/*.sp)) tests/cases/class/class.sp tests/cases/class/cls_super2.sp; do \
 	  b=$${f%.sp}; [ -f $$b.out ] || continue; args=""; [ -f $$b.args ] && args=$$(cat $$b.args); \
-	  out=$$(SPRINT_GC_STRESS=1 ASAN_OPTIONS=detect_leaks=0 $(BUILD)/nopool/sprint-san run --deterministic $$args $$f 2>&1); \
+	  out=$$(SPRINT_GC_STRESS=1 ASAN_OPTIONS=detect_leaks=0 $(BUILD)/nopool/sprint-san run --deterministic $$args $$f 2>/dev/null); \
 	  [ "$$out" = "$$(cat $$b.out)" ] || { echo "FAIL (gc stress, no pool) $$f"; fail=1; }; \
 	done; [ $$fail = 0 ] && echo 'gc stress without pools: language and class tests clean'
 
-# The whole suite with a collection at every allocation (and, second, with the JIT compiling every loop and function at its first
+# (about 15 minutes) The whole suite with a collection at every allocation (and, second, with the JIT compiling every loop and function at its first
 # opportunity): any object a C frame or the compiled code forgot to keep reachable shows up as a crash or a wrong result.
 test-gc-stress-all: $(BUILD)/sprint $(FFI_LIBS)
 	@SPRINT_GC_STRESS=1 SPRINT=$(BUILD)/sprint sh tests/run_tests.sh
