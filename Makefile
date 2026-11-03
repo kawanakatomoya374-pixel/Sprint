@@ -27,7 +27,10 @@ OPT_WARN := $(foreach f,-Wstrict-flex-arrays -Warray-compare -Warith-conversion 
                         -Wmultistatement-macros -Wfree-nonheap-object -Wcast-align=strict -Wimplicit-fallthrough=5 \
                         -Wcast-function-type -Walloc-zero -Walloc-size -Wvla-larger-than=0 -Wmissing-noreturn -Wstringop-overread \
                         -Wenum-conversion -Wabsolute-value -Wmissing-format-attribute -Wdeprecated-non-prototype \
-                        -Wstack-usage=32768 -Wshadow=local -Wtrivial-auto-var-init,$(call cc-opt,$(f)))
+                        -Wstack-usage=20480 -Wshadow=local -Wtrivial-auto-var-init \
+                        -Warray-parameter=2 -Wvla-parameter -Wbidi-chars=any -Wnormalized=nfc -Wuse-after-free=3 \
+                        -Wdangling-pointer=2 -Wzero-length-bounds -Wsizeof-array-div -Wxor-used-as-pow \
+                        -Wsuggest-attribute=cold -Wsuggest-attribute=malloc,$(call cc-opt,$(f)))
 OPT_HARD := $(foreach f,-fstrict-flex-arrays=3 -ftrivial-auto-var-init=zero -fcf-protection=full -fwrapv-pointer -fstack-clash-protection -fno-plt,$(call cc-opt,$(f)))
 # without -ftrivial-auto-var-init (GCC 12+) older compilers report possible uninitialised reads in a few output-parameter
 # idioms (lib_gfx.c); the locals are initialised on every path that uses them, so that one warning stays a warning there
@@ -56,7 +59,7 @@ WARN     := $(WERROR) $(OPT_WARN) -Wall -Wextra \
             -Wtrigraphs -Wdangling-else \
             -Wsizeof-array-argument -Wsizeof-pointer-memaccess -Wpointer-compare \
             -Wint-in-bool-context -Wmisleading-indentation -Wparentheses \
-            -Wframe-larger-than=65536 -Wlarger-than=8388608 \
+            -Wframe-larger-than=20480 -Wlarger-than=8388608 \
             -Wsuggest-attribute=format -Wsuggest-attribute=noreturn \
             -Wno-error=unsafe-loop-optimizations \
             -Wno-unknown-warning-option
@@ -166,7 +169,7 @@ fuzz: $(BUILD)/sprint-san
 analyze: $(GEN)/bundled.c
 	@for f in $(ALLSRC); do \
 	  echo "analyze $$f"; \
-	  $(CC) $(STD) $(WARN) -O1 $(INC) -fanalyzer $(call cc-opt,-fstrict-flex-arrays=3) -Wno-analyzer-malloc-leak \
+	  $(CC) $(STD) $(WARN) -O1 $(INC) -fanalyzer $(call cc-opt,-fstrict-flex-arrays=3) \
 	    -fsyntax-only $$f || exit 1; \
 	done
 
