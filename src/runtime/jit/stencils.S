@@ -1691,6 +1691,25 @@ ST tr_fcmp_ne_guard
 ST tr_sar_imm                   # HB0 = REX.W(+B), HB1 = modrm (/7 + register), HB2 = shift count: sar reg, imm8
     .byte HB0, 0xc1, HB1, HB2
 
+# integer ALU op with a 32-bit immediate (add /0, sub /5, cmp /7): HB0 = REX.W(+B), HB1 = modrm, H0 = the immediate
+ST tr_alu_imm
+    .byte HB0, 0x81, HB1
+    .long H0
+
+# imul reg, reg, imm32: HB0 = REX.W(+R,+B), HB1 = modrm
+ST tr_imul_imm
+    .byte HB0, 0x69, HB1
+    .long H0
+
+# reg op= [r12 + H0] (the local slot of a loop-invariant value): HB0 = REX.W+B(+R), HB1 = opcode, HB2 = modrm (mod 10, rm 100)
+ST tr_alu_mem
+    .byte HB0, HB1, HB2, 0x24
+    .long H0
+
+ST tr_imul_mem
+    .byte HB0, 0x0f, 0xaf, HB2, 0x24
+    .long H0
+
 ST tr_div_guard                 # r10 = divisor; 0 and -1 leave through JIT_T (deopt): the interpreter raises the error / handles INT64_MIN / -1
     inc %r10
     cmp $1,%r10

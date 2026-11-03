@@ -102,6 +102,7 @@ typedef struct {
 } TracePatch;
 
 enum { TA_LOOP = 0, TA_EXIT, TA_DEOPT, TA_MISS, TA_BUDGET, TA_EPILOGUE };
+#define TA_MEMREG 0xFEU /* regs[] mark of a loop-invariant integer that stays in its slot (see ta_is_invariant_mem) */
 #define TA_NO_LABEL ((unsigned)-1)
 
 static TracePatch ta_patch(void) {
@@ -254,6 +255,7 @@ static int ta_emit_snapshot_stores(TraceAsm *a, const SpJitSnapshot *snapshot,
     for (uint16_t i = 0U; i < snapshot->map->entry_count; i++) {
         const SpJitSnapshotEntry *entry = &snapshot->map->entries[i];
         if (entry->source != (uint8_t)SP_JIT_SNAPSHOT_FROM_IR) continue;
+        if (entry->value != 0U && entry->value <= nvalues && regs[entry->value] == TA_MEMREG) continue;   /* never changed: already in its slot */
         if (entry->value == 0U || entry->value > nvalues ||
             entry->slot >= snapshot->map->slot_count || regs[entry->value] == UINT8_MAX ||
             !ta_local_store_reg(a, (uint32_t)entry->slot, regs[entry->value])) return 0;
@@ -416,6 +418,75 @@ static int ta_const_i64(const SpTraceIR *ir, SpTIRValue v, int64_t *out) {
         if (ir->inst[i].dst == v && ir->inst[i].op == SP_TIR_CONST_I64) { *out = (int64_t)ir->inst[i].imm; return 1; }
     return 0;
 }
+/* ALU op `reg op= imm32`: ext 0 add, 5 sub, 7 cmp */
+static int ta_alu_imm(TraceAsm *a, uint8_t reg, uint8_t ext, int32_t imm) {
+    TracePatch p = ta_patch();
+    p.b[0] = (uint8_t)(0x48U | (reg >= 8U ? 0x01U : 0U));
+    p.b[1] = (uint8_t)(0xc0U | ((unsigned)ext << 3) | (reg & 7U));
+    p.h[0] = imm;
+    return ta_stencil(a, ST_tr_alu_imm, &p);
+}
+static int ta_imul_imm(TraceAsm *a, uint8_t dst, uint8_t src, int32_t imm) {
+    TracePatch p = ta_patch();
+    p.b[0] = (uint8_t)(0x48U | (dst >= 8U ? 0x04U : 0U) | (src >= 8U ? 0x01U : 0U));
+    p.b[1] = (uint8_t)(0xc0U | ((dst & 7U) << 3) | (src & 7U));
+    p.h[0] = imm;
+    return ta_stencil(a, ST_tr_imul_imm, &p);
+}
+/* A constant used only as the right operand of + - * and integer comparisons (and small enough for an imm32) needs no register:
+ * the operation takes it as an immediate. This saves registers and an instruction per use. */
+static int ta_is_folded(const SpTraceIR *ir, SpTIRValue v) {
+    const SpTIRInst *def = NULL;
+    int uses = 0;
+    for (size_t i = 0U; i < ir->count; i++)
+        if (ir->inst[i].dst == v && ir->inst[i].op == SP_TIR_CONST_I64) { def = &ir->inst[i]; break; }
+    if (def == NULL || (int64_t)def->imm < INT32_MIN || (int64_t)def->imm > INT32_MAX) return 0;
+    for (size_t i = 0U; i < ir->count; i++) {
+        const SpTIRInst *in = &ir->inst[i];
+        const int arith = in->op == SP_TIR_IADD || in->op == SP_TIR_ISUB || in->op == SP_TIR_IMUL ||
+                          (in->op >= SP_TIR_ICMP_EQ && in->op <= SP_TIR_ICMP_GE);
+        if (in->op == SP_TIR_PHI) { if (in->b == v || in->a == v) return 0; continue; }
+        if (in->a == v) return 0;
+        if (in->b == v) { if (!arith) return 0; uses++; }
+    }
+    return uses > 0;
+}
+/* ---- loop-invariant integers kept in their slot ---------------------------------------------------------------------------
+ * A loop-carried integer that the loop never changes (a range bound, the step, `n`) and that is used only as the right operand of
+ * + - * and comparisons does not need a register: those operations take it as a memory operand [r12 + slot]. regs[] marks such
+ * a value with TA_MEMREG; its entry guard stays, but there is nothing to load, and exits have nothing to store (the slot never
+ * changed). */
+static int ta_is_invariant_mem(const SpTraceIR *ir, SpTIRValue phi_dst) {
+    const SpTIRInst *phi = NULL;
+    int uses = 0;
+    for (size_t i = 0U; i < ir->count; i++)
+        if (ir->inst[i].op == SP_TIR_PHI && ir->inst[i].dst == phi_dst) { phi = &ir->inst[i]; break; }
+    if (phi == NULL || phi->b != phi->dst || phi->type != SP_TIR_T_I64) return 0;
+    for (size_t i = 0U; i < ir->count; i++) {
+        const SpTIRInst *in = &ir->inst[i];
+        const int arith = in->op == SP_TIR_IADD || in->op == SP_TIR_ISUB || in->op == SP_TIR_IMUL ||
+                          (in->op >= SP_TIR_ICMP_EQ && in->op <= SP_TIR_ICMP_GE);
+        if (in->op == SP_TIR_PHI) { if (in != phi && (in->b == phi_dst || in->a == phi_dst)) return 0; continue; }
+        if (in->a == phi_dst) return 0;
+        if (in->b == phi_dst) { if (!arith) return 0; uses++; }
+    }
+    return uses > 0;
+}
+static int ta_alu_mem(TraceAsm *a, uint8_t reg, uint8_t opcode, uint32_t slot) {
+    TracePatch p = ta_patch();
+    p.h[0] = (int32_t)(slot * 16U + 8U);
+    p.b[0] = (uint8_t)(0x49U | (reg >= 8U ? 0x04U : 0U));
+    p.b[1] = opcode;
+    p.b[2] = (uint8_t)(0x84U | ((reg & 7U) << 3));
+    return ta_stencil(a, ST_tr_alu_mem, &p);
+}
+static int ta_imul_mem(TraceAsm *a, uint8_t reg, uint32_t slot) {
+    TracePatch p = ta_patch();
+    p.h[0] = (int32_t)(slot * 16U + 8U);
+    p.b[0] = (uint8_t)(0x49U | (reg >= 8U ? 0x04U : 0U));
+    p.b[2] = (uint8_t)(0x84U | ((reg & 7U) << 3));
+    return ta_stencil(a, ST_tr_imul_mem, &p);
+}
 static int ta_plain(TraceAsm *a, int sid) {
     TracePatch p = ta_patch();
     return ta_stencil(a, sid, &p);
@@ -529,7 +600,7 @@ static int ta_has_div(const SpTraceIR *ir) {
         if (ir->inst[i].op == SP_TIR_IDIV || ir->inst[i].op == SP_TIR_IMOD) return 1;
     return 0;
 }
-static const uint8_t TA_GPR_POOL_DIV[10] = {1U, 3U, 6U, 7U, 8U, 9U, 14U, 15U, 0U, 2U};
+static const uint8_t TA_GPR_POOL_DIV[11] = {1U, 3U, 6U, 7U, 8U, 9U, 14U, 15U, 5U, 0U, 2U};
 static int ta_uses_rax_rdx(const SpTraceIR *ir, const uint8_t *regs) {
     for (uint32_t v = 1U; v <= ir->nvalues; v++)
         if (regs[v] == 0U || regs[v] == 2U) return 1;
@@ -555,6 +626,13 @@ static int ta_alloc_regs(const SpTraceIR *ir, const int32_t *phi_local, uint8_t 
             int picked;
             if (in->dst == 0U || in->dst > ir->nvalues || in->a == 0U || in->a > ir->nvalues ||
                 phi_local[in->dst] < 0) goto done;
+            if (ta_is_invariant_mem(ir, in->dst)) {
+                regs[in->dst] = TA_MEMREG;
+                regs[in->a] = TA_MEMREG;
+                pinned[in->dst] = 1U;
+                pinned[in->a] = 1U;
+                continue;
+            }
             picked = jit_ra_alloc(&bank, (int32_t)in->dst);
             if (picked < 0) goto done;
             regs[in->dst] = (uint8_t)picked;
@@ -576,7 +654,7 @@ static int ta_alloc_regs(const SpTraceIR *ir, const int32_t *phi_local, uint8_t 
             for (size_t j = 0U; j < 2U; j++) {
                 SpTIRValue v = values[j];
                 int picked;
-                if (v == 0U || v > ir->nvalues || pinned[v]) continue;
+                if (v == 0U || v > ir->nvalues || pinned[v] || regs[v] == TA_MEMREG || ta_is_folded(ir, v)) continue;
                 picked = jit_ra_alloc(&bank, (int32_t)v);
                 if (picked < 0) goto done;
                 regs[v] = (uint8_t)picked;
@@ -612,6 +690,7 @@ static int ta_alloc_regs(const SpTraceIR *ir, const int32_t *phi_local, uint8_t 
             }
         }
         if (in->dst == 0U || in->op == SP_TIR_PARAM || in->op == SP_TIR_PHI) continue;
+        if (in->op == SP_TIR_CONST_I64 && ta_is_folded(ir, in->dst)) continue;
         if ((in->op == SP_TIR_ICMP_EQ || in->op == SP_TIR_ICMP_NE || in->op == SP_TIR_ICMP_LT ||
              in->op == SP_TIR_ICMP_LE || in->op == SP_TIR_ICMP_GT || in->op == SP_TIR_ICMP_GE ||
              in->op == SP_TIR_FCMP_EQ || in->op == SP_TIR_FCMP_NE || in->op == SP_TIR_FCMP_LT ||
@@ -662,6 +741,11 @@ static int ta_emit_trace_ir(const SpTraceIR *ir, const int32_t *phi_local,
         uint8_t rb = in->b > 0U && in->b <= ir->nvalues ? regs[in->b] : UINT8_MAX;
         switch (in->op) {
         case SP_TIR_PARAM:
+            if (dst == TA_MEMREG) {   /* loop-invariant: only the entry type guard */
+                if (in->imm >= snapshot_set->loop_map.slot_count ||
+                    !ta_local_type_guard(a, (uint32_t)in->imm, (uint8_t)T_INT)) goto done;
+                break;
+            }
             if (dst == UINT8_MAX || in->imm >= snapshot_set->loop_map.slot_count ||
                 !ta_local_type_guard(a, (uint32_t)in->imm,
                     in->type == SP_TIR_T_I64 ? (uint8_t)T_INT :
@@ -673,6 +757,7 @@ static int ta_emit_trace_ir(const SpTraceIR *ir, const int32_t *phi_local,
             /* The entry PARAM and loop-carried PHI share a pinned native register. */
             break;
         case SP_TIR_CONST_I64: case SP_TIR_CONST_F64:
+            if (in->op == SP_TIR_CONST_I64 && ta_is_folded(ir, in->dst)) break;   /* used as an immediate */
             if (dst == UINT8_MAX || !ta_reg_imm(a, dst, in->imm)) goto done;
             break;
         case SP_TIR_CONST_BOOL:
@@ -684,7 +769,22 @@ static int ta_emit_trace_ir(const SpTraceIR *ir, const int32_t *phi_local,
                         (in->imm & SP_TIR_GUARD_DEOPT) ? TA_DEOPT : TA_EXIT))) goto done;
             break;
         case SP_TIR_IADD: case SP_TIR_ISUB: case SP_TIR_IMUL:
-            if (dst == UINT8_MAX || ra == UINT8_MAX || rb == UINT8_MAX) goto done;
+            if (rb == UINT8_MAX && dst != UINT8_MAX && ra != UINT8_MAX && ta_is_folded(ir, in->b)) {
+                int64_t kb = 0;
+                if (!ta_const_i64(ir, in->b, &kb) || !ta_reg_mov(a, dst, ra)) goto done;
+                if (in->op == SP_TIR_IMUL ? !ta_imul_imm(a, dst, dst, (int32_t)kb)
+                                          : !ta_alu_imm(a, dst, in->op == SP_TIR_IADD ? 0U : 5U, (int32_t)kb)) goto done;
+                if (!ta_jcc(a, 0x80U, TA_DEOPT)) goto done;
+                break;
+            }
+            if (rb == TA_MEMREG && dst != UINT8_MAX && ra != UINT8_MAX && ra != TA_MEMREG && phi_local[in->b] >= 0) {
+                if (!ta_reg_mov(a, dst, ra)) goto done;
+                if (in->op == SP_TIR_IMUL ? !ta_imul_mem(a, dst, (uint32_t)phi_local[in->b])
+                                          : !ta_alu_mem(a, dst, in->op == SP_TIR_IADD ? 0x03U : 0x2bU, (uint32_t)phi_local[in->b])) goto done;
+                if (!ta_jcc(a, 0x80U, TA_DEOPT)) goto done;
+                break;
+            }
+            if (dst == UINT8_MAX || ra == UINT8_MAX || rb == UINT8_MAX || ra == TA_MEMREG || rb == TA_MEMREG) goto done;
             if (!ta_reg_mov(a, dst, ra)) goto done;
             if (in->op == SP_TIR_IADD) {
                 if (!ta_reg_binop(a, dst, rb, 0x01U)) goto done;
@@ -706,7 +806,12 @@ static int ta_emit_trace_ir(const SpTraceIR *ir, const int32_t *phi_local,
                  * on side exits or when the budget is exhausted. */
                 if (!ta_load_budget(a) || !ta_label(a, TA_LOOP)) goto done;
             }
-            if (ra == UINT8_MAX || rb == UINT8_MAX || cc == 0U || !ta_reg_cmp(a, ra, rb)) goto done;
+            if (rb == TA_MEMREG && ra != UINT8_MAX && ra != TA_MEMREG && cc != 0U && phi_local[in->b] >= 0) {
+                if (!ta_alu_mem(a, ra, 0x3bU, (uint32_t)phi_local[in->b])) goto done;
+            } else if (rb == UINT8_MAX && ra != UINT8_MAX && cc != 0U && ta_is_folded(ir, in->b)) {
+                int64_t kb = 0;
+                if (!ta_const_i64(ir, in->b, &kb) || !ta_alu_imm(a, ra, 7U, (int32_t)kb)) goto done;
+            } else if (ra == UINT8_MAX || rb == UINT8_MAX || ra == TA_MEMREG || rb == TA_MEMREG || cc == 0U || !ta_reg_cmp(a, ra, rb)) goto done;
             if (dst == UINT8_MAX) {
                 if (i + 1U >= ir->count || ir->inst[i + 1U].op != SP_TIR_GUARD_TRUE ||
                     ir->inst[i + 1U].a != in->dst) goto done;
@@ -1983,7 +2088,14 @@ int jit_trace_compile(VM *vm, Proto *p, uint32_t header, const TraceStep *steps,
         }
     }
     if (!ta_emit_trace_ir(&ir, phi_local, &tr->snapshot_set, slot,
-                          &tr->runtime, as, &frame_size)) { fail_reason = "native trace emission rejected IR"; goto done; }
+                          &tr->runtime, as, &frame_size)) {
+            fail_reason = "native trace emission rejected IR";
+            if (trace_debug_env()) {
+                unsigned phis = 0U;
+                for (size_t k = 0U; k < ir.count; k++) phis += ir.inst[k].op == SP_TIR_PHI;
+                (void)fprintf(stderr, "trace-jit: emission rejected: %zu instructions, %u values, %u loop-carried\n", ir.count, (unsigned)ir.nvalues, phis);
+            }
+            goto done; }
     (void)frame_size;
     if (as->len == 0U || as->len > sizeof as->bytes) { fail_reason = "invalid native trace size"; goto done; }
     mem = jit_code_publish(as->bytes, as->len, &map_size);

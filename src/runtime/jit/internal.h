@@ -27,7 +27,7 @@ typedef struct {
     int32_t owner[32];
 } JitRegBank;
 
-extern const uint8_t JIT_TRACE_GPR_POOL[10];
+extern const uint8_t JIT_TRACE_GPR_POOL[11];
 void jit_ra_init(JitRegBank *bank, const uint8_t *pool, size_t count);
 void jit_ra_reset(JitRegBank *bank);
 uint32_t jit_ra_mask(const JitRegBank *bank);

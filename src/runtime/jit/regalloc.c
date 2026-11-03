@@ -1,6 +1,7 @@
 #include "internal.h"
 
-const uint8_t JIT_TRACE_GPR_POOL[10] = {0U, 1U, 2U, 3U, 6U, 7U, 8U, 9U, 14U, 15U};
+/* rbp is not a frame pointer in trace code (the prologue saves it, the epilogue restores it, nothing addresses through it) */
+const uint8_t JIT_TRACE_GPR_POOL[11] = {0U, 1U, 2U, 3U, 6U, 7U, 8U, 9U, 14U, 15U, 5U};
 
 void jit_ra_init(JitRegBank *bank, const uint8_t *pool, size_t count) {
     bank->pool = pool;
