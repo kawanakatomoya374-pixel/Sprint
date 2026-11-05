@@ -53,6 +53,13 @@ def gen(rng, fl):
     fdecl = "    let x = 0.5\n    let y = 1.5\n" if fl else ""
     ret = "return [a, b, c, arr" + (", x, y" if fl else "") + "]"
     n = rng.choice([300, 2000, 6000])
+    if rng.random() < 0.3:   # the same loop over module-level variables
+        top = "let a = 1\nlet b = 2\nlet c = 3\nlet arr = [1, 2, 3, 4, 5, 6, 7, 8]\n%slet i = 0\n" % fdecl.replace("    ", "")
+        shown = "print(a, b, c, arr" + (", x, y" if fl else "") + ")\n"
+        if rng.random() < 0.5:
+            return top + "try:\n    while i < %d:\n%s        i += 1\ncatch e:\n    print(e.kind)\n%s" % (n, body, shown)
+        rng_expr = rng.choice(["range(%d)" % n, "range(0, %d, 2)" % n, "range(%d, 0, -1)" % n])
+        return top + "try:\n    for i in %s:\n%scatch e:\n    print(e.kind)\n%s" % (rng_expr, body, shown)
     pre = "func f(n):\n    let a = 1\n    let b = 2\n    let c = 3\n    let arr = [1, 2, 3, 4, 5, 6, 7, 8]\n%s" % fdecl
     if rng.random() < 0.5:   # a counted loop
         rng_expr = rng.choice(["range(n)", "range(n)", "range(0, n, 2)", "range(0, n, 3)", "range(n, 0, -1)", "range(n, 0, -2)"])

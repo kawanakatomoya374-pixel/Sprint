@@ -61,6 +61,9 @@ struct TraceRegion {
     uint64_t side_attempts[TRACE_SIDE_ATTEMPT_MAX];
     uint64_t deopts, deopt_iters; /* deopt exits taken, and loop iterations completed between them (demotion policy) */
     uint8_t dead;                 /* demoted: the loop is left to the region JIT */
+    uint8_t nmod;                 /* module variables the trace keeps in scratch slots (mod_slot0 + k) of the frame */
+    uint16_t mod_idx[8];          /* ... and their indices in vm->slots */
+    uint32_t mod_slot0;
     uint8_t slot;
     uint8_t is_side;
     uint8_t side_count;
@@ -805,7 +808,19 @@ done:
     return ok;
 }
 
-static int ta_emit_trace_ir(const SpTraceIR *ir, const int32_t *phi_local,
+/* A trace keeps module variables in scratch slots above the frame's operand stack; on every exit the registers holding them are
+ * stored there (the snapshot maps only describe the frame's own slots), and jit_trace_site copies them back to vm->slots. */
+static int ta_emit_module_stores(const SpTraceIR *ir, const int32_t *phi_local, const uint8_t *regs, uint32_t slot0, TraceAsm *a) {
+    for (size_t i = 0U; i < ir->count; i++) {
+        const SpTIRInst *in = &ir->inst[i];
+        if (in->op != SP_TIR_PHI || in->dst > ir->nvalues || phi_local[in->dst] < 0 || (uint32_t)phi_local[in->dst] < slot0) continue;
+        if (regs[in->dst] == TA_MEMREG) continue;
+        if (regs[in->dst] >= 16U || !ta_local_store_reg(a, (uint32_t)phi_local[in->dst], regs[in->dst])) return 0;
+    }
+    return 1;
+}
+
+static int ta_emit_trace_ir(const SpTraceIR *ir, const int32_t *phi_local, unsigned nmod,
                             const SpJitSnapshotSet *snapshot_set, uint8_t slot,
                             TraceRuntimeCells *runtime, TraceAsm *a, size_t *frame_size_out) {
     size_t frame_size = 16U;
@@ -828,11 +843,11 @@ static int ta_emit_trace_ir(const SpTraceIR *ir, const int32_t *phi_local,
         switch (in->op) {
         case SP_TIR_PARAM:
             if (dst == TA_MEMREG) {   /* loop-invariant: only the entry type guard */
-                if (in->imm >= snapshot_set->loop_map.slot_count ||
+                if (in->imm >= snapshot_set->loop_map.slot_count + nmod ||
                     !ta_local_type_guard(a, (uint32_t)in->imm, (uint8_t)T_INT)) goto done;
                 break;
             }
-            if (dst == UINT8_MAX || in->imm >= snapshot_set->loop_map.slot_count ||
+            if (dst == UINT8_MAX || in->imm >= snapshot_set->loop_map.slot_count + nmod ||
                 !ta_local_type_guard(a, (uint32_t)in->imm,
                     in->type == SP_TIR_T_I64 ? (uint8_t)T_INT :
                     in->type == SP_TIR_T_F64 ? (uint8_t)T_FLOAT :
@@ -1009,15 +1024,18 @@ static int ta_emit_trace_ir(const SpTraceIR *ir, const int32_t *phi_local,
     if (!a->label_set[TA_LOOP] || !ta_label(a, TA_EXIT)) goto done;
     if (!ta_emit_snapshot_stores(a, &snapshot_set->snapshots[SP_JIT_SNAPSHOT_EXIT], regs,
                                  ir->nvalues) ||
+        !ta_emit_module_stores(ir, phi_local, regs, snapshot_set->loop_map.slot_count, a) ||
         !ta_store_budget(a) || !ta_trace_exit(a, exit_token, runtime)) goto done;
     if (!ta_label(a, TA_DEOPT)) goto done;
     if (!ta_emit_snapshot_stores(a, &snapshot_set->snapshots[SP_JIT_SNAPSHOT_DEOPT], regs,
                                  ir->nvalues) ||
+        !ta_emit_module_stores(ir, phi_local, regs, snapshot_set->loop_map.slot_count, a) ||
         !ta_store_budget(a) || !ta_trace_touch(a, runtime) || !ta_return(a, deopt_token)) goto done;
     if (!ta_label(a, TA_MISS) || !ta_trace_touch(a, runtime) || !ta_return(a, miss_token) ||
         !ta_label(a, TA_BUDGET) ||
         !ta_emit_snapshot_stores(a, &snapshot_set->snapshots[SP_JIT_SNAPSHOT_BUDGET], regs,
                                  ir->nvalues) ||
+        !ta_emit_module_stores(ir, phi_local, regs, snapshot_set->loop_map.slot_count, a) ||
         !ta_store_budget(a) || !ta_trace_touch(a, runtime) || !ta_return(a, budget_token) ||
         !ta_emit_epilogue(a, frame_size) || !ta_resolve(a)) goto done;
     *frame_size_out = frame_size;
@@ -1810,9 +1828,10 @@ typedef struct {
     uint8_t op, taken;
 } PathOp;
 
-static int trace_build_ir_path(Proto *p, const SpValue *locals, uint32_t stack_depth, uint32_t header,
+static int trace_build_ir_path(Proto *p, const SpValue *locals, const SpValue *mslots, uint32_t stack_depth, uint32_t header,
                                const TraceStep *steps, unsigned count, SpTraceIR *ir,
-                               int32_t **phi_local_out, uint32_t *exit_pc_out, uint32_t *backedge_pc_out) {
+                               int32_t **phi_local_out, uint32_t *exit_pc_out, uint32_t *backedge_pc_out,
+                               unsigned *nmod_out, uint16_t *mod_idx_out) {
     const uint8_t *code = p->ocode ? p->ocode : p->code;
     PathOp path[256];
     unsigned np = 0U;
@@ -1823,6 +1842,12 @@ static int trace_build_ir_path(Proto *p, const SpValue *locals, uint32_t stack_d
     size_t stack_capacity;
     unsigned depth;
     int have_exit = 0, stored = 0, array_stored = 0, ok = 0;
+    /* Module variables: the trace keeps them in scratch slots just above the frame's operand stack (slot_count + k); jit_trace_site
+     * copies them in from vm->slots before the trace runs and back afterwards. LOAD_MODULE / STORE_MODULE become local accesses
+     * of those scratch slots. */
+    uint16_t mod_idx[8];
+    unsigned nmod = 0U, slot_total;
+#define SLOTV(I) ((I) < slot_count ? locals[(I)] : mslots[mod_idx[(I) - slot_count]])
     const SArray **vhint = NULL;   /* per SSA value: the array object it held when the trace was recorded (element types come from it) */
     const char *why = "path builder: unsupported";
 
@@ -1875,6 +1900,18 @@ static int trace_build_ir_path(Proto *p, const SpValue *locals, uint32_t stack_d
                 po->arg = (uint16_t)rd16(code + pc + 1U);
                 if (po->arg >= (unsigned)p->nlocals) goto done;
                 break;
+            case OP_LOAD_MODULE: case OP_STORE_MODULE: {
+                unsigned idx = rd16(code + pc + 1U), k;
+                if (mslots == NULL) goto done;
+                for (k = 0U; k < nmod && mod_idx[k] != idx; k++) {}
+                if (k == nmod) {
+                    if (nmod >= 8U) { why = "too many module variables"; goto done; }
+                    mod_idx[nmod++] = (uint16_t)idx;
+                }
+                po->op = op == OP_LOAD_MODULE ? (uint8_t)OP_LOAD_LOCAL : (uint8_t)OP_STORE_LOCAL;
+                po->arg = (uint16_t)(slot_count + k);
+                break;
+            }
             case OP_RANGE_NEXT: {   /* for i in range(...): state in locals arg, arg+1, arg+2 = cur, stop, step */
                 int32_t off = rd32s(code + pc + 3U);
                 int64_t t = (int64_t)pc + 7 + off;
@@ -1913,12 +1950,13 @@ walked:
 
     /* 2. which slots are loop-carried */
     stack_capacity = (size_t)stack_depth + (size_t)np + 4U;
-    used = (uint8_t *)calloc((size_t)slot_count, sizeof *used);
-    param = (SpTIRValue *)calloc((size_t)slot_count, sizeof *param);
-    phi = (SpTIRValue *)calloc((size_t)slot_count, sizeof *phi);
-    current = (SpTIRValue *)calloc((size_t)slot_count, sizeof *current);
+    slot_total = slot_count + nmod;
+    used = (uint8_t *)calloc((size_t)slot_total, sizeof *used);
+    param = (SpTIRValue *)calloc((size_t)slot_total, sizeof *param);
+    phi = (SpTIRValue *)calloc((size_t)slot_total, sizeof *phi);
+    current = (SpTIRValue *)calloc((size_t)slot_total, sizeof *current);
     stack = (SpTIRValue *)calloc(stack_capacity, sizeof *stack);
-    vhint = (const SArray **)calloc((size_t)slot_count * 2U + (size_t)np * 3U + 16U, sizeof *vhint);
+    vhint = (const SArray **)calloc((size_t)slot_total * 2U + (size_t)np * 3U + 16U, sizeof *vhint);
     if (!used || !param || !phi || !current || !stack || !vhint) goto done;
     for (uint32_t i = 0U; i < stack_depth; i++) {
         SpTIRType t;
@@ -1928,7 +1966,7 @@ walked:
     for (unsigned i = 0U; i < np; i++) {
         if (path[i].op == OP_LOAD_LOCAL || path[i].op == OP_STORE_LOCAL) {
             SpTIRType t;
-            if (!trace_value_type((SpType)locals[path[i].arg].type, &t)) goto done;
+            if (!trace_value_type((SpType)SLOTV(path[i].arg).type, &t)) goto done;
             used[path[i].arg] = 1U;
         }
         if (path[i].op == OP_RANGE_NEXT) {
@@ -1942,17 +1980,17 @@ walked:
 
     /* 3. parameters, phis, then the body in path order */
     sp_tir_init(ir);
-    for (uint32_t i = 0U; i < slot_count; i++) {
+    for (uint32_t i = 0U; i < slot_total; i++) {
         SpTIRType t;
         if (!used[i]) continue;
-        if (!trace_value_type((SpType)locals[i].type, &t) ||
-            !sp_tir_emit_param_ex(ir, t, i, t == SP_TIR_T_REF ? locals[i].type : 0U, &param[i])) goto done;
+        if (!trace_value_type((SpType)SLOTV(i).type, &t) ||
+            !sp_tir_emit_param_ex(ir, t, i, t == SP_TIR_T_REF ? SLOTV(i).type : 0U, &param[i])) goto done;
     }
-    for (uint32_t i = 0U; i < slot_count; i++) {
+    for (uint32_t i = 0U; i < slot_total; i++) {
         if (!used[i]) continue;
         if (!sp_tir_emit_phi(ir, ir->value_types[param[i]], param[i], &phi[i])) goto done;
         current[i] = phi[i];
-        if (locals[i].type == T_ARRAY) vhint[phi[i]] = AS_ARRAY(locals[i]);
+        if (SLOTV(i).type == T_ARRAY) vhint[phi[i]] = AS_ARRAY(SLOTV(i));
     }
     depth = stack_depth;
     for (uint32_t i = 0U; i < stack_depth; i++) stack[i] = phi[(uint32_t)p->nlocals + i];
@@ -1970,7 +2008,7 @@ walked:
             if (depth == 0U) goto done;
             current[po->arg] = stack[--depth];
             if (ir->value_types[current[po->arg]] != ir->value_types[phi[po->arg]] ||
-                trace_ir_runtime_type(ir, current[po->arg]) != locals[po->arg].type) { why = "a local changes type"; goto done; }
+                trace_ir_runtime_type(ir, current[po->arg]) != SLOTV(po->arg).type) { why = "a local changes type"; goto done; }
             stored = 1;
             break;
         case OP_SMALLINT:
@@ -2042,7 +2080,7 @@ walked:
             SpValue e0;
             if (depth < 2U) goto done;
             b = stack[--depth]; a = stack[--depth];
-            h = (a <= ir->nvalues + 0U && a < (uint32_t)slot_count * 2U + (uint32_t)np * 3U + 16U) ? vhint[a] : NULL;
+            h = (a <= ir->nvalues + 0U && a < (uint32_t)slot_total * 2U + (uint32_t)np * 3U + 16U) ? vhint[a] : NULL;
             if (ir->value_types[a] != SP_TIR_T_REF || trace_ir_runtime_type(ir, a) != (uint8_t)T_ARRAY ||
                 ir->value_types[b] != SP_TIR_T_I64 || h == NULL || h->len <= 0) { why = "array read: unknown array or index type"; goto done; }
             if (array_stored) { why = "array read after a write in the same iteration"; goto done; }
@@ -2059,7 +2097,7 @@ walked:
             }
             etag = (uint8_t)e0.type;
             if (!sp_tir_emit_aload(ir, ety, etag, a, b, &r)) goto done;
-            if (e0.type == T_ARRAY && r < (uint32_t)slot_count * 2U + (uint32_t)np * 3U + 16U) vhint[r] = AS_ARRAY(e0);
+            if (e0.type == T_ARRAY && r < (uint32_t)slot_total * 2U + (uint32_t)np * 3U + 16U) vhint[r] = AS_ARRAY(e0);
             stack[depth++] = r;
             break;
         }
@@ -2163,10 +2201,12 @@ walked:
         }
     }
 
-    for (uint32_t i = 0U; i < slot_count; i++)
+    for (uint32_t i = 0U; i < slot_total; i++)
         if (used[i] && !sp_tir_set_phi_backedge(ir, phi[i], current[i])) goto done;
-    if (!sp_tir_emit_loop(ir) || !trace_finish_ir(ir, slot_count, &phi_local)) goto done;
+    if (!sp_tir_emit_loop(ir) || !trace_finish_ir(ir, slot_total, &phi_local)) goto done;
     *phi_local_out = phi_local; phi_local = NULL;
+    *nmod_out = nmod;
+    for (unsigned k = 0U; k < nmod; k++) mod_idx_out[k] = mod_idx[k];
     *exit_pc_out = exit_pc;
     *backedge_pc_out = backedge;
     ok = 1;
@@ -2176,6 +2216,7 @@ done:
     free(used); free(param); free(phi); free(current); free(stack); free(phi_local); free(vhint);
     if (!ok) sp_tir_destroy(ir);
     return ok;
+#undef SLOTV
 }
 
 int jit_trace_compile(VM *vm, Proto *p, uint32_t header, const TraceStep *steps, unsigned count,
@@ -2186,6 +2227,8 @@ int jit_trace_compile(VM *vm, Proto *p, uint32_t header, const TraceStep *steps,
     SpTraceIR ir;
     int32_t *phi_local = NULL;
     uint32_t exit_pc = 0U, backedge_pc = 0U;
+    unsigned nmod = 0U;
+    uint16_t mod_idx[8] = {0};
     TraceAsm *as = NULL;
     size_t frame_size = 0U, map_size = 0U, cache_bytes = 0U;
     uint8_t slot = 0U;
@@ -2220,14 +2263,17 @@ int jit_trace_compile(VM *vm, Proto *p, uint32_t header, const TraceStep *steps,
                         &ir, &phi_local, &exit_pc, &backedge_pc)) {
         /* the narrow builder refused (it destroyed its IR): try the general path builder */
         sp_tir_init(&ir);
-        if (!trace_build_ir_path(p, trace_base, stack_depth, header, steps, count,
-                                 &ir, &phi_local, &exit_pc, &backedge_pc)) { fail_reason = "trace IR build rejected path"; goto done; }
+        if (!trace_build_ir_path(p, trace_base, is_side ? NULL : vm->slots, stack_depth, header, steps, count,
+                                 &ir, &phi_local, &exit_pc, &backedge_pc, &nmod, mod_idx)) { fail_reason = "trace IR build rejected path"; goto done; }
     }
     as = (TraceAsm *)calloc(1U, sizeof *as);
     tr = (TraceRegion *)calloc(1U, sizeof *tr);
     if (!as || !tr) { fail_reason = "out of memory allocating trace"; goto done; }
     tr->runtime.clock = &jp->trace_clock;
     tr->slot = slot;
+    tr->nmod = (uint8_t)nmod;
+    for (unsigned k = 0U; k < nmod; k++) tr->mod_idx[k] = mod_idx[k];
+    tr->mod_slot0 = (uint32_t)p->nlocals + stack_depth;
     tr->is_side = (uint8_t)(is_side != 0);
     tr->parent = parent;
     tr->depth = parent != NULL ? (uint8_t)(parent->depth + 1U) : 0U;
@@ -2246,7 +2292,7 @@ int jit_trace_compile(VM *vm, Proto *p, uint32_t header, const TraceStep *steps,
             fail_reason = "snapshot verification failed"; goto done;
         }
     }
-    if (!ta_emit_trace_ir(&ir, phi_local, &tr->snapshot_set, slot,
+    if (!ta_emit_trace_ir(&ir, phi_local, nmod, &tr->snapshot_set, slot,
                           &tr->runtime, as, &frame_size)) {
             fail_reason = "native trace emission rejected IR";
             if (trace_debug_env()) {
@@ -2374,7 +2420,14 @@ int jit_trace_site(VM *vm, Proto *p, const uint8_t *hdr, SpValue *base, SpValue 
     /* A linked exit is a native tail jump.  The final side exit returns here
      * with the exact bytecode PC and the VM budget already materialized. */
     const uint64_t budget_before = vm->ileft;
+    /* module variables travel through scratch slots above the operand stack: copied in here, written back right after the run */
+    if (first->nmod != 0U) {
+        if (base + first->mod_slot0 + first->nmod + 8U > vm->stack_end) return 0;
+        for (unsigned k = 0U; k < first->nmod; k++) base[first->mod_slot0 + k] = vm->slots[first->mod_idx[k]];
+    }
     result = first->entry(base, &vm->ileft);
+    if (first->nmod != 0U)
+        for (unsigned k = 0U; k < first->nmod; k++) vm->slots[first->mod_idx[k]] = base[first->mod_slot0 + k];
     if (result == UINT32_MAX ||
         !sp_jit_snapshot_decode_token(result, &snapshot_slot, &snapshot_kind)) return 0;
     TraceRegion *owner = jp->trace_slots[snapshot_slot];
@@ -2413,7 +2466,7 @@ int jit_trace_site(VM *vm, Proto *p, const uint8_t *hdr, SpValue *base, SpValue 
      * Its Copy-and-Patch exit stencil reads this cell on subsequent runs. */
     next = trace_find(jp, first->exit_pc);
     if (next == first || (next && (!next->entry || next->dead))) next = NULL;
-    TraceEntry link_target = next && next->side_count == 0U &&
+    TraceEntry link_target = next && next->side_count == 0U && first->nmod == 0U && next->nmod == 0U &&
         next->snapshot_set.loop_map.stack_depth == first->snapshot_set.loop_map.stack_depth &&
         next->snapshot_set.loop_map.local_count == first->snapshot_set.loop_map.local_count ?
         next->entry : (TraceEntry)NULL;
@@ -2432,7 +2485,7 @@ int jit_trace_site(VM *vm, Proto *p, const uint8_t *hdr, SpValue *base, SpValue 
     requested_signature = miss_parent != NULL ?
         trace_signature_hash(miss_parent, base, stack_depth) : 0U;
     if (snapshot_kind == SP_JIT_SNAPSHOT_MISS && miss_parent != NULL &&
-        miss_parent->side_count < TRACE_SIDE_MAX && miss_parent->depth < TRACE_SIDE_DEPTH_MAX &&
+        miss_parent->nmod == 0U && miss_parent->side_count < TRACE_SIDE_MAX && miss_parent->depth < TRACE_SIDE_DEPTH_MAX &&
         trace_side_total(trace_root_region(miss_parent)) < TRACE_SIDE_MAX &&
         side_parent_slot_out != NULL && requested_signature != 0U &&
         trace_side_attempt_add(miss_parent, requested_signature)) {

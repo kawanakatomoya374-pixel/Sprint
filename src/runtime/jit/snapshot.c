@@ -73,8 +73,8 @@ int sp_jit_snapshot_set_init(SpJitSnapshotSet *set, const SpTraceIR *ir,
     for (size_t i = 0U; i < ir->count; i++) {
         const SpTIRInst *inst = &ir->inst[i];
         if (inst->op != SP_TIR_PHI) continue;
-        if (inst->dst == 0U || inst->dst > ir->nvalues || phi_slot[inst->dst] < 0 ||
-            (uint32_t)phi_slot[inst->dst] >= slot_count) goto fail;
+        if (inst->dst == 0U || inst->dst > ir->nvalues || phi_slot[inst->dst] < 0) goto fail;
+        if ((uint32_t)phi_slot[inst->dst] >= slot_count) continue;   /* a module variable the native code keeps in a scratch slot */
         phi_count++;
     }
     /* Every unchanged local and operand-stack cell is part of the restore map.
@@ -100,6 +100,7 @@ int sp_jit_snapshot_set_init(SpJitSnapshotSet *set, const SpTraceIR *ir,
         uint8_t runtime_type;
         if (inst->op != SP_TIR_PHI) continue;
         slot = (uint32_t)phi_slot[inst->dst];
+        if (slot >= slot_count) continue;
         if (seen[slot] != 0U || inst->a == 0U ||
             (param = snapshot_find_def(ir, inst->a)) == NULL || param->op != SP_TIR_PARAM) goto fail;
         if (inst->type == SP_TIR_T_REF) {
