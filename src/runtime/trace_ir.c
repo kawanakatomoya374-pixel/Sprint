@@ -298,7 +298,7 @@ int sp_tir_emit_unary(SpTraceIR *ir, SpTIROp op, SpTIRValue a, SpTIRValue *out) 
 
 int sp_tir_emit_guard(SpTraceIR *ir, SpTIRValue condition, uint32_t side_exit, unsigned flags) {
     SpTIRType type;
-    if (side_exit == SP_TIR_NO_EXIT || flags > (SP_TIR_GUARD_DEOPT | SP_TIR_GUARD_INVERT) ||
+    if (side_exit == SP_TIR_NO_EXIT || flags > (SP_TIR_GUARD_DEOPT | SP_TIR_GUARD_INVERT | SP_TIR_GUARD_ENTRY) ||
         !tir_value_type(ir, condition, &type) || type != SP_TIR_T_BOOL) {
         return 0;
     }
@@ -536,7 +536,7 @@ int sp_tir_verify(const SpTraceIR *ir, char *message, size_t message_size) {
             if (expected != SP_TIR_T_BOOL ||
                 !tir_value_defined_before(defs, in->a, i, (size_t)ir->nvalues) ||
                 types[in->a] != SP_TIR_T_BOOL || in->aux == SP_TIR_NO_EXIT ||
-                in->imm > (uint64_t)(SP_TIR_GUARD_DEOPT | SP_TIR_GUARD_INVERT)) {
+                in->imm > (uint64_t)(SP_TIR_GUARD_DEOPT | SP_TIR_GUARD_INVERT | SP_TIR_GUARD_ENTRY)) {
                 tir_error(message, message_size, "invalid guard condition or side-exit id");
                 goto done;
             }
@@ -982,7 +982,7 @@ int sp_tir_dump(const SpTraceIR *ir, FILE *out) {
             break;
         case SP_TIR_GUARD_TRUE:
             if (fprintf(out, " v%" PRIu32 " exit=%" PRIu32 "%s%s", in->a, in->aux,
-                        (in->imm & SP_TIR_GUARD_DEOPT) ? " deopt" : "", (in->imm & SP_TIR_GUARD_INVERT) ? " invert" : "") < 0) return 0;
+                        (in->imm & SP_TIR_GUARD_DEOPT) ? " deopt" : "", (in->imm & SP_TIR_GUARD_INVERT) ? " invert" : (in->imm & SP_TIR_GUARD_ENTRY) ? " entry" : "") < 0) return 0;
             break;
         case SP_TIR_LOOP:
             break;

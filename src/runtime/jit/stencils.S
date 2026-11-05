@@ -1734,6 +1734,12 @@ ST tr_ab_store_tag              # movq $H0, (%r10)
 ST tr_ab_store_val              # payload = src
     .byte HB0, 0x89, HB1, 0x08
 
+# cmpq $H1, [r12 + H0]: the slot of a loop-invariant integer against an immediate (the entry guard of a range step)
+ST tr_cmp_mem_imm
+    .byte 0x49, 0x81, 0xbc, 0x24
+    .long H0
+    .long H1
+
 ST tr_div_guard                 # r10 = divisor; 0 and -1 leave through JIT_T (deopt): the interpreter raises the error / handles INT64_MIN / -1
     inc %r10
     cmp $1,%r10

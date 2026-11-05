@@ -57,7 +57,8 @@ int sp_tir_emit_binary(SpTraceIR *ir, SpTIROp op, SpTIRValue a, SpTIRValue b, Sp
 int sp_tir_emit_unary(SpTraceIR *ir, SpTIROp op, SpTIRValue a, SpTIRValue *out);
 /* flags of a guard (stored in the instruction's imm): where a failed guard leaves, and which truth value it demands */
 enum { SP_TIR_GUARD_DEOPT = 1U,   /* leave through the deopt exit: restore the iteration-start state and re-run the iteration in the interpreter (default: the loop exit) */
-       SP_TIR_GUARD_INVERT = 2U   /* the guard holds when the condition is FALSE (integer comparisons only in the native backend) */ };
+       SP_TIR_GUARD_INVERT = 2U,  /* the guard holds when the condition is FALSE (integer comparisons only in the native backend) */
+       SP_TIR_GUARD_ENTRY = 4U    /* the condition is loop-invariant: the native code checks it once, on entry to the trace, before the loop label */ };
 int sp_tir_emit_guard_true(SpTraceIR *ir, SpTIRValue condition, uint32_t side_exit);
 int sp_tir_emit_guard(SpTraceIR *ir, SpTIRValue condition, uint32_t side_exit, unsigned flags);
 int sp_tir_emit_aload(SpTraceIR *ir, SpTIRType elem_type, uint8_t elem_tag, SpTIRValue array, SpTIRValue index, SpTIRValue *out);

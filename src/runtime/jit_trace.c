@@ -456,6 +456,7 @@ static int ta_is_folded(const SpTraceIR *ir, SpTIRValue v) {
  * + - * and comparisons does not need a register: those operations take it as a memory operand [r12 + slot]. regs[] marks such
  * a value with TA_MEMREG; its entry guard stays, but there is nothing to load, and exits have nothing to store (the slot never
  * changed). */
+static int ta_is_entry_cmp(const SpTraceIR *ir, size_t i);
 static int ta_is_invariant_mem(const SpTraceIR *ir, SpTIRValue phi_dst) {
     const SpTIRInst *phi = NULL;
     int uses = 0;
@@ -467,6 +468,8 @@ static int ta_is_invariant_mem(const SpTraceIR *ir, SpTIRValue phi_dst) {
         const int arith = in->op == SP_TIR_IADD || in->op == SP_TIR_ISUB || in->op == SP_TIR_IMUL ||
                           (in->op >= SP_TIR_ICMP_EQ && in->op <= SP_TIR_ICMP_GE);
         if (in->op == SP_TIR_PHI) { if (in != phi && (in->b == phi_dst || in->a == phi_dst)) return 0; continue; }
+        if (in->a == phi_dst && in->op >= SP_TIR_ICMP_EQ && in->op <= SP_TIR_ICMP_GE && ta_is_entry_cmp(ir, (size_t)(in - ir->inst)) &&
+            ta_is_folded(ir, in->b)) { uses++; continue; }   /* the entry guard reads the slot directly */
         if (in->a == phi_dst || (in->op == SP_TIR_ASTORE && in->aux == phi_dst)) return 0;
         if (in->b == phi_dst) { if (!arith) return 0; uses++; }
     }
@@ -546,6 +549,17 @@ static int ta_emit_pending_stores(const SpTraceIR *ir, const uint8_t *regs, cons
             !ta_ab_store(a, tag, regs[st->aux])) return 0;
     }
     return 1;
+}
+/* does instruction i, a comparison, feed an entry guard (a loop-invariant test performed once, before the loop label)? */
+static int ta_is_entry_cmp(const SpTraceIR *ir, size_t i) {
+    return i + 1U < ir->count && ir->inst[i + 1U].op == SP_TIR_GUARD_TRUE && ir->inst[i + 1U].a == ir->inst[i].dst &&
+           (ir->inst[i + 1U].imm & SP_TIR_GUARD_ENTRY) != 0U;
+}
+static int ta_cmp_mem_imm(TraceAsm *a, uint32_t slot, int32_t imm) {
+    TracePatch p = ta_patch();
+    p.h[0] = (int32_t)(slot * 16U + 8U);
+    p.h[1] = imm;
+    return ta_stencil(a, ST_tr_cmp_mem_imm, &p);
 }
 static int ta_plain(TraceAsm *a, int sid) {
     TracePatch p = ta_patch();
@@ -711,6 +725,7 @@ static int ta_alloc_regs(const SpTraceIR *ir, const int32_t *phi_local, uint8_t 
             in->op == SP_TIR_FCMP_EQ || in->op == SP_TIR_FCMP_NE || in->op == SP_TIR_FCMP_LT ||
             in->op == SP_TIR_FCMP_LE || in->op == SP_TIR_FCMP_GT || in->op == SP_TIR_FCMP_GE) {
             SpTIRValue values[2] = {in->a, in->b};
+            if (ta_is_entry_cmp(ir, i)) continue;   /* not the loop's test: its operands need no register for the whole loop */
             for (size_t j = 0U; j < 2U; j++) {
                 SpTIRValue v = values[j];
                 int picked;
@@ -871,13 +886,17 @@ static int ta_emit_trace_ir(const SpTraceIR *ir, const int32_t *phi_local,
         case SP_TIR_ICMP_EQ: case SP_TIR_ICMP_NE: case SP_TIR_ICMP_LT:
         case SP_TIR_ICMP_LE: case SP_TIR_ICMP_GT: case SP_TIR_ICMP_GE: {
             uint8_t cc = ta_cmp_false_cc(in->op);
-            if (!a->label_set[TA_LOOP]) {
+            const int entry = ta_is_entry_cmp(ir, i);
+            if (!entry && !a->label_set[TA_LOOP]) {
                 /* Keep the VM's loop budget in a caller-saved register. The
                  * trace has no calls or GC points, so it is written back only
                  * on side exits or when the budget is exhausted. */
                 if (!ta_load_budget(a) || !ta_label(a, TA_LOOP)) goto done;
             }
-            if (rb == TA_MEMREG && ra != UINT8_MAX && ra != TA_MEMREG && cc != 0U && phi_local[in->b] >= 0) {
+            if (ra == TA_MEMREG && entry && cc != 0U && phi_local[in->a] >= 0 && ta_is_folded(ir, in->b)) {
+                int64_t kb = 0;
+                if (!ta_const_i64(ir, in->b, &kb) || !ta_cmp_mem_imm(a, (uint32_t)phi_local[in->a], (int32_t)kb)) goto done;
+            } else if (rb == TA_MEMREG && ra != UINT8_MAX && ra != TA_MEMREG && cc != 0U && phi_local[in->b] >= 0) {
                 if (!ta_alu_mem(a, ra, 0x3bU, (uint32_t)phi_local[in->b])) goto done;
             } else if (rb == UINT8_MAX && ra != UINT8_MAX && cc != 0U && ta_is_folded(ir, in->b)) {
                 int64_t kb = 0;
@@ -2063,6 +2082,10 @@ walked:
             /* continue while cur < stop (step > 0) or cur > stop (step < 0); the sign of the step is a property of this trace,
              * so the step itself is checked below. The test leaves the loop, hence the loop exit when it is the iteration's
              * first guard */
+            /* the step is a property of this trace: checked once on entry (the guard is loop-invariant), after which the counter
+             * advances by a constant */
+            if (!sp_tir_emit_const_i64(ir, stepv, &kstep) || !sp_tir_emit_binary(ir, SP_TIR_ICMP_EQ, step, kstep, &eq) ||
+                !sp_tir_emit_guard(ir, eq, i + 1U, SP_TIR_GUARD_DEOPT | SP_TIR_GUARD_ENTRY)) goto done;
             if (!sp_tir_emit_binary(ir, stepv > 0 ? SP_TIR_ICMP_LT : SP_TIR_ICMP_GT, cur, stop, &cond)) goto done;
             if (!have_exit && !stored && !array_stored && depth == stack_depth && po->target > backedge) {
                 flags = 0U;
@@ -2070,10 +2093,8 @@ walked:
                 have_exit = 1;
             }
             if (!sp_tir_emit_guard(ir, cond, i + 1U, flags)) goto done;
-            if (!sp_tir_emit_const_i64(ir, stepv, &kstep) || !sp_tir_emit_binary(ir, SP_TIR_ICMP_EQ, step, kstep, &eq) ||
-                !sp_tir_emit_guard(ir, eq, i + 1U, SP_TIR_GUARD_DEOPT)) goto done;
             stack[depth++] = cur;
-            if (!sp_tir_emit_binary(ir, SP_TIR_IADD, cur, step, &nx)) goto done;   /* an overflow deoptimises: the interpreter ends the loop */
+            if (!sp_tir_emit_binary(ir, SP_TIR_IADD, cur, kstep, &nx)) goto done;   /* an overflow deoptimises: the interpreter ends the loop */
             current[po->arg] = nx;
             stored = 1;
             break;
@@ -2115,13 +2136,22 @@ walked:
         for (size_t i = 0U; i < ir->count; i++) {
             const SpTIROp o = ir->inst[i].op;
             if (o == SP_TIR_PHI) last_phi = i;
-            if (first_cmp == ir->count && o >= SP_TIR_ICMP_EQ && o <= SP_TIR_FCMP_GE) first_cmp = i;
+            if (first_cmp == ir->count && o >= SP_TIR_ICMP_EQ && o <= SP_TIR_FCMP_GE && !ta_is_entry_cmp(ir, i)) first_cmp = i;
         }
         if (first_cmp == ir->count) { why = "no comparison"; goto done; }
         for (size_t i = last_phi + 1U; i < first_cmp; i++) {
             const SpTIRInst *in = &ir->inst[i];
-            if ((in->op != SP_TIR_CONST_I64 && in->op != SP_TIR_CONST_F64) ||
-                (in->dst != ir->inst[first_cmp].a && in->dst != ir->inst[first_cmp].b)) { why = "work before the first comparison"; goto done; }
+            int entry_part = (in->op >= SP_TIR_ICMP_EQ && in->op <= SP_TIR_ICMP_GE && ta_is_entry_cmp(ir, i)) ||
+                             (in->op == SP_TIR_GUARD_TRUE && (in->imm & SP_TIR_GUARD_ENTRY) != 0U);
+            if (!entry_part && ((in->op != SP_TIR_CONST_I64 && in->op != SP_TIR_CONST_F64) ||
+                                (in->dst != ir->inst[first_cmp].a && in->dst != ir->inst[first_cmp].b) ) ) {
+                /* a constant belonging to an entry guard is fine as well */
+                int used_by_entry = 0;
+                for (size_t k = last_phi + 1U; k < first_cmp; k++)
+                    if (ir->inst[k].op >= SP_TIR_ICMP_EQ && ir->inst[k].op <= SP_TIR_ICMP_GE && ta_is_entry_cmp(ir, k) &&
+                        (ir->inst[k].b == in->dst || ir->inst[k].a == in->dst)) used_by_entry = 1;
+                if (!used_by_entry || (in->op != SP_TIR_CONST_I64 && in->op != SP_TIR_CONST_F64)) { why = "work before the first comparison"; goto done; }
+            }
         }
         for (int side = 0; side < 2; side++) {
             SpTIRValue v = side ? ir->inst[first_cmp].b : ir->inst[first_cmp].a;
