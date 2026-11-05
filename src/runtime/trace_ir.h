@@ -20,7 +20,10 @@ typedef enum {
     SP_TIR_FDIV, SP_TIR_FNEG, SP_TIR_ICMP_EQ, SP_TIR_ICMP_NE,
     SP_TIR_ICMP_LT, SP_TIR_ICMP_LE, SP_TIR_ICMP_GT, SP_TIR_ICMP_GE,
     SP_TIR_FCMP_EQ, SP_TIR_FCMP_NE, SP_TIR_FCMP_LT, SP_TIR_FCMP_LE,
-    SP_TIR_FCMP_GT, SP_TIR_FCMP_GE, SP_TIR_GUARD_TRUE, SP_TIR_LOOP,
+    SP_TIR_FCMP_GT, SP_TIR_FCMP_GE, SP_TIR_GUARD_TRUE,
+    SP_TIR_ALOAD,   /* dst = a[b]: a is an array reference, b an index; imm = the element tag the trace was recorded with; a failed bound or tag check deoptimises */
+    SP_TIR_ASTORE,  /* a[b] = value aux (no result); the backend performs it after the iteration's last deopt point */
+    SP_TIR_LOOP,
     SP_TIR_RETURN
 } SpTIROp;
 
@@ -57,6 +60,8 @@ enum { SP_TIR_GUARD_DEOPT = 1U,   /* leave through the deopt exit: restore the i
        SP_TIR_GUARD_INVERT = 2U   /* the guard holds when the condition is FALSE (integer comparisons only in the native backend) */ };
 int sp_tir_emit_guard_true(SpTraceIR *ir, SpTIRValue condition, uint32_t side_exit);
 int sp_tir_emit_guard(SpTraceIR *ir, SpTIRValue condition, uint32_t side_exit, unsigned flags);
+int sp_tir_emit_aload(SpTraceIR *ir, SpTIRType elem_type, uint8_t elem_tag, SpTIRValue array, SpTIRValue index, SpTIRValue *out);
+int sp_tir_emit_astore(SpTraceIR *ir, SpTIRValue array, SpTIRValue index, SpTIRValue value);
 int sp_tir_emit_loop(SpTraceIR *ir);
 int sp_tir_emit_return(SpTraceIR *ir, SpTIRValue value);
 int sp_tir_verify(const SpTraceIR *ir, char *message, size_t message_size);

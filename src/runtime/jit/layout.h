@@ -21,6 +21,8 @@
 #define L_SFUNC_PROTO 16
 #define L_SFUNC_UP 40
 #define L_SFUNC_NAT 24
+#define L_SARRAY_LEN 16
+#define L_SARRAY_ITEMS 32
 #define L_SSTR_LEN 16
 #define L_SSTR_DATA 24
 #define L_CELL_V 16

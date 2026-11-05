@@ -1710,6 +1710,30 @@ ST tr_imul_mem
     .byte HB0, 0x0f, 0xaf, HB2, 0x24
     .long H0
 
+# ---- array element access in traces (ALOAD / ASTORE). ra = array object, rb = index. The sequence is: bounds, address, tag, access.
+ST tr_ab_bounds                 # cmp rb, [ra + len]: HB0 = REX.W(+R rb)(+B ra), HB1 = modrm (mod 10, reg rb, rm ra); unsigned, so a negative index fails too
+    .byte HB0, 0x3b, HB1
+    .long L_SARRAY_LEN
+
+ST tr_ab_addr                   # r10 = &items[rb]
+    .byte HB0, 0x89, HB1        # mov r10, rb
+    .byte 0x49, 0xc1, 0xe2, 0x04
+    .byte HB2, 0x03, HB3        # add r10, [ra + items]
+    .long L_SARRAY_ITEMS
+
+ST tr_ab_tag                    # cmpq $HB0, (%r10): the element tag
+    .byte 0x49, 0x83, 0x3a, HB0
+
+ST tr_ab_load                   # dst = payload: HB0 = REX.W+B(+R dst), HB1 = modrm (mod 01, reg dst, rm r10)
+    .byte HB0, 0x8b, HB1, 0x08
+
+ST tr_ab_store_tag              # movq $H0, (%r10)
+    .byte 0x49, 0xc7, 0x02
+    .long H0
+
+ST tr_ab_store_val              # payload = src
+    .byte HB0, 0x89, HB1, 0x08
+
 ST tr_div_guard                 # r10 = divisor; 0 and -1 leave through JIT_T (deopt): the interpreter raises the error / handles INT64_MIN / -1
     inc %r10
     cmp $1,%r10

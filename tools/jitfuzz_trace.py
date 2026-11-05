@@ -12,6 +12,8 @@ def gen(rng, fl):
         r = rng.random()
         if d > 2 or r < 0.35:
             return rng.choice(ints + ["i", str(rng.choice([0, 1, 2, 3, 7, 8, 16, 100, -1, -3, 641, 1000003]))])
+        if r < 0.45:   # an array read; the index is reduced to the array's length, except now and then (an IndexError)
+            return "arr[%s]" % (("(%s) %% 8" % iexpr(d + 1)) if rng.random() < 0.95 else iexpr(d + 1))
         op = rng.choice(["+", "-", "*", "//", "%", "+", "-"])
         if op in ("//", "%"):
             if rng.random() < 0.75:
@@ -40,16 +42,18 @@ def gen(rng, fl):
             if rng.random() < 0.6:
                 s += "%selse:\n%s" % (pad, block(ind + 4, depth + 1))
             return s
-        if flts and r < 0.5:
+        if r < 0.45:
+            return "%sarr[(%s) %% 8] = %s\n" % (pad, iexpr(1), iexpr())
+        if flts and r < 0.6:
             return "%s%s = %s\n" % (pad, rng.choice(flts), fexpr())
         return "%s%s = %s\n" % (pad, rng.choice(ints), iexpr())
     def block(ind, depth):
         return "".join(stmt(ind, depth) for _ in range(rng.randint(1, 3)))
     body = "".join(stmt(8, 0) for _ in range(rng.randint(2, 5)))
     fdecl = "    let x = 0.5\n    let y = 1.5\n" if fl else ""
-    ret = "return [a, b, c" + (", x, y" if fl else "") + "]"
+    ret = "return [a, b, c, arr" + (", x, y" if fl else "") + "]"
     n = rng.choice([300, 2000, 6000])
-    pre = "func f(n):\n    let a = 1\n    let b = 2\n    let c = 3\n%s" % fdecl
+    pre = "func f(n):\n    let a = 1\n    let b = 2\n    let c = 3\n    let arr = [1, 2, 3, 4, 5, 6, 7, 8]\n%s" % fdecl
     if rng.random() < 0.5:   # a counted loop
         rng_expr = rng.choice(["range(n)", "range(n)", "range(0, n, 2)", "range(0, n, 3)", "range(n, 0, -1)", "range(n, 0, -2)"])
         return (pre + "    for i in %s:\n%s    %s\ntry:\n    print(f(%d))\ncatch e:\n    print(e.kind)\n") % (rng_expr, body, ret, n)
