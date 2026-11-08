@@ -552,6 +552,27 @@ static int ta_field_store(TraceAsm *a, uint8_t src, uint8_t ra, uint32_t slot, u
     q.b[0] = ta_rex(src, ra); q.b[1] = (uint8_t)(0x80U | ((src & 7U) << 3) | (ra & 7U));
     return ta_stencil(a, ST_tr_mem_store_tag, &p) && ta_stencil(a, ST_tr_mem_store_val, &q);
 }
+/* allocation for traces: no collection here (registers hold unrooted references); the back edge checks vm->bytes and leaves the
+ * trace, and jit_trace_site collects once the frame is consistent again */
+static void *trace_new_inst(VM *vm, SClass *k) {
+    SInstance *ci = vm_new_instance(vm, k);
+    if (k->dflt)
+        for (int i = 0; i < ci->nslots; i++) ci->slots[i] = k->dflt[i];
+    return ci;
+}
+static int ta_new_inst(TraceAsm *a, uint8_t dst, uint64_t cls) {
+    TracePatch p = ta_patch();
+    p.h[0] = (int32_t)(-(ptrdiff_t)offsetof(VM, ileft));
+    p.q = cls;
+    return ta_reg_imm(a, 10U, (uint64_t)(uintptr_t)&trace_new_inst) && ta_stencil(a, ST_tr_new_inst, &p) &&
+           ta_jcc(a, 0x84U, TA_DEOPT) && ta_reg_mov(a, dst, 10U);
+}
+static int ta_gc_check(TraceAsm *a) {
+    TracePatch p = ta_patch();
+    p.h[0] = (int32_t)((ptrdiff_t)offsetof(VM, bytes) - (ptrdiff_t)offsetof(VM, ileft));
+    p.h[1] = (int32_t)((ptrdiff_t)offsetof(VM, gc_next) - (ptrdiff_t)offsetof(VM, ileft));
+    return ta_stencil(a, ST_tr_gc_check, &p) && ta_jcc(a, 0x83U, TA_BUDGET);
+}
 /* dst = [ra + off] (a raw 64-bit load) */
 static int ta_mem_load(TraceAsm *a, uint8_t dst, uint8_t ra, uint32_t off) {
     TracePatch p = ta_patch();
@@ -642,7 +663,7 @@ static int ta_f64_guard_false(TraceAsm *a, SpTIROp op, unsigned target) {
     case SP_TIR_FSUB: case SP_TIR_FMUL: case SP_TIR_FDIV:
     case SP_TIR_FNEG: case SP_TIR_ICMP_EQ: case SP_TIR_ICMP_NE:
     case SP_TIR_ICMP_LT: case SP_TIR_ICMP_LE: case SP_TIR_ICMP_GT:
-    case SP_TIR_ICMP_GE: case SP_TIR_GUARD_TRUE: case SP_TIR_ALOAD: case SP_TIR_ASTORE: case SP_TIR_FLOAD: case SP_TIR_UCELL: case SP_TIR_FSTORE: case SP_TIR_CGUARD: case SP_TIR_LOOP:
+    case SP_TIR_ICMP_GE: case SP_TIR_GUARD_TRUE: case SP_TIR_ALOAD: case SP_TIR_ASTORE: case SP_TIR_FLOAD: case SP_TIR_UCELL: case SP_TIR_NEWINST: case SP_TIR_FSTORE: case SP_TIR_CGUARD: case SP_TIR_LOOP:
     case SP_TIR_RETURN:
         return 0;
     default:
@@ -696,7 +717,7 @@ static uint8_t ta_cmp_cc(SpTIROp op) {
     case SP_TIR_IMOD: case SP_TIR_INEG: case SP_TIR_FADD: case SP_TIR_FSUB: case SP_TIR_FMUL:
     case SP_TIR_FDIV: case SP_TIR_FNEG: case SP_TIR_FCMP_EQ: case SP_TIR_FCMP_NE:
     case SP_TIR_FCMP_LT: case SP_TIR_FCMP_LE: case SP_TIR_FCMP_GT: case SP_TIR_FCMP_GE:
-    case SP_TIR_GUARD_TRUE: case SP_TIR_ALOAD: case SP_TIR_ASTORE: case SP_TIR_FLOAD: case SP_TIR_UCELL: case SP_TIR_FSTORE: case SP_TIR_CGUARD: case SP_TIR_LOOP: case SP_TIR_RETURN: return 0U;
+    case SP_TIR_GUARD_TRUE: case SP_TIR_ALOAD: case SP_TIR_ASTORE: case SP_TIR_FLOAD: case SP_TIR_UCELL: case SP_TIR_NEWINST: case SP_TIR_FSTORE: case SP_TIR_CGUARD: case SP_TIR_LOOP: case SP_TIR_RETURN: return 0U;
     default: return 0U;
     }
 }
@@ -713,12 +734,24 @@ static uint8_t ta_cmp_false_cc(SpTIROp op) {
     case SP_TIR_IMOD: case SP_TIR_INEG: case SP_TIR_FADD: case SP_TIR_FSUB: case SP_TIR_FMUL:
     case SP_TIR_FDIV: case SP_TIR_FNEG: case SP_TIR_FCMP_EQ: case SP_TIR_FCMP_NE:
     case SP_TIR_FCMP_LT: case SP_TIR_FCMP_LE: case SP_TIR_FCMP_GT: case SP_TIR_FCMP_GE:
-    case SP_TIR_GUARD_TRUE: case SP_TIR_ALOAD: case SP_TIR_ASTORE: case SP_TIR_FLOAD: case SP_TIR_UCELL: case SP_TIR_FSTORE: case SP_TIR_CGUARD: case SP_TIR_LOOP: case SP_TIR_RETURN: return 0U;
+    case SP_TIR_GUARD_TRUE: case SP_TIR_ALOAD: case SP_TIR_ASTORE: case SP_TIR_FLOAD: case SP_TIR_UCELL: case SP_TIR_NEWINST: case SP_TIR_FSTORE: case SP_TIR_CGUARD: case SP_TIR_LOOP: case SP_TIR_RETURN: return 0U;
     default: return 0U;
     }
 }
 /* idiv works in rax and rdx. A trace that divides allocates them last (the pool order), and saves them around a division only if
  * some value was in fact assigned to one of them */
+/* a write into an instance this very trace allocated needs no deferral: a deopt discards the instance with the iteration */
+static int ta_store_to_fresh(const SpTraceIR *ir, const SpTIRInst *st) {
+    if (st->op != SP_TIR_FSTORE) return 0;
+    for (size_t i = 0U; i < ir->count; i++)
+        if (ir->inst[i].dst == st->a) return ir->inst[i].op == SP_TIR_NEWINST;
+    return 0;
+}
+static int ta_has_alloc(const SpTraceIR *ir) {
+    for (size_t i = 0U; i < ir->count; i++)
+        if (ir->inst[i].op == SP_TIR_NEWINST) return 1;
+    return 0;
+}
 static int ta_has_div(const SpTraceIR *ir) {
     for (size_t i = 0U; i < ir->count; i++)
         if (ir->inst[i].op == SP_TIR_IDIV || ir->inst[i].op == SP_TIR_IMOD) return 1;
@@ -801,6 +834,7 @@ static int ta_alloc_regs(const SpTraceIR *ir, const int32_t *phi_local, uint8_t 
             if (in->a > 0U && in->a <= ir->nvalues && in->op != SP_TIR_PHI)
                 last[in->a] = (uint32_t)i;
             if (in->b > 0U && in->b <= ir->nvalues) last[in->b] = (uint32_t)i;
+            if ((in->op == SP_TIR_FSTORE || in->op == SP_TIR_ASTORE) && in->aux > 0U && in->aux <= ir->nvalues) last[in->aux] = (uint32_t)i;
         }
     }
 
@@ -808,7 +842,7 @@ static int ta_alloc_regs(const SpTraceIR *ir, const int32_t *phi_local, uint8_t 
      * instructions do with the same values (this must come after the pass above, which records the last ordinary use). */
     for (size_t i = 0U; i < ir->count; i++) {
         const SpTIRInst *in = &ir->inst[i];
-        if (in->op != SP_TIR_ASTORE && in->op != SP_TIR_FSTORE) continue;
+        if ((in->op != SP_TIR_ASTORE && in->op != SP_TIR_FSTORE) || ta_store_to_fresh(ir, in)) continue;
         if (in->a <= ir->nvalues) last[in->a] = (uint32_t)ir->count - 1U;
         if (in->b <= ir->nvalues) last[in->b] = (uint32_t)ir->count - 1U;
         if (in->aux > 0U && in->aux <= ir->nvalues) last[in->aux] = (uint32_t)ir->count - 1U;
@@ -867,10 +901,12 @@ static int ta_emit_module_stores(const SpTraceIR *ir, const int32_t *phi_local, 
     return 1;
 }
 
+static _Thread_local size_t fail_at;
 static int ta_emit_trace_ir(const SpTraceIR *ir, const int32_t *phi_local, unsigned nmod,
                             const SpJitSnapshotSet *snapshot_set, uint8_t slot,
                             TraceRuntimeCells *runtime, TraceAsm *a, size_t *frame_size_out) {
     size_t frame_size = 16U;
+    fail_at = SIZE_MAX;
     uint8_t *regs = NULL;
     size_t pending[16], npending = 0U;   /* ASTORE instructions deferred to the end of the iteration */
     uint32_t exit_token = 0U, deopt_token = 0U, miss_token = 0U, budget_token = 0U;
@@ -885,6 +921,7 @@ static int ta_emit_trace_ir(const SpTraceIR *ir, const int32_t *phi_local, unsig
     for (size_t i = 0U; i < ir->count; i++) {
         const SpTIRInst *in = &ir->inst[i];
         uint8_t dst = in->dst > 0U && in->dst <= ir->nvalues ? regs[in->dst] : UINT8_MAX;
+        fail_at = i;
         uint8_t ra = in->a > 0U && in->a <= ir->nvalues ? regs[in->a] : UINT8_MAX;
         uint8_t rb = in->b > 0U && in->b <= ir->nvalues ? regs[in->b] : UINT8_MAX;
         switch (in->op) {
@@ -985,7 +1022,7 @@ static int ta_emit_trace_ir(const SpTraceIR *ir, const int32_t *phi_local, unsig
             {
                 TracePatch patch = ta_patch();
                 if (!ta_stencil(a, ST_tr_dec_r11, &patch) ||
-                    !ta_jcc(a, 0x84U, TA_BUDGET) || !ta_jmp(a, TA_LOOP)) goto done;
+                    !ta_jcc(a, 0x84U, TA_BUDGET) || (ta_has_alloc(ir) && !ta_gc_check(a)) || !ta_jmp(a, TA_LOOP)) goto done;
             }
             break;
         case SP_TIR_FADD: case SP_TIR_FSUB: case SP_TIR_FMUL: case SP_TIR_FDIV:
@@ -1027,11 +1064,20 @@ static int ta_emit_trace_ir(const SpTraceIR *ir, const int32_t *phi_local, unsig
         case SP_TIR_CGUARD:
             if (ra >= 16U || !(in->aux == 1U ? ta_ref_guard(a, ra, in->imm) : ta_class_guard(a, ra, in->imm))) goto done;
             break;
+        case SP_TIR_NEWINST:
+            if (dst >= 16U || !ta_new_inst(a, dst, in->imm)) goto done;
+            break;
         case SP_TIR_UCELL:
             if (dst >= 16U || ra >= 16U || !ta_mem_load(a, dst, ra, (uint32_t)offsetof(SFunc, up)) ||
                 !ta_mem_load(a, dst, dst, in->aux * 8U)) goto done;
             break;
         case SP_TIR_ASTORE: case SP_TIR_FSTORE:
+            if (ta_store_to_fresh(ir, in)) {
+                uint8_t tag;
+                if (ra >= 16U || regs[in->aux] >= 16U || !ta_store_tag(ir, in, &tag) ||
+                    !ta_field_store(a, regs[in->aux], ra, (uint32_t)in->imm, tag)) goto done;
+                break;
+            }
             if (npending >= sizeof pending / sizeof pending[0]) goto done;
             pending[npending++] = i;
             break;
@@ -1100,6 +1146,7 @@ static int ta_emit_trace_ir(const SpTraceIR *ir, const int32_t *phi_local, unsig
     *frame_size_out = frame_size;
     ok = 1;
 done:
+    if (!ok && getenv("SPRINT_TRACE_JIT_DEBUG")) (void)fprintf(stderr, "trace-jit: emitter stopped at instruction %zu\n", fail_at);
     free(regs);
     return ok;
 }
@@ -1153,6 +1200,7 @@ static uint8_t trace_ir_runtime_type(const SpTraceIR *ir, SpTIRValue value) {
             return (uint8_t)T_BOOL;
         case SP_TIR_ALOAD: case SP_TIR_FLOAD: return (uint8_t)in->imm;
         case SP_TIR_UCELL: return (uint8_t)T_CELL;
+        case SP_TIR_NEWINST: return (uint8_t)T_INSTANCE;
         case SP_TIR_GUARD_TRUE: case SP_TIR_ASTORE: case SP_TIR_FSTORE: case SP_TIR_CGUARD: case SP_TIR_LOOP: case SP_TIR_RETURN:
             return UINT8_MAX;
         default:
@@ -1887,6 +1935,7 @@ typedef struct {
     uint16_t arg;
     uint8_t op, taken;
     uint8_t lvl;          /* inlining depth: 0 = the loop's own function */
+    uint8_t mod;          /* a module variable (arg indexes the root frame's scratch slots whatever the depth) */
     Proto *proto;         /* the function the instruction belongs to */
     Proto *callee;        /* OP_CALL: the inlined callee */
 } PathOp;
@@ -1898,6 +1947,13 @@ typedef struct {
     uint32_t off[16];
     unsigned n;
 } FieldState;
+/* a class / identity guard on a value that an earlier guard of this iteration already covers is redundant */
+typedef struct { SpTIRValue v[32]; uint64_t k[32]; unsigned n; } GuardSet;
+static int trace_guard_once(SpTraceIR *ir, GuardSet *g, int identity, SpTIRValue v, uint64_t key) {
+    for (unsigned i = 0U; i < g->n; i++) if (g->v[i] == v && g->k[i] == key) return 1;
+    if (g->n < 32U) { g->v[g->n] = v; g->k[g->n] = key; g->n++; }
+    return identity ? sp_tir_emit_rguard(ir, v, key) : sp_tir_emit_cguard(ir, v, key);
+}
 static int trace_field_access(SpTraceIR *ir, FieldState *fs, int is_set, SpTIRValue obj, uint32_t off, SpTIRValue v,
                               SpTIRType fty, uint8_t tag, SpTIRValue *out) {
     if (is_set) {
@@ -1937,6 +1993,10 @@ static int trace_build_ir_path(Proto *p, const SpValue *locals, const SpValue *m
 #define SLOTV(I) ((I) < slot_count ? locals[(I)] : mslots[mod_idx[(I) - slot_count]])
     const SArray **vhint = NULL;   /* per SSA value: the array object it held when the trace was recorded (element types come from it) */
     FieldState fs;
+    GuardSet gs;
+    const SClass **chint = NULL;      /* per SSA value: the class a T_CLASS value held (constructor calls) */
+    const SClass **khint = NULL;      /* per SSA value: the class of an instance allocated by the trace itself */
+    SpTIRValue fctor[4];              /* constructor frames: the instance under construction */
     const SFunc **fhint = NULL;       /* per SSA value: the closure it held at recording time (identity guarded when called) */
     SpTIRValue fl[4][64];             /* locals of the inlined frames (index = inlining depth) */
     const SFunc *ffh[4];
@@ -1976,7 +2036,7 @@ static int trace_build_ir_path(Proto *p, const SpValue *locals, const SpValue *m
             len = op_len(op);
             if (len <= 0 || pc + (uint32_t)len > wp->code_len) { why = "bad instruction"; goto done; }
             po = &path[np++];
-            po->pc = pc; po->op = (uint8_t)op; po->lvl = (uint8_t)lvl; po->proto = wp; po->callee = NULL; po->arg = 0U; po->taken = 0U; po->target = 0U;
+            po->pc = pc; po->op = (uint8_t)op; po->lvl = (uint8_t)lvl; po->mod = 0U; po->proto = wp; po->callee = NULL; po->arg = 0U; po->taken = 0U; po->target = 0U;
             switch (op) {
             case OP_JUMP: {
                 int32_t off = rd32s(wc + pc + 1U);
@@ -2011,7 +2071,7 @@ static int trace_build_ir_path(Proto *p, const SpValue *locals, const SpValue *m
                 break;
             case OP_LOAD_MODULE: case OP_STORE_MODULE: {
                 unsigned idx = rd16(wc + pc + 1U), k;
-                if (mslots == NULL || lvl > 0U) goto done;
+                if (mslots == NULL) goto done;
                 for (k = 0U; k < nmod && mod_idx[k] != idx; k++) {}
                 if (k == nmod) {
                     if (nmod >= 8U) { why = "too many module variables"; goto done; }
@@ -2019,6 +2079,7 @@ static int trace_build_ir_path(Proto *p, const SpValue *locals, const SpValue *m
                 }
                 po->op = op == OP_LOAD_MODULE ? (uint8_t)OP_LOAD_LOCAL : (uint8_t)OP_STORE_LOCAL;
                 po->arg = (uint16_t)(slot_count + k);
+                po->mod = 1U;
                 break;
             }
             case OP_RANGE_NEXT: {
@@ -2045,24 +2106,29 @@ static int trace_build_ir_path(Proto *p, const SpValue *locals, const SpValue *m
                 po->arg = (uint16_t)rd16(wc + pc + 1U);
                 if (lvl == 0U) goto done;
                 break;
-            case OP_CALL: {
+            case OP_CALL: case OP_INVOKE: {
                 unsigned k = cur;
                 Proto *cp;
-                if (lvl >= 3U || pc + 2U > wp->code_len) { why = "call nesting"; goto done; }
-                po->arg = (uint16_t)wc[pc + 1U];
+                const unsigned clen = op == OP_INVOKE ? 4U : 2U;
+                if (lvl >= 3U || pc + clen > wp->code_len) { why = "call nesting"; goto done; }
+                po->arg = (uint16_t)wc[pc + clen - 1U];
+                if (op == OP_INVOKE) {
+                    po->target = rd16(wc + pc + 1U);
+                    if (po->target >= (unsigned)wp->nconsts || wp->consts[po->target].type != T_STRING) goto done;
+                }
                 while (k < count && !(steps[k].proto == wp && steps[k].pc == pc)) k++;
                 while (k < count && steps[k].proto == wp && steps[k].pc == pc) k++;
                 if (k >= count || steps[k].pc != 0U) { why = "call did not enter a function"; goto done; }
                 cp = (Proto *)(uintptr_t)steps[k].proto;
-                if (cp == NULL || cp->nlocals > 64 || cp->nparams != (int)po->arg || cp->has_rest || cp->ndefaults != 0 ||
+                if (cp == NULL || cp->nlocals > 64 || (cp->nparams != (int)(po->arg + (op == OP_INVOKE ? 1U : 0U)) && (op == OP_INVOKE || cp->nparams != (int)po->arg + 1)) || cp->has_rest || cp->ndefaults != 0 ||
                     cp->nrequired != cp->nparams || cp->nlocals < cp->nparams) { why = "callee shape"; goto done; }
                 po->callee = cp;
-                saved_pc[lvl] = pc + 2U; saved_p[lvl] = wp;
+                saved_pc[lvl] = pc + clen; saved_p[lvl] = wp;
                 lvl++;
                 wp = cp; wc = cp->ocode ? cp->ocode : cp->code; pc = 0U; cur = k;
                 continue;
             }
-            case OP_RETURN:
+            case OP_RETURN: case OP_RETURN_NIL:
                 if (lvl == 0U) goto done;
                 lvl--;
                 wp = saved_p[lvl]; wc = wp->ocode ? wp->ocode : wp->code; pc = saved_pc[lvl];
@@ -2096,19 +2162,23 @@ walked:
     phi = (SpTIRValue *)calloc((size_t)slot_total, sizeof *phi);
     current = (SpTIRValue *)calloc((size_t)slot_total, sizeof *current);
     stack = (SpTIRValue *)calloc(stack_capacity, sizeof *stack);
+    chint = (const SClass **)calloc((size_t)slot_total * 2U + (size_t)np * 3U + 16U, sizeof *chint);
+    khint = (const SClass **)calloc((size_t)slot_total * 2U + (size_t)np * 3U + 16U, sizeof *khint);
     fhint = (const SFunc **)calloc((size_t)slot_total * 2U + (size_t)np * 3U + 16U, sizeof *fhint);
     ihint = (const SInstance **)calloc((size_t)slot_total * 2U + (size_t)np * 3U + 16U, sizeof *ihint);
     vhint = (const SArray **)calloc((size_t)slot_total * 2U + (size_t)np * 3U + 16U, sizeof *vhint);
-    if (!used || !param || !phi || !current || !stack || !vhint || !ihint || !fhint) goto done;
+    if (!used || !param || !phi || !current || !stack || !vhint || !ihint || !fhint || !chint || !khint) goto done;
     memset(&fs, 0, sizeof fs);
+    memset(&gs, 0, sizeof gs);
     memset(fl, 0, sizeof fl);
+    memset(fctor, 0, sizeof fctor);
     for (uint32_t i = 0U; i < stack_depth; i++) {
         SpTIRType t;
         if (!trace_value_type((SpType)locals[(uint32_t)p->nlocals + i].type, &t)) goto done;
         used[(uint32_t)p->nlocals + i] = 1U;
     }
     for (unsigned i = 0U; i < np; i++) {
-        if (path[i].lvl == 0U && (path[i].op == OP_LOAD_LOCAL || path[i].op == OP_STORE_LOCAL)) {
+        if ((path[i].lvl == 0U || path[i].mod) && (path[i].op == OP_LOAD_LOCAL || path[i].op == OP_STORE_LOCAL)) {
             SpTIRType t;
             if (!trace_value_type((SpType)SLOTV(path[i].arg).type, &t)) goto done;
             used[path[i].arg] = 1U;
@@ -2137,6 +2207,7 @@ walked:
         if (SLOTV(i).type == T_ARRAY) vhint[phi[i]] = AS_ARRAY(SLOTV(i));
         if (SLOTV(i).type == T_INSTANCE) ihint[phi[i]] = AS_INSTANCE(SLOTV(i));
         if (SLOTV(i).type == T_FUNCTION) fhint[phi[i]] = AS_FUNC(SLOTV(i));
+        if (SLOTV(i).type == T_CLASS) chint[phi[i]] = AS_CLASS(SLOTV(i));
     }
     depth = stack_depth;
     for (uint32_t i = 0U; i < stack_depth; i++) stack[i] = phi[(uint32_t)p->nlocals + i];
@@ -2147,7 +2218,7 @@ walked:
         switch (po->op) {
         case OP_JUMP: case OP_NOP: break;
         case OP_LOAD_LOCAL:
-            if (blvl > 0U) {
+            if (blvl > 0U && !po->mod) {
                 if (depth >= stack_capacity || !fl[blvl][po->arg]) goto done;
                 stack[depth++] = fl[blvl][po->arg];
                 break;
@@ -2157,7 +2228,7 @@ walked:
             break;
         case OP_STORE_LOCAL:
             if (depth == 0U) goto done;
-            if (blvl > 0U) { fl[blvl][po->arg] = stack[--depth]; stored = 1; break; }
+            if (blvl > 0U && !po->mod) { fl[blvl][po->arg] = stack[--depth]; stored = 1; break; }
             current[po->arg] = stack[--depth];
             if (ir->value_types[current[po->arg]] != ir->value_types[phi[po->arg]] ||
                 trace_ir_runtime_type(ir, current[po->arg]) != SLOTV(po->arg).type) { why = "a local changes type"; goto done; }
@@ -2255,6 +2326,8 @@ walked:
         }
         case OP_GET_MEMBER: case OP_SET_MEMBER: {
             const SInstance *h;
+            const SClass *kc;
+            const SpValue *ksl;
             SpValue sv;
             SpTIRValue v = 0U;
             SpTIRType fty = SP_TIR_T_I64;
@@ -2264,26 +2337,34 @@ walked:
             if (is_set) v = stack[--depth];
             a = stack[--depth];
             h = a < (uint32_t)slot_total * 2U + (uint32_t)np * 3U + 16U ? ihint[a] : NULL;
-            if (h == NULL || ir->value_types[a] != SP_TIR_T_REF || trace_ir_runtime_type(ir, a) != (uint8_t)T_INSTANCE) {
+            kc = h != NULL ? h->cls : (a < (uint32_t)slot_total * 2U + (uint32_t)np * 3U + 16U ? khint[a] : NULL);
+            ksl = h != NULL ? h->slots : (kc != NULL ? kc->dflt : NULL);
+            if (kc == NULL || ir->value_types[a] != SP_TIR_T_REF || trace_ir_runtime_type(ir, a) != (uint8_t)T_INSTANCE) {
                 why = "member access: receiver is not a known instance"; goto done;
             }
-            if (!table_get_sstr(h->cls->fields, AS_STR(po->proto->consts[po->arg]), &sv) || sv.as.i < 0 || sv.as.i >= h->nslots) {
+            if (!table_get_sstr(kc->fields, AS_STR(po->proto->consts[po->arg]), &sv) || sv.as.i < 0 || sv.as.i >= kc->nfields) {
                 why = "member access: not a field"; goto done;
             }
             foff = (uint32_t)(offsetof(SInstance, slots) + (size_t)sv.as.i * sizeof(SpValue));
-            if (!sp_tir_emit_cguard(ir, a, (uint64_t)(uintptr_t)h->cls)) goto done;
+            if (h != NULL && !trace_guard_once(ir, &gs, 0, a, (uint64_t)(uintptr_t)h->cls)) goto done;
             if (is_set) {
                 if (ir->value_types[v] == SP_TIR_T_REF) { why = "member write of a reference"; goto done; }
                 if (!trace_field_access(ir, &fs, 1, a, foff, v, fty, 0U, NULL)) { why = "field write"; goto done; }
                 array_stored = 1;
             } else {
-                switch (h->slots[sv.as.i].type) {
-                case T_INT: fty = SP_TIR_T_I64; break;
-                case T_FLOAT: fty = SP_TIR_T_F64; break;
-                case T_BOOL: fty = SP_TIR_T_BOOL; break;
-                default: why = "member read: field type"; goto done;
+                {
+                    unsigned fk;
+                    int fwd = 0;
+                    for (fk = 0U; fk < fs.n; fk++) if (fs.obj[fk] == a && fs.off[fk] == foff) fwd = 1;
+                    if (ksl == NULL && !fwd) { why = "member read: unknown field type"; goto done; }
+                    switch (ksl != NULL ? ksl[sv.as.i].type : (unsigned)T_INT) {
+                    case T_INT: fty = SP_TIR_T_I64; break;
+                    case T_FLOAT: fty = SP_TIR_T_F64; break;
+                    case T_BOOL: fty = SP_TIR_T_BOOL; break;
+                    default: why = "member read: field type"; goto done;
+                    }
                 }
-                if (!trace_field_access(ir, &fs, 0, a, foff, 0U, fty, (uint8_t)h->slots[sv.as.i].type, &r)) {
+                if (!trace_field_access(ir, &fs, 0, a, foff, 0U, fty, ksl != NULL ? (uint8_t)ksl[sv.as.i].type : (uint8_t)T_INT, &r)) {
                     why = "member read may alias a pending write"; goto done;
                 }
                 stack[depth++] = r;
@@ -2296,7 +2377,7 @@ walked:
             SpTIRType fty = SP_TIR_T_I64;
             unsigned k;
             const int is_set = po->op == OP_STORE_UPVAL;
-            if (blvl == 0U || ffh[blvl] == NULL || po->arg >= (unsigned)ffh[blvl]->nup) goto done;
+            if (blvl == 0U || ffn[blvl] == 0U || ffh[blvl] == NULL || po->arg >= (unsigned)ffh[blvl]->nup) goto done;
             cell = ffh[blvl]->up[po->arg];
             if (cell == NULL) goto done;
             for (k = 0U; k < nucm; k++) if (ucm[k].fn == ffn[blvl] && ucm[k].idx == po->arg) { cv = ucm[k].cell; break; }
@@ -2332,18 +2413,63 @@ walked:
             if (n > 16U || depth < n + 1U || blvl >= 3U) goto done;
             for (unsigned k = n; k > 0U; k--) args[k - 1U] = stack[--depth];
             fv = stack[--depth];
+            if (fv < (uint32_t)slot_total * 2U + (uint32_t)np * 3U + 16U && chint[fv] != NULL &&
+                ir->value_types[fv] == SP_TIR_T_REF && trace_ir_runtime_type(ir, fv) == (uint8_t)T_CLASS) {
+                const SClass *kc = chint[fv];
+                SpTIRValue inst;
+                if (kc->fast != 1 || kc->init == NULL || kc->init->proto != po->callee || po->callee->nparams != (int)n + 1 ||
+                    kc->nfields > 30) { why = "constructor: class is not in the fast shape"; goto done; }
+                if (!trace_guard_once(ir, &gs, 1, fv, (uint64_t)(uintptr_t)kc) ||
+                    !sp_tir_emit_newinst(ir, (uint64_t)(uintptr_t)kc, &inst)) goto done;
+                if (inst < (uint32_t)slot_total * 2U + (uint32_t)np * 3U + 16U) khint[inst] = kc; else goto done;
+                blvl++;
+                ffn[blvl] = 0U; ffh[blvl] = NULL; fbase[blvl] = depth; fctor[blvl] = inst;
+                memset(fl[blvl], 0, sizeof fl[blvl]);
+                fl[blvl][0] = inst;
+                for (unsigned k = 0U; k < n; k++) fl[blvl][k + 1U] = args[k];
+                break;
+            }
             fh = fv < (uint32_t)slot_total * 2U + (uint32_t)np * 3U + 16U ? fhint[fv] : NULL;
             if (fh == NULL || ir->value_types[fv] != SP_TIR_T_REF || trace_ir_runtime_type(ir, fv) != (uint8_t)T_FUNCTION ||
                 fh->proto != po->callee) { why = "call: callee is not a known closure"; goto done; }
-            if (!sp_tir_emit_rguard(ir, fv, (uint64_t)(uintptr_t)fh)) goto done;
+            if (!trace_guard_once(ir, &gs, 1, fv, (uint64_t)(uintptr_t)fh)) goto done;
             blvl++;
-            ffn[blvl] = fv; ffh[blvl] = fh; fbase[blvl] = depth;
+            ffn[blvl] = fv; ffh[blvl] = fh; fbase[blvl] = depth; fctor[blvl] = 0U;
             memset(fl[blvl], 0, sizeof fl[blvl]);
             for (unsigned k = 0U; k < n; k++) fl[blvl][k] = args[k];
             break;
         }
+        case OP_INVOKE: {
+            SpTIRValue args[16], recv;
+            const SInstance *h;
+            const SClass *kc;
+            SpValue mv;
+            unsigned n = po->arg;
+            if (n > 15U || depth < n + 1U || blvl >= 3U) goto done;
+            for (unsigned k = n; k > 0U; k--) args[k - 1U] = stack[--depth];
+            recv = stack[--depth];
+            h = recv < (uint32_t)slot_total * 2U + (uint32_t)np * 3U + 16U ? ihint[recv] : NULL;
+            kc = h != NULL ? h->cls : (recv < (uint32_t)slot_total * 2U + (uint32_t)np * 3U + 16U ? khint[recv] : NULL);
+            if (kc == NULL || ir->value_types[recv] != SP_TIR_T_REF || trace_ir_runtime_type(ir, recv) != (uint8_t)T_INSTANCE ||
+                table_get_sstr(kc->fields, AS_STR(po->proto->consts[po->target]), &mv) ||
+                !table_get_sstr(kc->methods, AS_STR(po->proto->consts[po->target]), &mv) || mv.type != T_FUNCTION ||
+                AS_FUNC(mv)->proto != po->callee) { why = "invoke: not a plain instance method"; goto done; }
+            if (h != NULL && !trace_guard_once(ir, &gs, 0, recv, (uint64_t)(uintptr_t)h->cls)) goto done;
+            blvl++;
+            ffn[blvl] = 0U; ffh[blvl] = AS_FUNC(mv); fbase[blvl] = depth; fctor[blvl] = 0U;
+            memset(fl[blvl], 0, sizeof fl[blvl]);
+            fl[blvl][0] = recv;
+            for (unsigned k = 0U; k < n; k++) fl[blvl][k + 1U] = args[k];
+            break;
+        }
+        case OP_RETURN_NIL:
+            /* only a constructor can end this way: the call's value is the new instance */
+            if (blvl == 0U || fctor[blvl] == 0U || depth != fbase[blvl]) goto done;
+            stack[depth++] = fctor[blvl];
+            blvl--;
+            break;
         case OP_RETURN:
-            if (blvl == 0U || depth == 0U || depth <= fbase[blvl]) goto done;
+            if (blvl == 0U || fctor[blvl] != 0U || depth == 0U || depth <= fbase[blvl]) goto done;
             r = stack[depth - 1U];
             depth = fbase[blvl];
             stack[depth++] = r;
@@ -2461,7 +2587,7 @@ walked:
     p->trace_any = 1;
 done:
     if (!ok && trace_debug_env()) (void)fprintf(stderr, "trace-jit: path builder rejected %s@%u: %s\n", p->name ? p->name : "?", header, why);
-    free(used); free(param); free(phi); free(current); free(stack); free(phi_local); free(vhint); free(ihint); free(fhint);
+    free(used); free(param); free(phi); free(current); free(stack); free(phi_local); free(vhint); free(ihint); free(fhint); free(chint); free(khint);
     if (!ok) sp_tir_destroy(ir);
     return ok;
 #undef SLOTV
@@ -2546,7 +2672,7 @@ int jit_trace_compile(VM *vm, Proto *p, uint32_t header, const TraceStep *steps,
             if (trace_debug_env()) {
                 unsigned phis = 0U;
                 for (size_t k = 0U; k < ir.count; k++) phis += ir.inst[k].op == SP_TIR_PHI;
-                (void)fprintf(stderr, "trace-jit: emission rejected: %zu instructions, %u values, %u loop-carried\n", ir.count, (unsigned)ir.nvalues, phis);
+                (void)fprintf(stderr, "trace-jit: emission rejected: %zu instructions, %u values, %u loop-carried\n", ir.count, (unsigned)ir.nvalues, phis); (void)sp_tir_dump(&ir, stderr);
             }
             goto done; }
     (void)frame_size;
@@ -2730,6 +2856,7 @@ int jit_trace_site(VM *vm, Proto *p, const uint8_t *hdr, SpValue *base, SpValue 
 
     fr->pc = restored_pc;
     vm->sp = restored_sp;
+    if (vm->bytes >= vm->gc_next) vm_gc(vm);   /* a trace that allocates left at its back edge: the frame is consistent again */
     requested_signature = miss_parent != NULL ?
         trace_signature_hash(miss_parent, base, stack_depth) : 0U;
     if (snapshot_kind == SP_JIT_SNAPSHOT_MISS && miss_parent != NULL &&

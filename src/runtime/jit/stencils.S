@@ -1763,6 +1763,42 @@ ST tr_cmp_mem_reg               # cmp [ra + H0], reg (the class pointer, held in
     .byte HB0, 0x39, HB1
     .long H0
 
+# ---- allocation inside a trace: call the C helper whose address the caller put in r10 (rdi = VM, rsi = class); the result comes back in r10
+# (caller-saved registers of the register pool and the budget counter r11 are preserved; rsp is 16-byte aligned at the call)
+ST tr_new_inst
+    push %rax
+    push %rcx
+    push %rdx
+    push %rsi
+    push %rdi
+    push %r8
+    push %r9
+    push %r11
+    sub $8,%rsp
+    .byte 0x49, 0x8d, 0xbd      # lea H0(%r13), %rdi: the VM, from the budget cell
+    .long H0
+    movabs $HQ,%rsi
+    call *%r10
+    mov %rax,(%rsp)
+    mov 8(%rsp),%r11
+    mov 16(%rsp),%r9
+    mov 24(%rsp),%r8
+    mov 32(%rsp),%rdi
+    mov 40(%rsp),%rsi
+    mov 48(%rsp),%rdx
+    mov 56(%rsp),%rcx
+    mov 64(%rsp),%rax
+    mov (%rsp),%r10
+    add $72,%rsp
+    test %r10,%r10
+
+# is a collection due?  (back edge of a trace that allocates) -- sets CF when vm->bytes < vm->gc_next
+ST tr_gc_check
+    .byte 0x4d, 0x8b, 0x95      # mov H0(%r13), %r10
+    .long H0
+    .byte 0x4d, 0x3b, 0x95      # cmp H1(%r13), %r10
+    .long H1
+
 ST tr_div_guard                 # r10 = divisor; 0 and -1 leave through JIT_T (deopt): the interpreter raises the error / handles INT64_MIN / -1
     inc %r10
     cmp $1,%r10
