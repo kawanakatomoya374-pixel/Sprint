@@ -73,7 +73,8 @@ int sp_jit_snapshot_set_init(SpJitSnapshotSet *set, const SpTraceIR *ir,
     for (size_t i = 0U; i < ir->count; i++) {
         const SpTIRInst *inst = &ir->inst[i];
         if (inst->op != SP_TIR_PHI) continue;
-        if (inst->dst == 0U || inst->dst > ir->nvalues || phi_slot[inst->dst] < 0) goto fail;
+        if (inst->dst == 0U || inst->dst > ir->nvalues || phi_slot[inst->dst] == -1) goto fail;   /* -2: a field of a sunk object, no slot */
+        if (phi_slot[inst->dst] == -2) continue;
         if ((uint32_t)phi_slot[inst->dst] >= slot_count) continue;   /* a module variable the native code keeps in a scratch slot */
         phi_count++;
     }

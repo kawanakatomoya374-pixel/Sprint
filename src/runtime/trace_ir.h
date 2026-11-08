@@ -27,6 +27,7 @@ typedef enum {
     SP_TIR_FSTORE,  /* a.slot = value aux (no result), imm = the slot; performed after the iteration's last deopt point, like ASTORE */
     SP_TIR_NEWINST, /* dst = a fresh instance of class imm (a pointer) with its default slots; never merged or reordered */
     SP_TIR_UCELL,   /* dst = the upvalue cell idx (aux) of closure a (a REF to a cell); a is loop-invariant */
+    SP_TIR_VFIELD,  /* describes a sunk object: a = the virtual PHI standing for the object, b = the PHI carrying its field at byte offset aux (imm = tag); no result */
     SP_TIR_CGUARD,  /* deoptimise unless instance a has class imm (a pointer); aux == 1: unless reference a itself equals imm; no result */
     SP_TIR_LOOP,
     SP_TIR_RETURN
@@ -72,6 +73,9 @@ int sp_tir_emit_fload(SpTraceIR *ir, SpTIRType type, uint8_t tag, SpTIRValue obj
 int sp_tir_emit_fstore(SpTraceIR *ir, SpTIRValue object, uint32_t slot, SpTIRValue value);
 int sp_tir_emit_newinst(SpTraceIR *ir, uint64_t cls, SpTIRValue *out);
 int sp_tir_emit_ucell(SpTraceIR *ir, SpTIRValue fn, uint32_t idx, SpTIRValue *out);
+int sp_tir_emit_fparam(SpTraceIR *ir, SpTIRType type, SpTIRValue object, uint32_t offset, uint64_t cls, SpTIRValue *out);
+int sp_tir_emit_vfield(SpTraceIR *ir, SpTIRValue object_phi, SpTIRValue field_phi, uint32_t offset, uint8_t tag);
+int sp_tir_mark_virtual(SpTraceIR *ir, SpTIRValue value, uint64_t cls);
 int sp_tir_emit_cguard(SpTraceIR *ir, SpTIRValue object, uint64_t cls);
 int sp_tir_emit_rguard(SpTraceIR *ir, SpTIRValue ref, uint64_t ptr);
 int sp_tir_emit_loop(SpTraceIR *ir);
