@@ -56,6 +56,9 @@ static const char *tir_op_name(SpTIROp op) {
     case SP_TIR_FCMP_GE: return "fcmp.ge";
     case SP_TIR_GUARD_TRUE: return "guard.true";
     case SP_TIR_LOOP: return "loop";
+    case SP_TIR_FLOAD: return "fload";
+    case SP_TIR_FSTORE: return "fstore";
+    case SP_TIR_CGUARD: return "cguard";
     case SP_TIR_ALOAD: return "aload";
     case SP_TIR_ASTORE: return "astore";
     case SP_TIR_RETURN: return "return";
@@ -321,6 +324,22 @@ int sp_tir_emit_astore(SpTraceIR *ir, SpTIRValue array, SpTIRValue index, SpTIRV
     return tir_append(ir, SP_TIR_ASTORE, tv, array, index, value, 0U, 0, NULL);
 }
 
+int sp_tir_emit_fload(SpTraceIR *ir, SpTIRType type, uint8_t tag, SpTIRValue object, uint32_t slot, SpTIRValue *out) {
+    SpTIRType t;
+    if (!tir_value_type(ir, object, &t) || t != SP_TIR_T_REF) return 0;
+    return tir_append(ir, SP_TIR_FLOAD, type, object, SP_TIR_NO_VALUE, slot, (uint64_t)tag, 1, out);
+}
+int sp_tir_emit_fstore(SpTraceIR *ir, SpTIRValue object, uint32_t slot, SpTIRValue value) {
+    SpTIRType t, tv;
+    if (!tir_value_type(ir, object, &t) || t != SP_TIR_T_REF || !tir_value_type(ir, value, &tv) || value == SP_TIR_NO_VALUE) return 0;
+    return tir_append(ir, SP_TIR_FSTORE, tv, object, SP_TIR_NO_VALUE, value, (uint64_t)slot, 0, NULL);
+}
+int sp_tir_emit_cguard(SpTraceIR *ir, SpTIRValue object, uint64_t cls) {
+    SpTIRType t;
+    if (!tir_value_type(ir, object, &t) || t != SP_TIR_T_REF) return 0;
+    return tir_append(ir, SP_TIR_CGUARD, SP_TIR_T_REF, object, SP_TIR_NO_VALUE, 0U, cls, 0, NULL);
+}
+
 int sp_tir_emit_loop(SpTraceIR *ir) {
     return tir_append(ir, SP_TIR_LOOP, SP_TIR_T_REF, SP_TIR_NO_VALUE,
                       SP_TIR_NO_VALUE, 0U, 0U, 0, NULL);
@@ -373,8 +392,8 @@ int sp_tir_verify(const SpTraceIR *ir, char *message, size_t message_size) {
     /* First pass: unique SSA definitions, valid opcodes/types, PHI prefix, terminator. */
     for (size_t i = 0U; i < ir->count; i++) {
         const SpTIRInst *in = &ir->inst[i];
-        int has_result = in->op != SP_TIR_GUARD_TRUE && in->op != SP_TIR_ASTORE &&
-                         in->op != SP_TIR_LOOP && in->op != SP_TIR_RETURN;
+        int has_result = in->op != SP_TIR_GUARD_TRUE && in->op != SP_TIR_ASTORE && in->op != SP_TIR_FSTORE &&
+                         in->op != SP_TIR_CGUARD && in->op != SP_TIR_LOOP && in->op != SP_TIR_RETURN;
         if (terminated) {
             tir_error(message, message_size, "instruction appears after terminator");
             goto done;
@@ -549,6 +568,25 @@ int sp_tir_verify(const SpTraceIR *ir, char *message, size_t message_size) {
                 goto done;
             }
             break;
+        case SP_TIR_FLOAD:
+            if (!tir_value_defined_before(defs, in->a, i, (size_t)ir->nvalues) || types[in->a] != SP_TIR_T_REF || in->imm > 255U) {
+                tir_error(message, message_size, "invalid field load operands");
+                goto done;
+            }
+            break;
+        case SP_TIR_FSTORE:
+            if (!tir_value_defined_before(defs, in->a, i, (size_t)ir->nvalues) || types[in->a] != SP_TIR_T_REF ||
+                !tir_value_defined_before(defs, in->aux, i, (size_t)ir->nvalues) || types[in->aux] != in->type) {
+                tir_error(message, message_size, "invalid field store operands");
+                goto done;
+            }
+            break;
+        case SP_TIR_CGUARD:
+            if (!tir_value_defined_before(defs, in->a, i, (size_t)ir->nvalues) || types[in->a] != SP_TIR_T_REF) {
+                tir_error(message, message_size, "invalid class guard operand");
+                goto done;
+            }
+            break;
         case SP_TIR_ASTORE:
             if (!tir_value_defined_before(defs, in->a, i, (size_t)ir->nvalues) || types[in->a] != SP_TIR_T_REF ||
                 !tir_value_defined_before(defs, in->b, i, (size_t)ir->nvalues) || types[in->b] != SP_TIR_T_I64 ||
@@ -648,7 +686,7 @@ static int tir_i64_eval_binary(SpTIROp op, int64_t a, int64_t b, int64_t *out) {
     case SP_TIR_ICMP_LT: case SP_TIR_ICMP_LE: case SP_TIR_ICMP_GT:
     case SP_TIR_ICMP_GE: case SP_TIR_FCMP_EQ: case SP_TIR_FCMP_NE:
     case SP_TIR_FCMP_LT: case SP_TIR_FCMP_LE: case SP_TIR_FCMP_GT:
-    case SP_TIR_FCMP_GE: case SP_TIR_GUARD_TRUE: case SP_TIR_ALOAD: case SP_TIR_ASTORE: case SP_TIR_LOOP:
+    case SP_TIR_FCMP_GE: case SP_TIR_GUARD_TRUE: case SP_TIR_ALOAD: case SP_TIR_ASTORE: case SP_TIR_FLOAD: case SP_TIR_FSTORE: case SP_TIR_CGUARD: case SP_TIR_LOOP:
     case SP_TIR_RETURN:
         return 0;
     default:
@@ -671,7 +709,7 @@ static int tir_i64_eval_compare(SpTIROp op, int64_t a, int64_t b, int *out) {
     case SP_TIR_FDIV: case SP_TIR_FNEG: case SP_TIR_FCMP_EQ:
     case SP_TIR_FCMP_NE: case SP_TIR_FCMP_LT: case SP_TIR_FCMP_LE:
     case SP_TIR_FCMP_GT: case SP_TIR_FCMP_GE: case SP_TIR_GUARD_TRUE:
-    case SP_TIR_ALOAD: case SP_TIR_ASTORE: case SP_TIR_LOOP: case SP_TIR_RETURN:
+    case SP_TIR_ALOAD: case SP_TIR_ASTORE: case SP_TIR_FLOAD: case SP_TIR_FSTORE: case SP_TIR_CGUARD: case SP_TIR_LOOP: case SP_TIR_RETURN:
         return 0;
     default: return 0;
     }
@@ -840,6 +878,7 @@ int sp_tir_optimize(SpTraceIR *ir, size_t *folded_count, size_t *removed_count) 
                  * unused: the failure deoptimises, and the interpreter then raises the error the program must see. */
                 int observable = in->op == SP_TIR_PHI ||
                                 in->op == SP_TIR_GUARD_TRUE || in->op == SP_TIR_ASTORE || in->op == SP_TIR_ALOAD ||
+                                in->op == SP_TIR_FLOAD || in->op == SP_TIR_FSTORE || in->op == SP_TIR_CGUARD ||
                                 in->op == SP_TIR_IADD || in->op == SP_TIR_ISUB || in->op == SP_TIR_IMUL || in->op == SP_TIR_INEG ||
                                 in->op == SP_TIR_IDIV || in->op == SP_TIR_IMOD || in->op == SP_TIR_FDIV ||
                                 in->op == SP_TIR_LOOP || in->op == SP_TIR_RETURN;
@@ -857,7 +896,7 @@ int sp_tir_optimize(SpTraceIR *ir, size_t *folded_count, size_t *removed_count) 
                         live[in->b] = 1U;
                         changed = 1;
                     }
-                    if (in->op == SP_TIR_ASTORE && in->aux != SP_TIR_NO_VALUE && live[in->aux] == 0U) {
+                    if ((in->op == SP_TIR_ASTORE || in->op == SP_TIR_FSTORE) && in->aux != SP_TIR_NO_VALUE && live[in->aux] == 0U) {
                         live[in->aux] = 1U;
                         changed = 1;
                     }
@@ -893,7 +932,7 @@ int sp_tir_optimize(SpTraceIR *ir, size_t *folded_count, size_t *removed_count) 
             if (in.b > old_nvalues || remap[in.b] == SP_TIR_NO_VALUE) goto rollback;
             in.b = remap[in.b];
         }
-        if (in.op == SP_TIR_ASTORE) {   /* the stored value travels in aux */
+        if (in.op == SP_TIR_ASTORE || in.op == SP_TIR_FSTORE) {   /* the stored value travels in aux */
             if (in.aux == SP_TIR_NO_VALUE || in.aux > old_nvalues || remap[in.aux] == SP_TIR_NO_VALUE) goto rollback;
             in.aux = remap[in.aux];
         }
@@ -976,6 +1015,15 @@ int sp_tir_dump(const SpTraceIR *ir, FILE *out) {
             break;
         case SP_TIR_ALOAD:
             if (fprintf(out, " v%" PRIu32 "[v%" PRIu32 "] tag=%" PRIu64, in->a, in->b, in->imm) < 0) return 0;
+            break;
+        case SP_TIR_FLOAD:
+            if (fprintf(out, " v%" PRIu32 ".%" PRIu32 " tag=%" PRIu64, in->a, in->aux, in->imm) < 0) return 0;
+            break;
+        case SP_TIR_FSTORE:
+            if (fprintf(out, " v%" PRIu32 ".%" PRIu64 " = v%" PRIu32, in->a, in->imm, in->aux) < 0) return 0;
+            break;
+        case SP_TIR_CGUARD:
+            if (fprintf(out, " v%" PRIu32 " class=%#" PRIx64, in->a, in->imm) < 0) return 0;
             break;
         case SP_TIR_ASTORE:
             if (fprintf(out, " v%" PRIu32 "[v%" PRIu32 "] = v%" PRIu32, in->a, in->b, in->aux) < 0) return 0;

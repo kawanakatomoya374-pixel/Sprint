@@ -1740,6 +1740,29 @@ ST tr_cmp_mem_imm
     .long H0
     .long H1
 
+# ---- instance field access in traces: ra = the instance object, H0 = byte offset of the slot (L_SINST_SLOTS + 16 * slot)
+ST tr_obj_tagcmp                # cmpq $HB2, [ra + H0]
+    .byte HB0, 0x83, HB1
+    .long H0
+    .byte HB2
+
+ST tr_mem_load                  # dst = [ra + H0]: HB0 = REX.W(+R dst)(+B ra), HB1 = modrm (mod 10, reg dst, rm ra)
+    .byte HB0, 0x8b, HB1
+    .long H0
+
+ST tr_mem_store_tag             # movq $H1, [ra + H0]
+    .byte HB0, 0xc7, HB1
+    .long H0
+    .long H1
+
+ST tr_mem_store_val             # [ra + H0] = src
+    .byte HB0, 0x89, HB1
+    .long H0
+
+ST tr_cmp_mem_reg               # cmp [ra + H0], reg (the class pointer, held in r10)
+    .byte HB0, 0x39, HB1
+    .long H0
+
 ST tr_div_guard                 # r10 = divisor; 0 and -1 leave through JIT_T (deopt): the interpreter raises the error / handles INT64_MIN / -1
     inc %r10
     cmp $1,%r10
