@@ -25,7 +25,8 @@ typedef enum {
     SP_TIR_ASTORE,  /* a[b] = value aux (no result); the backend performs it after the iteration's last deopt point */
     SP_TIR_FLOAD,   /* dst = a.slot: a is an instance reference, aux the slot, imm the field tag the trace was recorded with; a tag mismatch deoptimises */
     SP_TIR_FSTORE,  /* a.slot = value aux (no result), imm = the slot; performed after the iteration's last deopt point, like ASTORE */
-    SP_TIR_CGUARD,  /* deoptimise unless instance a has class imm (a pointer); no result */
+    SP_TIR_UCELL,   /* dst = the upvalue cell idx (aux) of closure a (a REF to a cell); a is loop-invariant */
+    SP_TIR_CGUARD,  /* deoptimise unless instance a has class imm (a pointer); aux == 1: unless reference a itself equals imm; no result */
     SP_TIR_LOOP,
     SP_TIR_RETURN
 } SpTIROp;
@@ -68,7 +69,9 @@ int sp_tir_emit_aload(SpTraceIR *ir, SpTIRType elem_type, uint8_t elem_tag, SpTI
 int sp_tir_emit_astore(SpTraceIR *ir, SpTIRValue array, SpTIRValue index, SpTIRValue value);
 int sp_tir_emit_fload(SpTraceIR *ir, SpTIRType type, uint8_t tag, SpTIRValue object, uint32_t slot, SpTIRValue *out);
 int sp_tir_emit_fstore(SpTraceIR *ir, SpTIRValue object, uint32_t slot, SpTIRValue value);
+int sp_tir_emit_ucell(SpTraceIR *ir, SpTIRValue fn, uint32_t idx, SpTIRValue *out);
 int sp_tir_emit_cguard(SpTraceIR *ir, SpTIRValue object, uint64_t cls);
+int sp_tir_emit_rguard(SpTraceIR *ir, SpTIRValue ref, uint64_t ptr);
 int sp_tir_emit_loop(SpTraceIR *ir);
 int sp_tir_emit_return(SpTraceIR *ir, SpTIRValue value);
 int sp_tir_verify(const SpTraceIR *ir, char *message, size_t message_size);
