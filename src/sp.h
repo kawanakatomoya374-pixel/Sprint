@@ -402,6 +402,7 @@ struct Proto {
     struct JitProto *jit;  /* compiled loop regions (JIT) */
     int jhot;              /* back-edge countdown until the JIT is consulted (0 = not initialised) */
     struct JitUnit *junit; /* native entry of the whole function (JIT), NULL = not compiled */
+    struct JitPure *pure;  /* a pure self-recursive integer function compiled to a native function (jit_pure.c), or NULL */
     int jcall;             /* call countdown until the JIT is asked to compile the function (0 = not initialised) */
     int compile_index;     /* stable index in Program.protos while compiling */
     /* TraceJIT: bit set of loop headers (by code offset) that are settled: their root recording was rejected or already
@@ -923,6 +924,12 @@ int jit_trace_site(VM *vm, Proto *p, const uint8_t *hdr, SpValue *base, SpValue 
                    uint8_t *side_parent_slot_out);
 /* Called from OP_CALL: after the call countdown ran out. Returns the unit to enter, or NULL. */
 JitUnit *jit_call_hot(VM *vm, SFunc *fn, SpValue *base);
+/* jit_pure.c: pure self-recursive integer functions run without VM frames. jit_pure_enter: 1 = the call was done (*out = result,
+ * *left = budget left), 0 = the interpreter performs it. */
+typedef struct JitPure JitPure;
+struct JitPure *jit_pure_compile(VM *vm, Proto *p);
+void jit_pure_free(Proto *p);
+int jit_pure_enter(VM *vm, Proto *p, const SpValue *args, uint64_t *left, int64_t *out);
 /* Run a unit whose frame is already pushed (nf = top frame, base = its base); state as for jit_site. */
 void jit_run(VM *vm, JitUnit *u, SpValue *base);
 void jit_free_proto(Proto *p);

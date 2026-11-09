@@ -546,6 +546,18 @@ static RunStatus RUN_LOOP_NAME(VM *vm, VMTraceCapture **capp, RunCold *ccold, in
                     cfv + 1 + cp->nlocals + cp->max_stack + 8 <= vm->stack_end && cn == cp->nrequired) {
                     TICK();
                     pc++;
+#if SP_JIT
+                    if (__builtin_expect(cp->pure != NULL, 0)) {   /* a pure recursive integer function: native, no frames */
+                        int64_t pure_r;
+                        uint64_t pure_left = left;
+                        if (jit_pure_enter(vm, cp, cfv + 1, &pure_left, &pure_r)) {
+                            left = pure_left;
+                            sp = cfv;
+                            PUSH(v_int(pure_r));
+                            break;
+                        }
+                    }
+#endif
                     SpValue *nb = cfv + 1;
                     for (int i = cn; i < cp->nlocals; i++) nb[i] = v_nil();
                     fr->pc = pc;

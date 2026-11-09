@@ -194,6 +194,7 @@ void jit_roots(Proto *p, void (*mark)(VM *, SpValue), VM *vm) {
 }
 
 void jit_free_proto(Proto *p) {
+    jit_pure_free(p);
     struct JitProto *jp = p->jit;
     if (!jp) return;
     for (int i = 0; i < jp->n; i++) region_free(jp->r[i]);
@@ -3838,6 +3839,9 @@ JitUnit *jit_call_hot(VM *vm, SFunc *fn, SpValue *base) {
     if (p->junit) return p->junit;
     if (!vm->jit_on || p->jcall > 1) return NULL;
     p->jcall = 0x3fffffff;                                                /* one attempt only */
+    if (!p->pure) p->pure = jit_pure_compile(vm, p);
+    if (getenv("SPRINT_PURE_DEBUG")) (void)fprintf(stderr, "pure %s: %s\n", p->name ? p->name : "?", p->pure ? "compiled" : "no");
+                         /* a pure recursive integer function gets a frameless native version */
     if (p->nparams != p->nrequired || p->has_rest || p->ndefaults != 0) return NULL;
     struct JitProto *jp = jit_proto(p);
     if (!jp || jp->unit) return NULL;
