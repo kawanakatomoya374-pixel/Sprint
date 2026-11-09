@@ -60,6 +60,7 @@ struct TraceRegion {
     size_t meta_size;
     uint64_t signature_hash;
     uint64_t side_attempts[TRACE_SIDE_ATTEMPT_MAX];
+    uint64_t ticks;               /* loop iterations run in this trace over its life (region-vs-trace policy) */
     uint64_t deopts, deopt_iters; /* deopt exits taken, and loop iterations completed between them (demotion policy) */
     uint8_t dead;                 /* demoted: the loop is left to the region JIT */
     uint8_t nmod;                 /* module variables the trace keeps in scratch slots (mod_slot0 + k) of the frame */
@@ -852,6 +853,24 @@ static int ta_alloc_regs(const SpTraceIR *ir, const int32_t *phi_local, uint8_t 
         }
     }
 
+    /* Loads hoisted to the entry (before the first loop test) are live across every trip. */
+    {
+        size_t first_cmp = ir->count;
+        for (size_t i = 0U; i < ir->count && first_cmp == ir->count; i++) {
+            const SpTIROp o = ir->inst[i].op;
+            if (o >= SP_TIR_ICMP_EQ && o <= SP_TIR_FCMP_GE && !ta_is_entry_cmp(ir, i)) first_cmp = i;
+        }
+        for (size_t i = 0U; i < first_cmp; i++) {
+            const SpTIRInst *in = &ir->inst[i];
+            int picked;
+            if (in->op != SP_TIR_ALOAD || in->dst == 0U || in->dst > ir->nvalues) continue;
+            picked = jit_ra_alloc(&bank, (int32_t)in->dst);
+            if (picked < 0) goto done;
+            regs[in->dst] = (uint8_t)picked;
+            pinned[in->dst] = 1U;
+        }
+    }
+
     /* Comparison operands are live across every trip, even though their SSA
      * uses appear only once in the linear instruction list. */
     for (size_t i = 0U; i < ir->count; i++) {
@@ -913,6 +932,7 @@ static int ta_alloc_regs(const SpTraceIR *ir, const int32_t *phi_local, uint8_t 
         }
         if (in->dst == 0U || in->op == SP_TIR_PARAM || in->op == SP_TIR_PHI) continue;
         if (in->op == SP_TIR_NEWINST && in->aux == 1U) continue;   /* sunk: no code, no register */
+        if (pinned[in->dst]) continue;
         if (in->op == SP_TIR_CONST_I64 && ta_is_folded(ir, in->dst)) continue;
         if ((in->op == SP_TIR_ICMP_EQ || in->op == SP_TIR_ICMP_NE || in->op == SP_TIR_ICMP_LT ||
              in->op == SP_TIR_ICMP_LE || in->op == SP_TIR_ICMP_GT || in->op == SP_TIR_ICMP_GE ||
@@ -2754,40 +2774,6 @@ walked:
     if (depth != stack_depth) { why = "stack height changes"; goto done; }
     if (!have_exit) exit_pc = backedge + 5U;
 
-    /* the loop label is planted at the first comparison, and only its operands live across trips: that comparison must sit at the
-     * start of the iteration, with nothing but its own constants before it */
-    {
-        size_t first_cmp = ir->count, last_phi = 0U;
-        for (size_t i = 0U; i < ir->count; i++) {
-            const SpTIROp o = ir->inst[i].op;
-            if (o == SP_TIR_PHI) last_phi = i;
-            if (first_cmp == ir->count && o >= SP_TIR_ICMP_EQ && o <= SP_TIR_FCMP_GE && !ta_is_entry_cmp(ir, i)) first_cmp = i;
-        }
-        if (first_cmp == ir->count) { why = "no comparison"; goto done; }
-        for (size_t i = last_phi + 1U; i < first_cmp; i++) {
-            const SpTIRInst *in = &ir->inst[i];
-            int entry_part = (in->op >= SP_TIR_ICMP_EQ && in->op <= SP_TIR_ICMP_GE && ta_is_entry_cmp(ir, i)) ||
-                             (in->op == SP_TIR_GUARD_TRUE && (in->imm & SP_TIR_GUARD_ENTRY) != 0U) || in->op == SP_TIR_CGUARD;
-            if (!entry_part && ((in->op != SP_TIR_CONST_I64 && in->op != SP_TIR_CONST_F64) ||
-                                (in->dst != ir->inst[first_cmp].a && in->dst != ir->inst[first_cmp].b) ) ) {
-                /* a constant belonging to an entry guard is fine as well */
-                int used_by_entry = 0;
-                for (size_t k = last_phi + 1U; k < first_cmp; k++)
-                    if (ir->inst[k].op >= SP_TIR_ICMP_EQ && ir->inst[k].op <= SP_TIR_ICMP_GE && ta_is_entry_cmp(ir, k) &&
-                        (ir->inst[k].b == in->dst || ir->inst[k].a == in->dst)) used_by_entry = 1;
-                if (!used_by_entry || (in->op != SP_TIR_CONST_I64 && in->op != SP_TIR_CONST_F64)) { why = "work before the first comparison"; goto done; }
-            }
-        }
-        for (int side = 0; side < 2; side++) {
-            SpTIRValue v = side ? ir->inst[first_cmp].b : ir->inst[first_cmp].a;
-            int def_ok = 0;
-            for (size_t i = 0U; i < first_cmp && !def_ok; i++)
-                def_ok = ir->inst[i].dst == v && (ir->inst[i].op == SP_TIR_PHI || ir->inst[i].op == SP_TIR_CONST_I64 ||
-                                                  ir->inst[i].op == SP_TIR_CONST_F64);
-            if (!def_ok) { why = "first comparison operand is computed"; goto done; }
-        }
-    }
-
     for (uint32_t i = 0U; i < slot_total && nvobj != 0U; i++) {
         VObj *vo;
         if (!used[i]) continue;
@@ -2813,6 +2799,41 @@ walked:
     }
     for (uint32_t i = 0U; i < slot_total; i++)
         if (used[i] && !sp_tir_set_phi_backedge(ir, phi[i], current[i])) goto done;
+    if (sp_tir_hoist_loads(ir) < 0) goto done;
+    /* the loop label is planted at the first comparison, and only its operands live across trips: that comparison must sit at the
+     * start of the iteration, with nothing but its own constants before it */
+    {
+        size_t first_cmp = ir->count, last_phi = 0U;
+        for (size_t i = 0U; i < ir->count; i++) {
+            const SpTIROp o = ir->inst[i].op;
+            if (o == SP_TIR_PHI) last_phi = i;
+            if (first_cmp == ir->count && o >= SP_TIR_ICMP_EQ && o <= SP_TIR_FCMP_GE && !ta_is_entry_cmp(ir, i)) first_cmp = i;
+        }
+        if (first_cmp == ir->count) { why = "no comparison"; goto done; }
+        for (size_t i = last_phi + 1U; i < first_cmp; i++) {
+            const SpTIRInst *in = &ir->inst[i];
+            int entry_part = (in->op >= SP_TIR_ICMP_EQ && in->op <= SP_TIR_ICMP_GE && ta_is_entry_cmp(ir, i)) ||
+                             (in->op == SP_TIR_GUARD_TRUE && (in->imm & SP_TIR_GUARD_ENTRY) != 0U) || in->op == SP_TIR_CGUARD || in->op == SP_TIR_ALOAD;
+            if (!entry_part && ((in->op != SP_TIR_CONST_I64 && in->op != SP_TIR_CONST_F64) ||
+                                (in->dst != ir->inst[first_cmp].a && in->dst != ir->inst[first_cmp].b) ) ) {
+                /* a constant belonging to an entry guard is fine as well */
+                int used_by_entry = 0;
+                for (size_t k = last_phi + 1U; k < first_cmp; k++)
+                    if (ir->inst[k].op >= SP_TIR_ICMP_EQ && ir->inst[k].op <= SP_TIR_ICMP_GE && ta_is_entry_cmp(ir, k) &&
+                        (ir->inst[k].b == in->dst || ir->inst[k].a == in->dst)) used_by_entry = 1;
+                if (!used_by_entry || (in->op != SP_TIR_CONST_I64 && in->op != SP_TIR_CONST_F64)) { why = "work before the first comparison"; goto done; }
+            }
+        }
+        for (int side = 0; side < 2; side++) {
+            SpTIRValue v = side ? ir->inst[first_cmp].b : ir->inst[first_cmp].a;
+            int def_ok = 0;
+            for (size_t i = 0U; i < first_cmp && !def_ok; i++)
+                def_ok = ir->inst[i].dst == v && (ir->inst[i].op == SP_TIR_PHI || ir->inst[i].op == SP_TIR_CONST_I64 ||
+                                                  ir->inst[i].op == SP_TIR_CONST_F64);
+            if (!def_ok) { why = "first comparison operand is computed"; goto done; }
+        }
+    }
+
     if (!sp_tir_emit_loop(ir) || !trace_finish_ir(ir, slot_total, &phi_local)) goto done;
     *phi_local_out = phi_local; phi_local = NULL;
     *nmod_out = nmod;
@@ -2969,9 +2990,16 @@ int jit_trace_compile(VM *vm, Proto *p, uint32_t header, const TraceStep *steps,
     jp->trace_count++;
     jp->trace_bytes += cache_bytes;
     trace_mark_used(jp, tr);
+    debug = trace_debug_env();
+    if (debug && debug[0] == '2') {   /* SPRINT_TRACE_JIT_DEBUG=2: raw code to /tmp/sprint_trace_<name>_<header>.bin (objdump -D -b binary -mi386:x86-64) */
+        char path[160];
+        FILE *df;
+        (void)snprintf(path, sizeof path, "/tmp/sprint_trace_%s_%u.bin", p->name ? p->name : "x", header);
+        df = fopen(path, "wb");
+        if (df != NULL) { (void)fwrite(mem, 1U, as->len, df); (void)fclose(df); }
+    }
     mem = MAP_FAILED;
     tr = NULL;
-    debug = trace_debug_env();
     if (debug && debug[0] && debug[0] != '0') {
         (void)fprintf(stderr, "trace-jit: %s %s@%u depth=%u parent=%u body=%u exit=%u code=%zuB ir=%zu cache=%u/%zuB%s\n",
                       is_side ? "side-compiled" : "compiled", p->name ? p->name : "?",
@@ -2995,6 +3023,17 @@ done:
     free(phi_local);
     sp_tir_destroy(&ir);
     return ok;
+}
+
+/* iterations the traces of loops nested in [header, here] have run: a region around a loop that spends its time in such traces
+ * would swallow them (jit.c compile_region weighs this against the outer iteration count) */
+uint64_t jit_trace_inner_ticks(const Proto *p, uint32_t header, uint32_t here) {
+    const struct JitProto *jp = p->jit;
+    uint64_t total = 0U;
+    if (jp == NULL) return 0U;
+    for (const TraceRegion *tr = jp->traces; tr != NULL; tr = tr->next)
+        if (!tr->is_side && !tr->dead && tr->entry != NULL && tr->header > header && tr->header < here) total += tr->ticks + 1U;
+    return total;
 }
 
 int jit_trace_site(VM *vm, Proto *p, const uint8_t *hdr, SpValue *base, SpValue *sp,
@@ -3033,7 +3072,8 @@ int jit_trace_site(VM *vm, Proto *p, const uint8_t *hdr, SpValue *base, SpValue 
      * compatible trace's entry guards once; its MISS snapshot then becomes
      * the parent of a Side-of-Side. The total descendant budget remains four
      * per root, with a maximum nesting depth of three. */
-    first = trace_find_signature(root, base, stack_depth);
+    /* a root without side traces is simply entered: its own entry guards leave through MISS on a wrong shape */
+    first = root->side_count == 0U && root->snapshot_set.loop_map.stack_depth == stack_depth ? root : trace_find_signature(root, base, stack_depth);
     if (first == NULL) {
         if (trace_side_total(root) >= TRACE_SIDE_MAX) return 0;
         first = trace_choose_miss_parent(root, stack_depth);
@@ -3050,6 +3090,7 @@ int jit_trace_site(VM *vm, Proto *p, const uint8_t *hdr, SpValue *base, SpValue 
         for (unsigned k = 0U; k < first->nmod; k++) base[first->mod_slot0 + k] = vm->slots[first->mod_idx[k]];
     }
     result = first->entry(base, &vm->ileft);
+    if (budget_before >= vm->ileft) first->ticks += budget_before - vm->ileft;
     if (first->nmod != 0U)
         for (unsigned k = 0U; k < first->nmod; k++) vm->slots[first->mod_idx[k]] = base[first->mod_slot0 + k];
     if (result == UINT32_MAX ||
@@ -3107,7 +3148,7 @@ int jit_trace_site(VM *vm, Proto *p, const uint8_t *hdr, SpValue *base, SpValue 
     fr->pc = restored_pc;
     vm->sp = restored_sp;
     if (vm->bytes >= vm->gc_next) vm_gc(vm);   /* a trace that allocates left at its back edge: the frame is consistent again */
-    requested_signature = miss_parent != NULL ?
+    requested_signature = miss_parent != NULL && snapshot_kind == SP_JIT_SNAPSHOT_MISS ?
         trace_signature_hash(miss_parent, base, stack_depth) : 0U;
     if (snapshot_kind == SP_JIT_SNAPSHOT_MISS && miss_parent != NULL &&
         miss_parent->nmod == 0U && miss_parent->side_count < TRACE_SIDE_MAX && miss_parent->depth < TRACE_SIDE_DEPTH_MAX &&

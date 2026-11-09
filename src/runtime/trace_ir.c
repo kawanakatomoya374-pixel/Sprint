@@ -359,6 +359,66 @@ int sp_tir_mark_virtual(SpTraceIR *ir, SpTIRValue value, uint64_t cls) {
     }
     return 0;
 }
+/* Loop-invariant array reads (`a[i]` where neither the array nor the index changes in the loop, and nothing in the trace stores into
+ * an array) are moved to the entry, after the PHIs: they run once instead of every trip. Their constants move with them. The
+ * instruction list is rebuilt in the new order and the values are renumbered. Returns the number of loads moved, or -1 on error. */
+int sp_tir_hoist_loads(SpTraceIR *ir) {
+    size_t n = ir->count, last_phi = 0U, nh = 0U, out = 0U;
+    uint8_t *inv = NULL, *move = NULL;
+    size_t *order = NULL;
+    SpTIRValue *remap = NULL;
+    SpTIRInst *copy = NULL;
+    SpTIRType *types = NULL;
+    int rc = -1;
+    for (size_t i = 0U; i < n; i++) {
+        if (ir->inst[i].op == SP_TIR_ASTORE) return 0;
+        if (ir->inst[i].op == SP_TIR_PHI) last_phi = i;
+    }
+    inv = (uint8_t *)calloc((size_t)ir->nvalues + 1U, 1U);
+    move = (uint8_t *)calloc(n, 1U);
+    order = (size_t *)malloc(n * sizeof *order);
+    remap = (SpTIRValue *)calloc((size_t)ir->nvalues + 1U, sizeof *remap);
+    copy = (SpTIRInst *)malloc(n * sizeof *copy);
+    types = (SpTIRType *)calloc(ir->type_capacity, sizeof *types);
+    if (!inv || !move || !order || !remap || !copy || !types) goto done;
+    for (size_t i = 0U; i < n; i++) {
+        const SpTIRInst *in = &ir->inst[i];
+        if (in->op == SP_TIR_PHI && in->b == in->dst && in->aux == 0U) inv[in->dst] = 1U;
+        else if (in->op == SP_TIR_CONST_I64 && i > last_phi) inv[in->dst] = 1U;
+        else if (in->op == SP_TIR_ALOAD && i > last_phi && inv[in->a] && inv[in->b]) { inv[in->dst] = 1U; move[i] = 2U; nh++; }
+    }
+    if (nh == 0U) { rc = 0; goto done; }
+    /* the constants a moved load uses move too (they are pure) */
+    for (size_t i = 0U; i < n; i++)
+        if (move[i] == 2U)
+            for (size_t k = last_phi + 1U; k < i; k++)
+                if (ir->inst[k].op == SP_TIR_CONST_I64 && (ir->inst[k].dst == ir->inst[i].b || ir->inst[k].dst == ir->inst[i].a)) move[k] = 1U;
+    for (size_t i = 0U; i <= last_phi; i++) order[out++] = i;
+    for (size_t i = last_phi + 1U; i < n; i++) if (move[i]) order[out++] = i;
+    for (size_t i = last_phi + 1U; i < n; i++) if (!move[i]) order[out++] = i;
+    {
+        SpTIRValue next = 0U;
+        for (size_t k = 0U; k < n; k++) {
+            const SpTIRInst *in = &ir->inst[order[k]];
+            if (in->dst != SP_TIR_NO_VALUE) remap[in->dst] = ++next;
+        }
+        for (size_t k = 0U; k < n; k++) {
+            SpTIRInst in = ir->inst[order[k]];
+            if (in.dst != SP_TIR_NO_VALUE) { types[remap[in.dst]] = ir->value_types[in.dst]; in.dst = remap[in.dst]; }
+            if (in.a != SP_TIR_NO_VALUE) in.a = remap[in.a];
+            if (in.b != SP_TIR_NO_VALUE) in.b = remap[in.b];
+            if (in.op == SP_TIR_ASTORE || in.op == SP_TIR_FSTORE) in.aux = remap[in.aux];
+            copy[k] = in;
+        }
+    }
+    memcpy(ir->inst, copy, n * sizeof *copy);
+    memcpy(ir->value_types, types, ir->type_capacity * sizeof *types);
+    rc = (int)nh;
+done:
+    free(inv); free(move); free(order); free(remap); free(copy); free(types);
+    return rc;
+}
+
 int sp_tir_emit_ucell(SpTraceIR *ir, SpTIRValue fn, uint32_t idx, SpTIRValue *out) {
     SpTIRType t;
     if (!tir_value_type(ir, fn, &t) || t != SP_TIR_T_REF) return 0;

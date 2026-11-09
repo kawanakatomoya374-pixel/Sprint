@@ -91,6 +91,7 @@ typedef struct JRegion {
     uint32_t hdr;
     int state;
     int cnt;
+    uint64_t dticks;         /* inner-trace iterations seen at the last deferral decision */
     int d0;
     int (*fn)(VM *, SpValue *, const SpValue *, Frame *);
     void *mem;
@@ -148,6 +149,7 @@ static void *jit_new_inst(VM *vm, SClass *k) {
     return ci;
 }
 
+static int g_jit_defer;       /* compile_region declined for now and wants to be asked again */
 static SpValue g_hint_int;   /* "probably an int": the guess for the result of a call */
 static SpValue g_hint_string; /* a result known to be a string; every use still has a run-time type guard */
 static int g_jit_stats;       /* opt-in compiler-shape diagnostics; zero-cost when disabled */
@@ -3470,6 +3472,16 @@ static int compile_region(VM *vm, Proto *p, JRegion *r, SFunc *fn, SpValue *base
         if (end == 0) { c->why = "no back edge"; goto done; }
     }
     c->end = end;
+    /* an inner loop that the TraceJIT already runs stays with it: a region around both would swallow the trace */
+    if (p->trace_any && !c->unit) {
+        const uint64_t t = jit_trace_inner_ticks(p, c->hdr, end);
+        if (t != 0U) {
+            const uint64_t delta = t - r->dticks;
+            r->dticks = t;
+            /* decided per window of outer iterations: an inner loop that runs long stays a trace, the outer loop stays interpreted */
+            if (delta / (uint64_t)vm->jit_thresh >= 64U) { c->why = "inner loop runs as a trace"; g_jit_defer = 1; goto done; }
+        }
+    }
     if (end - c->hdr > 6000) { c->why = "region too large"; goto done; }
     if (!jc_setup(c, end - c->hdr)) { c->why = "out of memory"; goto done; }
 
@@ -3776,7 +3788,9 @@ int jit_site(VM *vm, Proto *p, const uint8_t *hdr, SpValue *base, SpValue *sp) {
     SpValue *stk = base + p->nlocals;
     if (r->state == JS_NEW) {
         if (++r->cnt < vm->jit_thresh) return 0;
+        g_jit_defer = 0;
         r->state = compile_region(vm, p, r, vm->frames[vm->nframes - 1].fn, base, (int)(sp - stk)) ? JS_OK : JS_FAIL;
+        if (r->state == JS_FAIL && g_jit_defer) { r->state = JS_NEW; r->cnt = 0; return 0; }
         if (r->state == JS_OK) jp->nok++;
     }
     if (r->state != JS_OK) {

@@ -247,7 +247,8 @@ int sp_jit_snapshot_restore(const SpJitSnapshot *snapshot, const Proto *proto,
                             SpValue **sp_out, const uint8_t **pc_out) {
     if (frame == NULL || base == NULL || sp_out == NULL || pc_out == NULL ||
         frame->fn == NULL || frame->fn->proto != proto || frame->base != base ||
-        proto == NULL || proto->code == NULL || !snapshot_shape_valid(snapshot, proto)) return 0;
+        proto == NULL || proto->code == NULL || snapshot == NULL || snapshot->map == NULL ||
+        snapshot->resume_pc > proto->code_len) return 0;   /* the shape was validated when the trace was compiled */
     for (uint16_t i = 0U; i < snapshot->map->entry_count; i++) {
         const SpJitSnapshotEntry *entry = &snapshot->map->entries[i];
         if (entry->source == (uint8_t)SP_JIT_SNAPSHOT_FROM_IR &&

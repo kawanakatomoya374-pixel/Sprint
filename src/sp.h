@@ -912,6 +912,7 @@ typedef struct TraceStep { const Proto *proto; uint32_t pc; uint8_t op; } TraceS
 int jit_trace_compile(VM *vm, Proto *p, uint32_t header, const TraceStep *steps, unsigned count,
                       uint32_t stack_depth, int is_side, uint8_t parent_slot);
 /* 0 = not run, 1 = trace ran, 2 = MISS restored and side recording requested. */
+uint64_t jit_trace_inner_ticks(const Proto *p, uint32_t header, uint32_t here);
 int jit_trace_site(VM *vm, Proto *p, const uint8_t *hdr, SpValue *base, SpValue *sp,
                    uint8_t *side_parent_slot_out);
 /* Called from OP_CALL: after the call countdown ran out. Returns the unit to enter, or NULL. */
