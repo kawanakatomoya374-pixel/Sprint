@@ -48,7 +48,7 @@ static int ctor_shape(const SClass *cls, SpValue *d, int *any, SFunc **init) {
         const SString *key = NULL;
         for (int k = 0; k < p->nconsts && !key; k++) {
             const SpValue *cv = &p->consts[k];
-            if (cv->type == T_STRING && AS_STR(*cv)->len == 4 && memcmp(AS_STR(*cv)->data, "init", 4) == 0) key = AS_STR(*cv);
+            if (cv->type == T_STRING && AS_STR(*cv)->len == 4 && memcmp(AS_STR(*cv)->dp, "init", 4) == 0) key = AS_STR(*cv);
         }
         SpValue mv;
         if (!key || !table_get_sstr(cls->methods, key, &mv) || mv.type != T_FUNCTION || AS_FUNC(mv)->nat) return 0;

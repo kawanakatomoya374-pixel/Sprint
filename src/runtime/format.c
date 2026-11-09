@@ -31,7 +31,7 @@ void fmt_float(double d, char *buf) {
 static void put_repr_string(Out *o, SString *s) {
     out_put(o, "\"", 1);
     for (uint32_t i = 0; i < s->len; i++) {
-        unsigned char c = (unsigned char)s->data[i];
+        unsigned char c = (unsigned char)s->dp[i];
         char tmp[8];
         if (c == '"') out_put(o, "\\\"", 2);
         else if (c == '\\') out_put(o, "\\\\", 2);
@@ -84,7 +84,7 @@ void fmt_value(VM *vm, SpValue v, int depth, int repr, Out *o) {
     case T_FLOAT: fmt_float(v.as.f, buf); out_put(o, buf, strlen(buf)); break;
     case T_STRING:
         if (repr) put_repr_string(o, AS_STR(v));
-        else out_put(o, AS_STR(v)->data, AS_STR(v)->len);
+        else out_put(o, AS_STR(v)->dp, AS_STR(v)->len);
         break;
     case T_ARRAY: {
         SArray *a = AS_ARRAY(v);
@@ -139,7 +139,7 @@ void fmt_value(VM *vm, SpValue v, int depth, int repr, Out *o) {
     }
     case T_CLASS: {
         out_put(o, "<class ", 7);
-        out_put(o, AS_CLASS(v)->name->data, AS_CLASS(v)->name->len);
+        out_put(o, AS_CLASS(v)->name->dp, AS_CLASS(v)->name->len);
         out_put(o, ">", 1);
         break;
     }
@@ -147,23 +147,23 @@ void fmt_value(VM *vm, SpValue v, int depth, int repr, Out *o) {
         SInstance *in = AS_INSTANCE(v);
         int n = snprintf(buf, sizeof buf, " #%llu>", (unsigned long long)in->h.id);
         out_put(o, "<", 1);
-        out_put(o, in->cls->name->data, in->cls->name->len);
+        out_put(o, in->cls->name->dp, in->cls->name->len);
         out_put(o, buf, (size_t)n);
         break;
     }
     case T_MODULE: {
         SModule *m = AS_MODULE(v);
         out_put(o, "<module ", 8);
-        out_put(o, m->name->data, m->name->len);
+        out_put(o, m->name->dp, m->name->len);
         out_put(o, ">", 1);
         break;
     }
     case T_ERROR: {
         SError *e = AS_ERROR(v);
         out_put(o, "<", 1);
-        out_put(o, e->kind->data, e->kind->len);
+        out_put(o, e->kind->dp, e->kind->len);
         out_put(o, ": ", 2);
-        out_put(o, e->message->data, e->message->len);
+        out_put(o, e->message->dp, e->message->len);
         out_put(o, ">", 1);
         break;
     }
@@ -181,7 +181,7 @@ SString *vm_to_string(VM *vm, SpValue v) {
     fmt_value(vm, v, 0, 0, &m);
     SString *s = vm_alloc_string(vm, m.len);
     Out w = {0};
-    w.dst = s->data;
+    w.dst = s->dp;
     w.cap = m.len;
     fmt_value(vm, v, 0, 0, &w);
     string_finish(s);

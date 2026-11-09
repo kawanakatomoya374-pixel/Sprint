@@ -124,7 +124,7 @@ static int sort_less(VM *vm, SpValue cmp, SpValue a, SpValue b, int *less) {
     else if (a.type == T_STRING && b.type == T_STRING) {
         SString *x = AS_STR(a), *y = AS_STR(b);
         size_t n = x->len < y->len ? x->len : y->len;
-        c = memcmp(x->data, y->data, n);
+        c = memcmp(x->dp, y->dp, n);
         if (c == 0) c = x->len < y->len ? -1 : x->len > y->len;
     } else {
         return vm_set_error(vm, E_TYPE, "cannot sort %s with %s", type_name(a), type_name(b));
@@ -375,9 +375,9 @@ int lib_invoke_builtin_method_s(VM *vm, SpValue recv, const SString *name, int a
         d = NULL;
         if (ncls) {
             for (const NativeDesc *m = ncls->methods; m && m->name; m++)
-                if (strncmp(m->name, name->data, name->len) == 0 && m->name[name->len] == 0) { d = m; break; }
+                if (strncmp(m->name, name->dp, name->len) == 0 && m->name[name->len] == 0) { d = m; break; }
         } else {
-            d = find_method(recv.type, name->data, name->len, str_hash_peek(name));
+            d = find_method(recv.type, name->dp, name->len, str_hash_peek(name));
         }
         if (d) { e->name = name; e->ncls = ncls; e->type = recv.type; e->d = d; }
     }

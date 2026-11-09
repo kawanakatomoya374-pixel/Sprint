@@ -638,14 +638,16 @@ static int ta_push(TraceAsm *a, uint8_t reg) {
 }
 /* dst = byte `rb` of the string in ra; an index outside 0 .. len-1 deoptimises */
 static int ta_sload(TraceAsm *a, uint8_t dst, uint8_t ra, uint8_t rb) {
-    TracePatch lp = ta_patch(), sp = ta_patch();
+    TracePatch lp = ta_patch(), dp = ta_patch(), sp = ta_patch();
     lp.b[0] = (uint8_t)(0x44U | (ra >= 8U ? 0x01U : 0U));
     lp.b[1] = (uint8_t)(0x90U | (ra & 7U));
-    sp.b[0] = (uint8_t)(0x40U | (dst >= 8U ? 0x04U : 0U) | (rb >= 8U ? 0x02U : 0U) | (ra >= 8U ? 0x01U : 0U));
-    sp.b[1] = (uint8_t)(0x80U | ((dst & 7U) << 3) | 4U);
-    sp.b[2] = (uint8_t)(((rb & 7U) << 3) | (ra & 7U));
+    dp.b[0] = (uint8_t)(0x4cU | (ra >= 8U ? 0x01U : 0U));
+    dp.b[1] = (uint8_t)(0x90U | (ra & 7U));
+    sp.b[0] = (uint8_t)(0x41U | (dst >= 8U ? 0x04U : 0U) | (rb >= 8U ? 0x02U : 0U));
+    sp.b[1] = (uint8_t)(((dst & 7U) << 3) | 4U);
+    sp.b[2] = (uint8_t)(((rb & 7U) << 3) | 2U);
     return ta_stencil(a, ST_tr_sstr_len, &lp) && ta_reg_binop(a, rb, 10U, 0x39U) && ta_jcc(a, 0x83U, TA_DEOPT) &&
-           ta_stencil(a, ST_tr_sload, &sp);
+           ta_stencil(a, ST_tr_sstr_dp, &dp) && ta_stencil(a, ST_tr_sload, &sp);
 }
 static int ta_leaf_call(TraceAsm *a, uint8_t dst, uint8_t ra, uint8_t rb, uint64_t fn) {
     TracePatch p = ta_patch();

@@ -294,7 +294,7 @@ static const uint8_t *ja_glyph(uint32_t cp) {
 static int cp_advance(uint32_t cp) { return ja_glyph(cp) ? 12 : 6; }
 
 static void draw_text(Canvas *c, int x, int y, const SString *s, uint32_t col, int scale) {
-    const unsigned char *d = (const unsigned char *)s->data;
+    const unsigned char *d = (const unsigned char *)s->dp;
     size_t i = 0, n = s->len;
     int cx = x;
     while (i < n) {
@@ -344,7 +344,7 @@ static void draw_text(Canvas *c, int x, int y, const SString *s, uint32_t col, i
 
 /* total advance of the widest line, in pixels (a Japanese glyph is 12 wide, other characters 6) */
 static int64_t text_advance(const SString *s, int scale) {
-    const unsigned char *d = (const unsigned char *)s->data;
+    const unsigned char *d = (const unsigned char *)s->dp;
     size_t i = 0, n = s->len;
     int64_t cur = 0, best = 0;
     while (i < n) {
@@ -574,7 +574,7 @@ static int encode_bmp(const Canvas *c, Buf *out) {
 static int save_file(VM *vm, SpValue pathv, const Buf *b, const char *op) {
     char rp[PATH_MAX];
     if (lib_fs_check(vm, pathv, 1, op, rp)) return 1;
-    const char *orig = AS_STR(pathv)->data;
+    const char *orig = AS_STR(pathv)->dp;
     char tmp[PATH_MAX + 32];
     (void)snprintf(tmp, sizeof tmp, "%.*s.sprint-tmp-%ld", PATH_MAX, rp, (long)getpid());
     FILE *f = fopen(tmp, "wb");

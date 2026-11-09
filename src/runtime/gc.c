@@ -48,7 +48,12 @@ __attribute__((noinline))
 #endif
 static void mark_obj_new(VM *vm, Obj *o) {
     if (o->type == T_STRING) {
-        o->marked = 2U; /* strings have no outgoing references */
+        SString *ss = (SString *)o;
+        o->marked = 2U; /* strings have no outgoing references ... */
+        if (ss->dp != ss->idata) {   /* ... except a string sharing a buffer, which keeps the hidden owner string alive */
+            SString *own = (SString *)(void *)(ss->dp - offsetof(SString, idata));
+            own->h.marked = 2U;
+        }
         return;
     }
     o->marked = 1U; /* gray: queued, or discoverable by the fallback heap scan */
@@ -163,7 +168,7 @@ static void blacken(VM *vm, Obj *o) {
 
 static size_t obj_size(Obj *o) {
     switch (o->type) {
-    case T_STRING: return offsetof(SString, data) + ((SString *)o)->len + 1;
+    case T_STRING: return ((SString *)o)->dp != ((SString *)o)->idata ? offsetof(SString, idata) : offsetof(SString, idata) + ((SString *)o)->len + 1;
     case T_ARRAY: return sizeof(SArray) + (size_t)((SArray *)o)->cap * sizeof(SpValue);
     case T_TABLE: {
         STable *t = (STable *)o;

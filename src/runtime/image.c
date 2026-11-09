@@ -119,7 +119,7 @@ uint8_t *image_encode(const Program *pg, size_t *out_len) {
                 b_u64(&protos, bits);
                 break;
             }
-            case T_STRING: b_u8(&protos, 5); b_u32(&protos, st_intern(&st, AS_STR(v)->data, AS_STR(v)->len)); break;
+            case T_STRING: b_u8(&protos, 5); b_u32(&protos, st_intern(&st, AS_STR(v)->dp, AS_STR(v)->len)); break;
             default: b_u8(&protos, 0); break;
             }
         }

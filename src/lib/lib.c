@@ -137,8 +137,8 @@ static int n_to_int(VM *vm, int argc, SpValue *argv, SpValue *ret) {
     }
     if (v.type == T_STRING) {
         int64_t r;
-        if (!parse_int_text(AS_STR(v)->data, AS_STR(v)->len, &r))
-            return vm_set_error(vm, E_VALUE, "invalid integer literal: \"%s\"", AS_STR(v)->data);
+        if (!parse_int_text(AS_STR(v)->dp, AS_STR(v)->len, &r))
+            return vm_set_error(vm, E_VALUE, "invalid integer literal: \"%s\"", AS_STR(v)->dp);
         *ret = v_int(r);
         return 0;
     }
@@ -152,14 +152,14 @@ static int n_to_float(VM *vm, int argc, SpValue *argv, SpValue *ret) {
     if (v.type == T_FLOAT) { *ret = v; return 0; }
     if (v.type == T_STRING) {
         const SString *s = AS_STR(v);
-        if (strcmp(s->data, "inf") == 0) { *ret = v_float((double)INFINITY); return 0; }
-        if (strcmp(s->data, "-inf") == 0) { *ret = v_float(-(double)INFINITY); return 0; }
-        if (strcmp(s->data, "nan") == 0) { *ret = v_float((double)NAN); return 0; }
+        if (s->len == 3U && memcmp(s->dp, "inf", 3) == 0) { *ret = v_float((double)INFINITY); return 0; }
+        if (s->len == 4U && memcmp(s->dp, "-inf", 4) == 0) { *ret = v_float(-(double)INFINITY); return 0; }
+        if (s->len == 3U && memcmp(s->dp, "nan", 3) == 0) { *ret = v_float((double)NAN); return 0; }
         char buf[128];
         size_t bl = 0;
         int ok = s->len > 0 && s->len < sizeof buf;
         for (size_t i = 0; ok && i < s->len; i++) {
-            char c = s->data[i];
+            char c = s->dp[i];
             if (c == '_') continue;
             if (!((c >= '0' && c <= '9') || c == '.' || c == 'e' || c == 'E' || c == '+' || c == '-')) ok = 0;
             else buf[bl++] = c;
@@ -170,7 +170,7 @@ static int n_to_float(VM *vm, int argc, SpValue *argv, SpValue *ret) {
             double d = strtod(buf, &end);
             if (bl > 0 && *end == 0 && !isinf(d)) { *ret = v_float(d); return 0; }
         }
-        return vm_set_error(vm, E_VALUE, "invalid float literal: \"%s\"", s->data);
+        return vm_set_error(vm, E_VALUE, "invalid float literal: \"%s\"", s->dp);
     }
     return vm_set_error(vm, E_TYPE, "to_float() argument must be int, float or string, not %s", type_name(v));
 }
@@ -204,11 +204,11 @@ static int n_range(VM *vm, int argc, SpValue *argv, SpValue *ret) {
 static int n_error(VM *vm, int argc, SpValue *argv, SpValue *ret) {
     if (need_str(vm, argv[0], "error kind") || need_str(vm, argv[1], "error message")) return 1;
     SString *k = AS_STR(argv[0]);
-    int code = err_kind_code(k->data, k->len);
-    if (code < 0) return vm_set_error(vm, E_VALUE, "'%s' is not a constructible error kind", k->data);
+    int code = err_kind_code(k->dp, k->len);
+    if (code < 0) return vm_set_error(vm, E_VALUE, "'%s' is not a constructible error kind", k->dp);
     if (code == 0) {
         code = E_USER;
-        if (k->len == 0 || !(isalpha((unsigned char)k->data[0]) || k->data[0] == '_'))
+        if (k->len == 0 || !(isalpha((unsigned char)k->dp[0]) || k->dp[0] == '_'))
             return vm_set_error(vm, E_VALUE, "error kind must be an identifier");
     }
     SpValue cause = argc > 2 ? argv[2] : v_nil();
@@ -363,7 +363,7 @@ int lib_module_has(const ModDesc *m, const char *member, size_t len) {
 
 SpValue lib_module_value(VM *vm, const char *name) {
     for (int i = 0; i < vm->nroots; i++)
-        if (vm->roots[i].type == T_MODULE && strcmp(AS_MODULE(vm->roots[i])->name->data, name) == 0)
+        if (vm->roots[i].type == T_MODULE && strcmp(AS_MODULE(vm->roots[i])->name->dp, name) == 0)
             return vm->roots[i];
     const ModDesc *d = lib_find_module(vm, name, strlen(name));
     SModule *m = vm_new_module(vm, name);

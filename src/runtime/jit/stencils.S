@@ -1535,7 +1535,8 @@ ST sget
     mov L_SSTR_LEN(%rax),%edx
     cmp %rdx,%rcx
     jae JIT_X
-    movzbl L_SSTR_DATA(%rax,%rcx),%eax
+    mov L_SSTR_DP(%rax),%rax
+    movzbl (%rax,%rcx),%eax
     movq $T_INT,H0(%r12)
     mov %rax,H0+8(%r12)
 
@@ -1933,9 +1934,12 @@ ST tr_sstr_len                  # r10d = length of the string in ra: HB0 = REX(.
     .byte HB0, 0x8b, HB1
     .long L_SSTR_LEN
 
-ST tr_sload                     # dst = byte at [ra + rb + data] (zero-extended): HB0 = REX, HB1 = modrm (mod 10, reg dst, rm 100), HB2 = SIB (index rb, base ra)
+ST tr_sstr_dp                   # r10 = the string's data pointer: HB0 = REX.W + R(r10) + B, HB1 = modrm (mod 10, reg r10, rm ra)
+    .byte HB0, 0x8b, HB1
+    .long L_SSTR_DP
+
+ST tr_sload                     # dst = byte at [r10 + rb] (zero-extended): HB0 = REX (.R dst .X rb .B r10), HB1 = modrm (mod 00, reg dst, rm 100), HB2 = SIB (index rb, base r10)
     .byte HB0, 0x0f, 0xb6, HB1, HB2
-    .long L_SSTR_DATA
 
 ST tr_push                      # push a register: HB0 = 0x40 | REX.B, HB1 = 0x50 | reg
     .byte HB0, HB1

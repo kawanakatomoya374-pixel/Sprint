@@ -391,7 +391,7 @@ static RunStatus RUN_LOOP_NAME(VM *vm, VMTraceCapture **capp, RunCold *ccold, in
             if (total > vm->lim.max_string_bytes) vm_fatal(vm, RS_MEMORY, "string length limit exceeded");
             SString *s = vm_alloc_string(vm, total);
             Out w = {0};
-            w.dst = s->data;
+            w.dst = s->dp;
             w.cap = total;
             for (unsigned i = 0; i < n; i++) fmt_value(vm, sp[-(int)n + (int)i], 0, 0, &w);
             string_finish(s);
@@ -638,7 +638,7 @@ static RunStatus RUN_LOOP_NAME(VM *vm, VMTraceCapture **capp, RunCold *ccold, in
                     break;
                 }
                 if (recv.type == T_ARRAY && nargs == 1 && str_hash(mname) == vm->h_append && mname->len == 6 &&
-                    memcmp(mname->data, "append", 6) == 0 && AS_ARRAY(recv)->len < AS_ARRAY(recv)->cap) {
+                    memcmp(mname->dp, "append", 6) == 0 && AS_ARRAY(recv)->len < AS_ARRAY(recv)->cap) {
                     /* array.append without growth: no allocation, no GC point */
                     SArray *aa = AS_ARRAY(recv);
                     array_note_push(aa, ov[1]);
@@ -656,7 +656,7 @@ static RunStatus RUN_LOOP_NAME(VM *vm, VMTraceCapture **capp, RunCold *ccold, in
                     left = vm->ileft;
                     if (nerr) RAISE();
                     if (!found) {
-                        (void)vm_set_error(vm, E_NAME, "'%s' has no method '%s'", type_name(recv), mname->data);
+                        (void)vm_set_error(vm, E_NAME, "'%s' has no method '%s'", type_name(recv), mname->dp);
                         RAISE();
                     }
                     sp = ov;
@@ -680,14 +680,14 @@ static RunStatus RUN_LOOP_NAME(VM *vm, VMTraceCapture **capp, RunCold *ccold, in
                         sp++;
                         nargs++;
                     } else {
-                        (void)vm_set_error(vm, E_NAME, "'%s' instance has no field or method '%s'", in->cls->name->data, mname->data);
+                        (void)vm_set_error(vm, E_NAME, "'%s' instance has no field or method '%s'", in->cls->name->dp, mname->dp);
                         RAISE();
                     }
                 } else if (recv.type == T_CLASS) {
                     if (get_member(vm, recv, mname, &fv)) RAISE();
                     *ov = fv;
                 } else {
-                    (void)vm_set_error(vm, E_TYPE, "'%s' object has no method '%s'", type_name(recv), mname->data);
+                    (void)vm_set_error(vm, E_TYPE, "'%s' object has no method '%s'", type_name(recv), mname->dp);
                     RAISE();
                 }
             }
@@ -924,8 +924,8 @@ static RunStatus RUN_LOOP_NAME(VM *vm, VMTraceCapture **capp, RunCold *ccold, in
             SpValue *ov = sp - n - 1;
             SYNC();
             if (ov->type == T_ARRAY || ov->type == T_STRING) {
-                if (!sp_invoke_method_exists(ov->type, mname->data, mname->len)) {
-                    (void)vm_set_error(vm, E_NAME, "'%s' has no method '%s'", type_name(*ov), mname->data);
+                if (!sp_invoke_method_exists(ov->type, mname->dp, mname->len)) {
+                    (void)vm_set_error(vm, E_NAME, "'%s' has no method '%s'", type_name(*ov), mname->dp);
                     RAISE();
                 }
                 defer_register(vm, ov, n + 1, mname);
@@ -933,7 +933,7 @@ static RunStatus RUN_LOOP_NAME(VM *vm, VMTraceCapture **capp, RunCold *ccold, in
                 SpValue fv;
                 int nv = n + 1;
                 if (ov->type != T_TABLE && ov->type != T_MODULE && ov->type != T_INSTANCE && ov->type != T_CLASS) {
-                    (void)vm_set_error(vm, E_TYPE, "'%s' object has no method '%s'", type_name(*ov), mname->data);
+                    (void)vm_set_error(vm, E_TYPE, "'%s' object has no method '%s'", type_name(*ov), mname->dp);
                     RAISE();
                 }
                 if (get_member(vm, *ov, mname, &fv)) RAISE();
@@ -986,7 +986,7 @@ static RunStatus RUN_LOOP_NAME(VM *vm, VMTraceCapture **capp, RunCold *ccold, in
             int code = (int)U8();
             SString *m = AS_STR(proto->consts[U16()]);
             SYNC();
-            (void)vm_set_error(vm, code, "%s", m->data);
+            (void)vm_set_error(vm, code, "%s", m->dp);
             RAISE();
         }
         case OP_CLASS: {
@@ -1054,8 +1054,8 @@ static RunStatus RUN_LOOP_NAME(VM *vm, VMTraceCapture **capp, RunCold *ccold, in
             SpValue v = sp[-1];
             int has = 0;
             SpValue tmp;
-            if (v.type == T_TABLE) has = table_get_str(AS_TABLE(v), k->data, k->len, &tmp);
-            else if (v.type == T_INSTANCE) has = table_get_str(AS_INSTANCE(v)->cls->fields, k->data, k->len, &tmp);
+            if (v.type == T_TABLE) has = table_get_str(AS_TABLE(v), k->dp, k->len, &tmp);
+            else if (v.type == T_INSTANCE) has = table_get_str(AS_INSTANCE(v)->cls->fields, k->dp, k->len, &tmp);
             sp[-1] = v_bool(has);
             break;
         }
@@ -1676,7 +1676,7 @@ static RunStatus RUN_LOOP_NAME(VM *vm, VMTraceCapture **capp, RunCold *ccold, in
                 if (!cc->init) {
                     if (nargs > 0) {
                         SYNC();
-                        (void)vm_set_error(vm, E_TYPE, "%s() takes no arguments but %d were given", cc->name->data, nargs);
+                        (void)vm_set_error(vm, E_TYPE, "%s() takes no arguments but %d were given", cc->name->dp, nargs);
                         RAISE();
                     }
                     *cf = v_obj(T_INSTANCE, ci);
@@ -1941,7 +1941,7 @@ static RunStatus RUN_LOOP_NAME(VM *vm, VMTraceCapture **capp, RunCold *ccold, in
             if (top == 0) {
                 vm->sp = sp;
                 if (is_panic) {
-                    (void)snprintf(vm->fatal_msg, sizeof vm->fatal_msg, "%s", AS_ERROR(ev)->message->data);
+                    (void)snprintf(vm->fatal_msg, sizeof vm->fatal_msg, "%s", AS_ERROR(ev)->message->dp);
                     vm->fatal_status = RS_PANIC;
                     RET(RS_PANIC);
                 }

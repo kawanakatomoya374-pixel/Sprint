@@ -130,7 +130,7 @@ void *new_obj(VM *vm, size_t size, int type, int with_id) { return new_obj_z(vm,
 /* size of the object header block as allocated by new_obj */
 static size_t obj_hdr_size(const Obj *o) {
     switch (o->type) {
-    case T_STRING: return offsetof(SString, data) + ((const SString *)o)->len + 1;
+    case T_STRING: return ((const SString *)o)->dp != ((const SString *)o)->idata ? offsetof(SString, idata) : offsetof(SString, idata) + ((const SString *)o)->len + 1;
     case T_ARRAY: return sizeof(SArray);
     case T_TABLE: return sizeof(STable);
     case T_FUNCTION: return sizeof(SFunc);
@@ -175,10 +175,16 @@ uint32_t sp_hash_bytes(const char *s, size_t n) {
 SString *vm_alloc_string(VM *vm, size_t len) {
     if (len > vm->lim.max_string_bytes)
         vm_fatal(vm, RS_MEMORY, "string length limit exceeded");
-    SString *s = new_obj_z(vm, offsetof(SString, data) + len + 1, offsetof(SString, data), T_STRING, 0);
+    SString *s = new_obj_z(vm, offsetof(SString, idata) + len + 1, offsetof(SString, idata), T_STRING, 0);
     s->len = (uint32_t)len;
-    s->data[len] = 0;
+    s->dp = s->idata;
+    s->idata[len] = 0;
     return s;
+}
+
+const char *str_z(VM *vm, const SString *s) {
+    if (s->dp == s->idata) return s->dp;
+    return vm_new_string(vm, s->dp, s->len)->dp;
 }
 
 uint32_t str_hash_calc(const char *s, size_t n) {
@@ -187,7 +193,7 @@ uint32_t str_hash_calc(const char *s, size_t n) {
 }
 
 uint32_t str_hash_slow(SString *s) {
-    s->hash = str_hash_calc(s->data, s->len);
+    s->hash = str_hash_calc(s->dp, s->len);
     return s->hash;
 }
 
@@ -198,7 +204,7 @@ void string_finish(SString *s) {
 
 SString *vm_new_string(VM *vm, const char *src, size_t len) {
     SString *s = vm_alloc_string(vm, len);
-    if (len) memcpy(s->data, src, len);
+    if (len) memcpy(s->dp, src, len);
     string_finish(s);
     return s;
 }
@@ -449,7 +455,7 @@ int value_eq(SpValue a, SpValue b) {
     case T_BOOL: return a.as.b == b.as.b;
     case T_STRING: {
         SString *x = AS_STR(a), *y = AS_STR(b);
-        return x == y || (x->len == y->len && str_hash(x) == str_hash(y) && memcmp(x->data, y->data, x->len) == 0);
+        return x == y || (x->len == y->len && str_hash(x) == str_hash(y) && memcmp(x->dp, y->dp, x->len) == 0);
     }
     default: return a.as.o == b.as.o;
     }

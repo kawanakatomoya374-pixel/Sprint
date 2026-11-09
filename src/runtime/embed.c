@@ -463,7 +463,7 @@ const char *sp_string_data(SpValue s, size_t *len) {
         return NULL;
     }
     if (len) *len = AS_STR(s)->len;
-    return AS_STR(s)->data;
+    return AS_STR(s)->dp;
 }
 
 SpStatus sp_new_array(SpVM *vm, size_t capacity, SpValue *out) {
@@ -570,14 +570,14 @@ SpStatus sp_get_member(SpVM *vm, SpValue obj, const char *name, SpValue *out) {
         break;
     case T_MODULE:
         if (!table_get_str(AS_MODULE(obj)->exports, name, nl, out))
-            return rt_fail(vm, E_NAME, "module '%s' has no export '%s'", AS_MODULE(obj)->name->data, name);
+            return rt_fail(vm, E_NAME, "module '%s' has no export '%s'", AS_MODULE(obj)->name->dp, name);
         break;
     case T_INSTANCE: {
         SInstance *in = AS_INSTANCE(obj);
         SpValue slot;
         if (table_get_str(in->cls->fields, name, nl, &slot)) *out = in->slots[slot.as.i];
         else if (!table_get_str(in->cls->methods, name, nl, out))
-            return rt_fail(vm, E_NAME, "'%s' has no member '%s'", in->cls->name->data, name);
+            return rt_fail(vm, E_NAME, "'%s' has no member '%s'", in->cls->name->dp, name);
         break;
     }
     case T_ERROR: {

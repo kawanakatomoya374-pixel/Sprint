@@ -36,7 +36,7 @@ int main(void) {
     P("L_SARRAY_LEN", offsetof(SArray, len));
     P("L_SARRAY_ITEMS", offsetof(SArray, items));
     P("L_SSTR_LEN", offsetof(SString, len));
-    P("L_SSTR_DATA", offsetof(SString, data));
+    P("L_SSTR_DP", offsetof(SString, dp));
     P("L_CELL_V", offsetof(SCell, v));
     P("L_PROTO_JUNIT", offsetof(Proto, junit));
     P("L_JU_ENTRY", offsetof(JitUnit, entry));

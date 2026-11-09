@@ -148,7 +148,7 @@ SError *vm_make_error(VM *vm, int code, SString *kind, SString *msg) {
         trace_fmt(vm, &m);
         SString *t = vm_alloc_string(vm, m.len);
         Out w = {0};
-        w.dst = t->data;
+        w.dst = t->dp;
         w.cap = m.len;
         trace_fmt(vm, &w);
         string_finish(t);

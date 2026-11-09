@@ -364,7 +364,7 @@ static int json_parse(VM *vm, int argc, SpValue *argv, SpValue *ret) {
     (void)argc;
     if (need_str(vm, argv[0], "json.parse() input")) return 1;
     SString *s = AS_STR(argv[0]);
-    JParse J = {vm, s->data, s->len, 0, 0};
+    JParse J = {vm, s->dp, s->len, 0, 0};
     SpValue v = v_nil();
     if (j_value(&J, 0, &v)) return 1;
     j_ws(&J);
@@ -394,7 +394,7 @@ static void jb_put(VM *vm, JBuf *b, const char *s, size_t n) {
 static void jb_str(VM *vm, JBuf *b, const SString *s) {
     jb_put(vm, b, "\"", 1);
     for (uint32_t i = 0; i < s->len; i++) {
-        unsigned char c = (unsigned char)s->data[i];
+        unsigned char c = (unsigned char)s->dp[i];
         char esc[8];
         switch (c) {
         case '"': jb_put(vm, b, "\\\"", 2); break;
@@ -520,17 +520,18 @@ int lib_io_fail(VM *vm, int err, const char *op, const char *path) { return io_f
 static int fs_check(VM *vm, SpValue pv, int write, const char *op, char *out) {
     if (need_str(vm, pv, "path")) return 1;
     const SString *ps = AS_STR(pv);
-    if (ps->len == 0 || ps->len >= PATH_MAX - 2 || memchr(ps->data, 0, ps->len))
+    if (ps->len == 0 || ps->len >= PATH_MAX - 2 || memchr(ps->dp, 0, ps->len))
         return vm_set_error(vm, E_VALUE, "invalid path");
     int cap = write ? CAP_FS_WRITE : CAP_FS_READ;
     if (!(vm->caps & cap))
         return vm_set_error(vm, E_PERM, "%s access is not permitted (use --allow-%s=DIR)", write ? "filesystem write" : "filesystem read", write ? "write" : "read");
     char tmp[PATH_MAX];
-    if (realpath(ps->data, tmp)) {
+    const char *psz = str_z(vm, ps);
+    if (realpath(psz, tmp)) {
         (void)snprintf(out, PATH_MAX, "%s", tmp);
     } else if (errno == ENOENT) {
         char buf[PATH_MAX];
-        (void)snprintf(buf, sizeof buf, "%s", ps->data);
+        (void)snprintf(buf, sizeof buf, "%s", psz);
         char *sl = strrchr(buf, '/');
         char dirp[PATH_MAX];
         const char *base;
@@ -538,20 +539,20 @@ static int fs_check(VM *vm, SpValue pv, int write, const char *op, char *out) {
         else if (sl == buf) { (void)snprintf(dirp, sizeof dirp, "/"); base = sl + 1; }
         else { *sl = 0; (void)snprintf(dirp, sizeof dirp, "%s", buf); base = sl + 1; }
         char rd[PATH_MAX];
-        if (!realpath(dirp, rd)) return io_fail(vm, errno, op, ps->data);
+        if (!realpath(dirp, rd)) return io_fail(vm, errno, op, ps->dp);
         size_t rl = strcmp(rd, "/") == 0 ? 0 : strlen(rd), bl = strlen(base);
-        if (rl + 1 + bl >= PATH_MAX) return io_fail(vm, ENAMETOOLONG, op, ps->data);
+        if (rl + 1 + bl >= PATH_MAX) return io_fail(vm, ENAMETOOLONG, op, ps->dp);
         memcpy(out, rd, rl);
         out[rl] = '/';
         memcpy(out + rl + 1, base, bl + 1);
     } else {
-        return io_fail(vm, errno, op, ps->data);
+        return io_fail(vm, errno, op, ps->dp);
     }
     const char *const *list = (const char *const *)(write ? vm->allow_write : vm->allow_read);
     int cnt = write ? vm->n_allow_write : vm->n_allow_read;
     for (int i = 0; i < cnt; i++)
         if (within(out, list[i])) return 0;
-    return vm_set_error(vm, E_PERM, "'%s' is outside the permitted directories", ps->data);
+    return vm_set_error(vm, E_PERM, "'%s' is outside the permitted directories", ps->dp);
 }
 
 static int fs_read_file(VM *vm, int argc, SpValue *argv, SpValue *ret) {
@@ -560,11 +561,11 @@ static int fs_read_file(VM *vm, int argc, SpValue *argv, SpValue *ret) {
     if (fs_check(vm, argv[0], 0, "read", rp)) return 1;
     size_t len = 0;
     char *b = sp_read_file(rp, &len);
-    if (!b) return io_fail(vm, errno ? errno : EIO, "read", AS_STR(argv[0])->data);
+    if (!b) return io_fail(vm, errno ? errno : EIO, "read", AS_STR(argv[0])->dp);
     size_t bad;
     if (!utf8_validate(b, len, &bad)) {
         free(b);
-        return vm_set_error(vm, E_IO, "'%s' is not valid UTF-8", AS_STR(argv[0])->data);
+        return vm_set_error(vm, E_IO, "'%s' is not valid UTF-8", AS_STR(argv[0])->dp);
     }
     *ret = vstr(vm, b, len);
     free(b);
@@ -577,11 +578,11 @@ static int write_impl(VM *vm, SpValue *argv, int append) {
     if (fs_check(vm, argv[0], 1, op, rp)) return 1;
     if (need_str(vm, argv[1], "data")) return 1;
     const SString *d = AS_STR(argv[1]);
-    const char *orig = AS_STR(argv[0])->data;
+    const char *orig = AS_STR(argv[0])->dp;
     if (append) {
         FILE *f = fopen(rp, "ab");
         if (!f) return io_fail(vm, errno, op, orig);
-        int ok = fwrite(d->data, 1, d->len, f) == d->len;
+        int ok = fwrite(d->dp, 1, d->len, f) == d->len;
         int e = errno;
         if (fclose(f) != 0) ok = 0;
         return ok ? 0 : io_fail(vm, e ? e : EIO, op, orig);
@@ -590,7 +591,7 @@ static int write_impl(VM *vm, SpValue *argv, int append) {
     (void)snprintf(tmp, sizeof tmp, "%.*s.sprint-tmp-%ld", PATH_MAX, rp, (long)getpid());
     FILE *f = fopen(tmp, "wb");
     if (!f) return io_fail(vm, errno, op, orig);
-    int ok = fwrite(d->data, 1, d->len, f) == d->len;
+    int ok = fwrite(d->dp, 1, d->len, f) == d->len;
     int e = errno;
     if (fflush(f) != 0) ok = 0;
     if (fclose(f) != 0) ok = 0;
@@ -625,7 +626,7 @@ static int fs_list_dir(VM *vm, int argc, SpValue *argv, SpValue *ret) {
     char rp[PATH_MAX];
     if (fs_check(vm, argv[0], 0, "list", rp)) return 1;
     DIR *d = opendir(rp);
-    if (!d) return io_fail(vm, errno, "list", AS_STR(argv[0])->data);
+    if (!d) return io_fail(vm, errno, "list", AS_STR(argv[0])->dp);
     size_t cap = 16, n = 0;
     char **names = malloc(cap * sizeof *names);
     if (!names) { (void)closedir(d); vm_fatal(vm, RS_MEMORY, "out of memory"); }
@@ -660,7 +661,7 @@ static int fs_make_dir(VM *vm, int argc, SpValue *argv, SpValue *ret) {
     (void)argc; (void)ret;
     char rp[PATH_MAX];
     if (fs_check(vm, argv[0], 1, "mkdir", rp)) return 1;
-    if (mkdir(rp, 0777) != 0) return io_fail(vm, errno, "mkdir", AS_STR(argv[0])->data);
+    if (mkdir(rp, 0777) != 0) return io_fail(vm, errno, "mkdir", AS_STR(argv[0])->dp);
     return 0;
 }
 static int fs_remove(VM *vm, int argc, SpValue *argv, SpValue *ret) {
@@ -668,9 +669,9 @@ static int fs_remove(VM *vm, int argc, SpValue *argv, SpValue *ret) {
     char rp[PATH_MAX];
     if (fs_check(vm, argv[0], 1, "remove", rp)) return 1;
     struct stat st;
-    if (lstat(rp, &st) != 0) return io_fail(vm, errno, "remove", AS_STR(argv[0])->data);
+    if (lstat(rp, &st) != 0) return io_fail(vm, errno, "remove", AS_STR(argv[0])->dp);
     int r = S_ISDIR(st.st_mode) ? rmdir(rp) : unlink(rp);
-    if (r != 0) return io_fail(vm, errno, "remove", AS_STR(argv[0])->data);
+    if (r != 0) return io_fail(vm, errno, "remove", AS_STR(argv[0])->dp);
     return 0;
 }
 const NativeDesc lib_fs_fns[] = {

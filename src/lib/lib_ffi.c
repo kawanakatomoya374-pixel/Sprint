@@ -88,14 +88,14 @@ static int parse_struct_type(const char *s, size_t n, SInfo *out) {
 
 /* "ret:arg,arg,...": e.g. "f64:f64,f64", "i32:s,...", "v:" */
 static int parse_sig(VM *vm, const SString *s, Sig *out) {
-    const char *p = s->data, *end = s->data + s->len;
+    const char *p = s->dp, *end = s->dp + s->len;
     const char *colon = memchr(p, ':', s->len);
-    if (!colon) return vm_set_error(vm, E_VALUE, "bad ffi signature '%s' (expected \"ret:arg,arg\")", s->data);
+    if (!colon) return vm_set_error(vm, E_VALUE, "bad ffi signature '%s' (expected \"ret:arg,arg\")", s->dp);
     out->ret = parse_type(p, (size_t)(colon - p));
     out->nargs = 0;
     out->variadic = 0;
     if (out->ret == C_BAD && parse_struct_type(p, (size_t)(colon - p), &out->rinfo)) out->ret = C_STRUCT;
-    if (out->ret == C_BAD) return vm_set_error(vm, E_VALUE, "bad ffi return type in '%s'", s->data);
+    if (out->ret == C_BAD) return vm_set_error(vm, E_VALUE, "bad ffi return type in '%s'", s->dp);
     if (out->ret == C_STRUCT && !FFI_STRUCT_BY_VALUE) return vm_set_error(vm, E_RUNTIME, "structs by value need the System V x86-64 ABI");
     p = colon + 1;
     while (p < end) {
@@ -109,7 +109,7 @@ static int parse_sig(VM *vm, const SString *s, Sig *out) {
                 t = C_STRUCT;
                 if (!FFI_STRUCT_BY_VALUE) return vm_set_error(vm, E_RUNTIME, "structs by value need the System V x86-64 ABI");
             }
-            if (t == C_BAD || t == C_VOID || out->variadic) return vm_set_error(vm, E_VALUE, "bad ffi argument type in '%s'", s->data);
+            if (t == C_BAD || t == C_VOID || out->variadic) return vm_set_error(vm, E_VALUE, "bad ffi argument type in '%s'", s->dp);
             if (out->nargs == MAX_ARGS) return vm_set_error(vm, E_VALUE, "too many ffi parameters");
             out->args[out->nargs++] = t;
         }
@@ -150,8 +150,8 @@ static int a_int64(VM *vm, SpValue v, const char *what, int64_t *out) {
 
 static int a_type(VM *vm, SpValue v, CType *out) {
     if (v.type != T_STRING) return vm_set_error(vm, E_TYPE, "type must be a string like \"i32\", not %s", type_name(v));
-    *out = parse_type(AS_STR(v)->data, AS_STR(v)->len);
-    if (*out == C_BAD || *out == C_VOID || *out == C_STR) return vm_set_error(vm, E_VALUE, "bad memory type '%s'", AS_STR(v)->data);
+    *out = parse_type(AS_STR(v)->dp, AS_STR(v)->len);
+    if (*out == C_BAD || *out == C_VOID || *out == C_STR) return vm_set_error(vm, E_VALUE, "bad memory type '%s'", AS_STR(v)->dp);
     return 0;
 }
 
@@ -265,7 +265,7 @@ static int bm_put(VM *vm, int argc, SpValue *argv, SpValue *ret) {
     if (!b || a_int64(vm, argv[1], "offset", &off)) return 1;
     if (argv[2].type != T_STRING) return vm_set_error(vm, E_TYPE, "put expects a string, not %s", type_name(argv[2]));
     if (buf_range(vm, b, off, AS_STR(argv[2])->len)) return 1;
-    memcpy(b->b + off, AS_STR(argv[2])->data, AS_STR(argv[2])->len);
+    memcpy(b->b + off, AS_STR(argv[2])->dp, AS_STR(argv[2])->len);
     return 0;
 }
 static const NativeDesc cbuf_methods[] = {
@@ -311,7 +311,7 @@ static int f_copy_in(VM *vm, int argc, SpValue *argv, SpValue *ret) {
     void *p;
     if (need_cap(vm) || a_addr(vm, argv[0], &p)) return 1;
     if (argv[1].type != T_STRING) return vm_set_error(vm, E_TYPE, "copy_in expects a string, not %s", type_name(argv[1]));
-    memcpy(p, AS_STR(argv[1])->data, AS_STR(argv[1])->len);
+    memcpy(p, AS_STR(argv[1])->dp, AS_STR(argv[1])->len);
     return 0;
 }
 
@@ -320,7 +320,7 @@ static int f_open(VM *vm, int argc, SpValue *argv, SpValue *ret) {
     (void)argc;
     if (need_cap(vm)) return 1;
     const char *path = NULL;
-    if (argv[0].type == T_STRING) path = AS_STR(argv[0])->data;
+    if (argv[0].type == T_STRING) path = str_z(vm, AS_STR(argv[0]));
     else if (argv[0].type != T_NIL) return vm_set_error(vm, E_TYPE, "library name must be a string or nil, not %s", type_name(argv[0]));
     void *h = dlopen(path, RTLD_NOW | RTLD_LOCAL);
     if (!h) {
@@ -339,8 +339,8 @@ static int f_sym(VM *vm, int argc, SpValue *argv, SpValue *ret) {
     if (argv[1].type != T_STRING) return vm_set_error(vm, E_TYPE, "symbol name must be a string, not %s", type_name(argv[1]));
     void *h;
     memcpy(&h, AS_NATIVE(argv[0])->data, sizeof h);
-    void *s = dlsym(h, AS_STR(argv[1])->data);
-    if (!s) return vm_set_error(vm, E_NAME, "symbol '%s' not found in the library", AS_STR(argv[1])->data);
+    void *s = dlsym(h, str_z(vm, AS_STR(argv[1])));
+    if (!s) return vm_set_error(vm, E_NAME, "symbol '%s' not found in the library", AS_STR(argv[1])->dp);
     *ret = v_int((int64_t)(uintptr_t)s);
     return 0;
 }
@@ -531,7 +531,7 @@ static int do_call(VM *vm, int64_t addr, const Sig *psig, const SpValue *items, 
         if (ni == MAX_INT_ARGS) return vm_set_error(vm, E_VALUE, "too many integer/pointer ffi arguments (max %d)", MAX_INT_ARGS);
         int64_t x = 0;
         if (t == C_STR || t == C_PTR) {
-            if (v.type == T_STRING) x = (int64_t)(uintptr_t)AS_STR(v)->data;
+            if (v.type == T_STRING) { const char *zp = str_z(vm, AS_STR(v)); x = (int64_t)(uintptr_t)zp; }
             else if (v.type == T_NATIVE && AS_NATIVE(v)->cls == &cbuf_class) x = (int64_t)(uintptr_t)((CBuf *)AS_NATIVE(v)->data)->b;
             else if (v.type == T_NIL) x = 0;
             else if (v.type == T_INT) x = v.as.i;
@@ -747,12 +747,12 @@ static int make_prepared(VM *vm, int64_t addr, const SString *sigs, SpValue *ret
     PrepFn *p = NULL;
     if (share)
         for (size_t i = 0; i < g_nprep; i++)
-            if (g_prep[i]->addr == addr && strlen(g_prep[i]->key) == sigs->len && memcmp(g_prep[i]->key, sigs->data, sigs->len) == 0) { p = g_prep[i]; break; }
+            if (g_prep[i]->addr == addr && strlen(g_prep[i]->key) == sigs->len && memcmp(g_prep[i]->key, sigs->dp, sigs->len) == 0) { p = g_prep[i]; break; }
     if (!p) {
         p = calloc(1, sizeof *p);
         char *key = malloc(sigs->len + 1);
         if (!p || !key) { free(p); free(key); return vm_set_error(vm, E_MEMORY, "out of memory"); }
-        memcpy(key, sigs->data, sigs->len);
+        memcpy(key, sigs->dp, sigs->len);
         key[sigs->len] = 0;
         /* argument counts are checked by do_call so that the messages stay those of the unprepared path */
         p->d = (NativeDesc){"ffi function", 0, -1, prep_invoke};
@@ -813,7 +813,7 @@ static int f_asm(VM *vm, int argc, SpValue *argv, SpValue *ret) {
     if (size > ((size_t)1 << 20) || g_asm_total + size > ((size_t)64 << 20)) return vm_set_error(vm, E_VALUE, "too much machine code");
     void *mem = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (mem == MAP_FAILED) return vm_set_error(vm, E_MEMORY, "cannot map memory for machine code");
-    if (argv[0].type == T_STRING) memcpy(mem, AS_STR(argv[0])->data, len);
+    if (argv[0].type == T_STRING) memcpy(mem, AS_STR(argv[0])->dp, len);
     else for (size_t i = 0; i < len; i++) ((unsigned char *)mem)[i] = (unsigned char)AS_ARRAY(argv[0])->items[i].as.i;
 #if defined(__aarch64__)
     __builtin___clear_cache((char *)mem, (char *)mem + len);

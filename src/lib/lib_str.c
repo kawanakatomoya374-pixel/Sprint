@@ -5,7 +5,7 @@ static int cp_next(VM *vm, SIterator *it, SpValue out[2]) {
     (void)vm;
     const SString *s = AS_STR(it->held);
     if ((uint64_t)it->a >= s->len) return 1;
-    const unsigned char *p = (const unsigned char *)s->data + it->a;
+    const unsigned char *p = (const unsigned char *)s->dp + it->a;
     int64_t cp;
     int n;
     if (p[0] < 0x80) { cp = p[0]; n = 1; }
@@ -24,10 +24,10 @@ static const IterClass cp_class = {"codepoints", 1, cp_next};
 static int format_pass(VM *vm, const SString *t, int argc, SpValue *args, Out *o) {
     int next = 0;
     for (uint32_t i = 0; i < t->len; i++) {
-        char c = t->data[i];
+        char c = t->dp[i];
         if (c == '{') {
-            if (i + 1 < t->len && t->data[i + 1] == '{') { out_put(o, "{", 1); i++; continue; }
-            if (i + 1 < t->len && t->data[i + 1] == '}') {
+            if (i + 1 < t->len && t->dp[i + 1] == '{') { out_put(o, "{", 1); i++; continue; }
+            if (i + 1 < t->len && t->dp[i + 1] == '}') {
                 if (next >= argc) return vm_set_error(vm, E_VALUE, "format(): not enough arguments for template");
                 fmt_value(vm, args[next++], 0, 0, o);
                 i++;
@@ -36,7 +36,7 @@ static int format_pass(VM *vm, const SString *t, int argc, SpValue *args, Out *o
             return vm_set_error(vm, E_VALUE, "format(): '{' must be followed by '}' or '{'");
         }
         if (c == '}') {
-            if (i + 1 < t->len && t->data[i + 1] == '}') { out_put(o, "}", 1); i++; continue; }
+            if (i + 1 < t->len && t->dp[i + 1] == '}') { out_put(o, "}", 1); i++; continue; }
             return vm_set_error(vm, E_VALUE, "format(): single '}' in template");
         }
         out_put(o, &c, 1);
@@ -52,7 +52,7 @@ static int s_format(VM *vm, int argc, SpValue *argv, SpValue *ret) {
     if (format_pass(vm, t, argc - 1, argv + 1, &m)) return 1;
     SString *s = vm_alloc_string(vm, m.len);
     Out w = {0};
-    w.dst = s->data;
+    w.dst = s->dp;
     w.cap = m.len;
     (void)format_pass(vm, t, argc - 1, argv + 1, &w);
     string_finish(s);
@@ -94,9 +94,9 @@ int arr_join(VM *vm, SArray *a, SString *sep, SpValue *ret) {
     SString *s = vm_alloc_string(vm, total);
     size_t p = 0;
     for (int64_t i = 0; i < a->len; i++) {
-        if (i) { memcpy(s->data + p, sep->data, sep->len); p += sep->len; }
+        if (i) { memcpy(s->dp + p, sep->dp, sep->len); p += sep->len; }
         SString *e = AS_STR(a->items[i]);
-        memcpy(s->data + p, e->data, e->len);
+        memcpy(s->dp + p, e->dp, e->len);
         p += e->len;
     }
     string_finish(s);
@@ -121,7 +121,7 @@ const NativeDesc str_fns[] = {
 /* ---------------------------------------------------------------- */
 static int is_ws(char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\v' || c == '\f'; }
 static int is_boundary(const SString *s, int64_t i) {
-    return i == 0 || i == (int64_t)s->len || (i > 0 && i < (int64_t)s->len && (((unsigned char)s->data[i]) & 0xC0) != 0x80);
+    return i == 0 || i == (int64_t)s->len || (i > 0 && i < (int64_t)s->len && (((unsigned char)s->dp[i]) & 0xC0) != 0x80);
 }
 
 static int sm_slice(VM *vm, int argc, SpValue *argv, SpValue *ret) {
@@ -133,7 +133,7 @@ static int sm_slice(VM *vm, int argc, SpValue *argv, SpValue *ret) {
         return vm_set_error(vm, E_INDEX, "slice out of range for string of length %u", s->len);
     if (a > b) return vm_set_error(vm, E_VALUE, "slice start is after end");
     if (!is_boundary(s, a) || !is_boundary(s, b)) return vm_set_error(vm, E_VALUE, "slice boundary is inside a UTF-8 character");
-    *ret = vstr(vm, s->data + a, (size_t)(b - a));
+    *ret = vstr(vm, s->dp + a, (size_t)(b - a));
     return 0;
 }
 static int sm_find(VM *vm, int argc, SpValue *argv, SpValue *ret) {
@@ -143,28 +143,28 @@ static int sm_find(VM *vm, int argc, SpValue *argv, SpValue *ret) {
     if (argc > 2 && need_int(vm, argv[2], "start", &st)) return 1;
     if (st < 0 || st > (int64_t)s->len) return vm_set_error(vm, E_INDEX, "find start out of range");
     SString *sub = AS_STR(argv[1]);
-    *ret = v_int(find_bytes(s->data, s->len, sub->data, sub->len, (size_t)st));
+    *ret = v_int(find_bytes(s->dp, s->len, sub->dp, sub->len, (size_t)st));
     return 0;
 }
 int sm_contains(VM *vm, int argc, SpValue *argv, SpValue *ret) {
     (void)argc;
     if (need_str(vm, argv[1], "substring")) return 1;
     SString *s = AS_STR(argv[0]), *sub = AS_STR(argv[1]);
-    *ret = v_bool(find_bytes(s->data, s->len, sub->data, sub->len, 0) >= 0);
+    *ret = v_bool(find_bytes(s->dp, s->len, sub->dp, sub->len, 0) >= 0);
     return 0;
 }
 static int sm_starts_with(VM *vm, int argc, SpValue *argv, SpValue *ret) {
     (void)argc;
     if (need_str(vm, argv[1], "prefix")) return 1;
     SString *s = AS_STR(argv[0]), *p = AS_STR(argv[1]);
-    *ret = v_bool(p->len <= s->len && memcmp(s->data, p->data, p->len) == 0);
+    *ret = v_bool(p->len <= s->len && memcmp(s->dp, p->dp, p->len) == 0);
     return 0;
 }
 static int sm_ends_with(VM *vm, int argc, SpValue *argv, SpValue *ret) {
     (void)argc;
     if (need_str(vm, argv[1], "suffix")) return 1;
     SString *s = AS_STR(argv[0]), *p = AS_STR(argv[1]);
-    *ret = v_bool(p->len <= s->len && memcmp(s->data + (s->len - p->len), p->data, p->len) == 0);
+    *ret = v_bool(p->len <= s->len && memcmp(s->dp + (s->len - p->len), p->dp, p->len) == 0);
     return 0;
 }
 static int sm_count(VM *vm, int argc, SpValue *argv, SpValue *ret) {
@@ -175,7 +175,7 @@ static int sm_count(VM *vm, int argc, SpValue *argv, SpValue *ret) {
     int64_t n = 0;
     size_t p = 0;
     for (;;) {
-        int f = find_bytes(s->data, s->len, sub->data, sub->len, p);
+        int f = find_bytes(s->dp, s->len, sub->dp, sub->len, p);
         if (f < 0) break;
         n++;
         p = (size_t)f + sub->len;
@@ -192,9 +192,9 @@ static int sm_split(VM *vm, int argc, SpValue *argv, SpValue *ret) {
     *ret = v_obj(T_ARRAY, a);
     size_t p = 0;
     for (;;) {
-        int f = find_bytes(s->data, s->len, sep->data, sep->len, p);
+        int f = find_bytes(s->dp, s->len, sep->dp, sep->len, p);
         size_t e = f < 0 ? s->len : (size_t)f;
-        array_push(vm, a, vstr(vm, s->data + p, e - p));
+        array_push(vm, a, vstr(vm, s->dp + p, e - p));
         if (f < 0) break;
         p = e + sep->len;
     }
@@ -207,9 +207,9 @@ static int sm_split_lines(VM *vm, int argc, SpValue *argv, SpValue *ret) {
     *ret = v_obj(T_ARRAY, a);
     size_t p = 0;
     while (p < s->len) {
-        int f = find_bytes(s->data, s->len, "\n", 1, p);
+        int f = find_bytes(s->dp, s->len, "\n", 1, p);
         size_t e = f < 0 ? s->len : (size_t)f;
-        array_push(vm, a, vstr(vm, s->data + p, e - p));
+        array_push(vm, a, vstr(vm, s->dp + p, e - p));
         p = e + 1;
     }
     return 0;
@@ -217,9 +217,9 @@ static int sm_split_lines(VM *vm, int argc, SpValue *argv, SpValue *ret) {
 static int trim_impl(VM *vm, SpValue *argv, SpValue *ret, int left, int right) {
     SString *s = AS_STR(argv[0]);
     size_t b = 0, e = s->len;
-    if (left) while (b < e && is_ws(s->data[b])) b++;
-    if (right) while (e > b && is_ws(s->data[e - 1])) e--;
-    *ret = (b == 0 && e == s->len) ? argv[0] : vstr(vm, s->data + b, e - b);
+    if (left) while (b < e && is_ws(s->dp[b])) b++;
+    if (right) while (e > b && is_ws(s->dp[e - 1])) e--;
+    *ret = (b == 0 && e == s->len) ? argv[0] : vstr(vm, s->dp + b, e - b);
     return 0;
 }
 static int sm_trim(VM *vm, int argc, SpValue *argv, SpValue *ret) { (void)argc; return trim_impl(vm, argv, ret, 1, 1); }
@@ -230,16 +230,16 @@ static int case_impl(VM *vm, SpValue *argv, SpValue *ret, int upper) {
     SString *s = AS_STR(argv[0]);
     int change = 0;
     for (uint32_t i = 0; i < s->len; i++) {
-        char c = s->data[i];
+        char c = s->dp[i];
         if (upper ? (c >= 'a' && c <= 'z') : (c >= 'A' && c <= 'Z')) { change = 1; break; }
     }
     if (!change) { *ret = argv[0]; return 0; }
     SString *r = vm_alloc_string(vm, s->len);
     for (uint32_t i = 0; i < s->len; i++) {
-        char c = s->data[i];
+        char c = s->dp[i];
         if (upper && c >= 'a' && c <= 'z') c = (char)(c - 32);
         else if (!upper && c >= 'A' && c <= 'Z') c = (char)(c + 32);
-        r->data[i] = c;
+        r->dp[i] = c;
     }
     string_finish(r);
     *ret = v_obj(T_STRING, r);
@@ -255,7 +255,7 @@ static int sm_replace(VM *vm, int argc, SpValue *argv, SpValue *ret) {
     if (o->len == 0) return vm_set_error(vm, E_VALUE, "replace() of an empty substring");
     size_t cnt = 0, p = 0;
     for (;;) {
-        int f = find_bytes(s->data, s->len, o->data, o->len, p);
+        int f = find_bytes(s->dp, s->len, o->dp, o->len, p);
         if (f < 0) break;
         cnt++;
         p = (size_t)f + o->len;
@@ -266,12 +266,12 @@ static int sm_replace(VM *vm, int argc, SpValue *argv, SpValue *ret) {
     size_t w = 0;
     p = 0;
     for (;;) {
-        int f = find_bytes(s->data, s->len, o->data, o->len, p);
+        int f = find_bytes(s->dp, s->len, o->dp, o->len, p);
         size_t e = f < 0 ? s->len : (size_t)f;
-        memcpy(r->data + w, s->data + p, e - p);
+        memcpy(r->dp + w, s->dp + p, e - p);
         w += e - p;
         if (f < 0) break;
-        memcpy(r->data + w, n->data, n->len);
+        memcpy(r->dp + w, n->dp, n->len);
         w += n->len;
         p = e + o->len;
     }
@@ -287,7 +287,7 @@ static int sm_repeat(VM *vm, int argc, SpValue *argv, SpValue *ret) {
     SString *s = AS_STR(argv[0]);
     if (s->len && (uint64_t)n > vm->lim.max_string_bytes / s->len) vm_fatal(vm, RS_MEMORY, "string length limit exceeded");
     SString *r = vm_alloc_string(vm, s->len * (size_t)n);
-    for (int64_t i = 0; i < n; i++) memcpy(r->data + (size_t)i * s->len, s->data, s->len);
+    for (int64_t i = 0; i < n; i++) memcpy(r->dp + (size_t)i * s->len, s->dp, s->len);
     string_finish(r);
     *ret = v_obj(T_STRING, r);
     return 0;
@@ -296,7 +296,7 @@ static int sm_char_count(VM *vm, int argc, SpValue *argv, SpValue *ret) {
     (void)vm; (void)argc;
     SString *s = AS_STR(argv[0]);
     int64_t n = 0;
-    for (uint32_t i = 0; i < s->len; i++) if ((((unsigned char)s->data[i]) & 0xC0) != 0x80) n++;
+    for (uint32_t i = 0; i < s->len; i++) if ((((unsigned char)s->dp[i]) & 0xC0) != 0x80) n++;
     *ret = v_int(n);
     return 0;
 }
@@ -307,7 +307,7 @@ static int sm_char_at(VM *vm, int argc, SpValue *argv, SpValue *ret) {
     SString *s = AS_STR(argv[0]);
     if (i < 0 || i >= (int64_t)s->len) return vm_set_error(vm, E_INDEX, "char_at() index out of range");
     if (!is_boundary(s, i)) return vm_set_error(vm, E_VALUE, "char_at() index is not on a character boundary");
-    const unsigned char *p = (const unsigned char *)s->data + i;
+    const unsigned char *p = (const unsigned char *)s->dp + i;
     uint32_t cp;
     if (p[0] < 0x80) cp = p[0];
     else if (p[0] < 0xE0) cp = ((uint32_t)(p[0] & 0x1F) << 6) | (p[1] & 0x3Fu);
@@ -345,7 +345,7 @@ const NativeDesc *lib_string_method(const SString *name) {
     if (!name) return NULL;
     for (const NativeDesc *d = string_methods; d->name; d++) {
         size_t n = strlen(d->name);
-        if (n == name->len && memcmp(d->name, name->data, n) == 0) return d;
+        if (n == name->len && memcmp(d->name, name->dp, n) == 0) return d;
     }
     return NULL;
 }
@@ -355,7 +355,7 @@ int lib_string_method_id(const SString *name) {
     int id = 0;
     for (const NativeDesc *d = string_methods; d->name; d++, id++) {
         size_t n = strlen(d->name);
-        if (n == name->len && memcmp(d->name, name->data, n) == 0) return id;
+        if (n == name->len && memcmp(d->name, name->dp, n) == 0) return id;
     }
     return -1;
 }

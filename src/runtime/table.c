@@ -29,7 +29,7 @@ static int key_eq(SpValue a, SpValue b) {
     case T_BOOL: return a.as.b == b.as.b;
     case T_STRING: {
         SString *x = AS_STR(a), *y = AS_STR(b);
-        return x == y || (x->len == y->len && str_hash(x) == str_hash(y) && memcmp(x->data, y->data, x->len) == 0);
+        return x == y || (x->len == y->len && str_hash(x) == str_hash(y) && memcmp(x->dp, y->dp, x->len) == 0);
     }
     default: return a.as.o == b.as.o;
     }
@@ -87,7 +87,7 @@ static int64_t t_find_sstr(const STable *t, const SString *key, uint32_t h32,
                 const SString *ks = AS_STR(te->key);
                 if (ks == key || ((ks->hash == h32 || !ks->hash) &&
                                   ks->len == key->len &&
-                                  memcmp(ks->data, key->data, key->len) == 0)) {
+                                  memcmp(ks->dp, key->dp, key->len) == 0)) {
                     if (slot_out) *slot_out = (int64_t)i;
                     return e;
                 }
@@ -170,7 +170,7 @@ int table_get_str(STable *t, const char *s, size_t len, SpValue *out) {
         if (e >= 0) {
             SpValue k = t->ents[e].key;
             if (k.type == T_STRING && (AS_STR(k)->hash == h32 || !AS_STR(k)->hash) && AS_STR(k)->len == len &&
-                memcmp(AS_STR(k)->data, s, len) == 0) {
+                memcmp(AS_STR(k)->dp, s, len) == 0) {
                 if (out) *out = t->ents[e].val;
                 return 1;
             }

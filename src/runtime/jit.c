@@ -1522,7 +1522,7 @@ static int do_invoke(JC *c, uint32_t pc, int len, uint32_t *skip) {
         if (argc != 1) FAIL("invoke: nonmodule arity");
         if (!flush_regs(c)) return 0;
         m = &c->st[pm];
-        if (name->len != 6 || memcmp(name->data, "append", 6) != 0) FAIL("invoke: nonmodule method not supported");
+        if (name->len != 6 || memcmp(name->dp, "append", 6) != 0) FAIL("invoke: nonmodule method not supported");
         Ent *a = &c->st[pb];
         if (m->kind == EK_K || m->kind == EK_MOD) FAIL("invoke: append receiver");
         if (!need(c, pm, TY_ARR)) FAIL("invoke: append receiver");
@@ -2454,7 +2454,7 @@ static int jh_getidx(VM *vm, const SpValue *o, const SpValue *k, SpValue *dst) {
     case T_STRING: {
         const SString *st = AS_STR(*o);
         if (k->type != T_INT || k->as.i < 0 || k->as.i >= (int64_t)st->len) return 0;
-        r = v_int((unsigned char)st->data[k->as.i]);
+        r = v_int((unsigned char)st->dp[k->as.i]);
         break;
     }
     case T_NATIVE:

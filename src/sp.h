@@ -221,11 +221,16 @@ struct Obj {
     Obj *next;
 };
 
+/* Strings.  Short and ordinary strings keep their bytes inline (dp == idata).  A long string made by concatenation shares a buffer
+ * with the strings it grew from: dp points at the first byte of a hidden owner string (len = capacity, hash = bytes used) and
+ * idata is absent, so `s = s .. x` appends in place (see concat_fast).  Always read the bytes through dp; dp[len] is NUL only
+ * for inline strings -- use str_cstr() where C needs a terminated string. */
 typedef struct SString {
     Obj h;
     uint32_t len;
     uint32_t hash;
-    char data[];
+    char *dp;
+    char idata[];
 } SString;
 
 typedef struct SArray {
@@ -762,6 +767,9 @@ void vm_free(VM *vm);
 void limits_default(Limits *l);
 
 /* objects */
+/* the bytes of s as a NUL-terminated C string: a string that shares a buffer (dp != idata) is copied first (the copy is a fresh heap
+ * string, valid until the next collection) */
+const char *str_z(VM *vm, const SString *s);
 SString *vm_new_string(VM *vm, const char *s, size_t len);
 SString *vm_alloc_string(VM *vm, size_t len); /* uninitialised data, hash unset */
 void string_finish(SString *s);
@@ -809,7 +817,7 @@ uint32_t sp_hash_bytes(const char *s, size_t n);
 uint32_t str_hash_calc(const char *s, size_t n); /* never 0 */
 uint32_t str_hash_slow(SString *s);
 /* A long string's hash is computed on first use (0 = not yet), so building big strings costs no hashing. */
-static inline uint32_t str_hash_peek(const SString *s) { return s->hash ? s->hash : str_hash_calc(s->data, s->len); }
+static inline uint32_t str_hash_peek(const SString *s) { return s->hash ? s->hash : str_hash_calc(s->dp, s->len); }
 static inline uint32_t str_hash(SString *s) { return s->hash ? s->hash : str_hash_slow(s); }
 size_t sp_fmt_int(char *buf, int64_t v);
 extern const NativeDesc math_fns[];

@@ -1,5 +1,6 @@
 /* Layer 6: the interpreter (SPEC 17): arithmetic, indexing, the dispatch loop. No C recursion for Sprint calls. */
 #include "vm_int.h"
+#include "value_int.h"
 #include "vm/internal.h"
 
 static const ICEnt *ic_fill(VM *vm, ICEnt *e, const SClass *k, const SString *name);
@@ -154,7 +155,7 @@ static int compare(VM *vm, SpValue a, SpValue b, int *unordered) {
     if (a.type == T_STRING && b.type == T_STRING) {
         SString *x = AS_STR(a), *y = AS_STR(b);
         size_t n = x->len < y->len ? x->len : y->len;
-        int c = memcmp(x->data, y->data, n);
+        int c = memcmp(x->dp, y->dp, n);
         if (c != 0) return c < 0 ? -1 : 1;
         return x->len < y->len ? -1 : x->len > y->len;
     }
@@ -180,7 +181,7 @@ static int get_index(VM *vm, SpValue o, SpValue k, SpValue *out) {
         SString *s = AS_STR(o);
         if (k.as.i < 0 || k.as.i >= (int64_t)s->len)
             return vm_set_error(vm, E_INDEX, "string index %lld out of range (length %u)", (long long)k.as.i, s->len);
-        *out = v_int((unsigned char)s->data[k.as.i]);
+        *out = v_int((unsigned char)s->dp[k.as.i]);
         return 0;
     }
     case T_TABLE: return table_get(vm, AS_TABLE(o), k, out, NULL);
@@ -252,11 +253,11 @@ static int get_member(VM *vm, SpValue o, SString *name, SpValue *out) {
         return 0;
     case T_MODULE:
         if (!mc_get(vm, AS_MODULE(o)->exports, name, out))
-            return vm_set_error(vm, E_NAME, "module '%s' has no export '%s'", AS_MODULE(o)->name->data, name->data);
+            return vm_set_error(vm, E_NAME, "module '%s' has no export '%s'", AS_MODULE(o)->name->dp, name->dp);
         return 0;
     case T_ERROR: {
         SError *e = AS_ERROR(o);
-        const char *n = name->data;
+        const char *n = name->dp;
         if (strcmp(n, "kind") == 0) *out = v_obj(T_STRING, e->kind);
         else if (strcmp(n, "code") == 0) *out = v_int(e->code);
         else if (strcmp(n, "message") == 0) *out = v_obj(T_STRING, e->message);
@@ -274,18 +275,18 @@ static int get_member(VM *vm, SpValue o, SString *name, SpValue *out) {
         SInstance *in = AS_INSTANCE(o);
         const ICEnt *ce = ic_find(vm, in->cls, name);
         if (ce) { *out = ce->kind == 1 ? in->slots[ce->slot] : ce->fn; return 0; }
-        return vm_set_error(vm, E_NAME, "'%s' instance has no field or method '%s'", in->cls->name->data, name->data);
+        return vm_set_error(vm, E_NAME, "'%s' instance has no field or method '%s'", in->cls->name->dp, name->dp);
     }
     case T_CLASS: {
         SClass *k = AS_CLASS(o);
         const ICEnt *ce = ic_find(vm, k, name);
         if (ce && ce->kind == 2) { *out = ce->fn; return 0; }
-        return vm_set_error(vm, E_NAME, "class '%s' has no method '%s'", k->name->data, name->data);
+        return vm_set_error(vm, E_NAME, "class '%s' has no method '%s'", k->name->dp, name->dp);
     }
     case T_ARRAY: case T_STRING:
-        if (sp_invoke_method_exists(o.type, name->data, name->len))
-            return vm_set_error(vm, E_TYPE, "method '%s' of %s must be called (no bound methods)", name->data, type_name(o));
-        return vm_set_error(vm, E_NAME, "'%s' has no member '%s'", type_name(o), name->data);
+        if (sp_invoke_method_exists(o.type, name->dp, name->len))
+            return vm_set_error(vm, E_TYPE, "method '%s' of %s must be called (no bound methods)", name->dp, type_name(o));
+        return vm_set_error(vm, E_NAME, "'%s' has no member '%s'", type_name(o), name->dp);
     default:
         return vm_set_error(vm, E_TYPE, "'%s' object has no members", type_name(o));
     }
@@ -294,15 +295,15 @@ static int get_member(VM *vm, SpValue o, SString *name, SpValue *out) {
 static int set_member(VM *vm, SpValue o, SString *name, SpValue v) {
     switch (o.type) {
     case T_TABLE: return table_set(vm, AS_TABLE(o), v_obj(T_STRING, name), v);
-    case T_MODULE: return vm_set_error(vm, E_CONST, "cannot assign to module member '%s'", name->data);
+    case T_MODULE: return vm_set_error(vm, E_CONST, "cannot assign to module member '%s'", name->dp);
     case T_ERROR: return vm_set_error(vm, E_TYPE, "error values are immutable");
     case T_INSTANCE: {
         SInstance *in = AS_INSTANCE(o);
         const ICEnt *ce = ic_find(vm, in->cls, name);
         if (ce && ce->kind == 1) { in->slots[ce->slot] = v; return 0; }
         if (ce)
-            return vm_set_error(vm, E_TYPE, "cannot assign to method '%s'", name->data);
-        return vm_set_error(vm, E_NAME, "'%s' instance has no field '%s'", in->cls->name->data, name->data);
+            return vm_set_error(vm, E_TYPE, "cannot assign to method '%s'", name->dp);
+        return vm_set_error(vm, E_NAME, "'%s' instance has no field '%s'", in->cls->name->dp, name->dp);
     }
     case T_CLASS: return vm_set_error(vm, E_TYPE, "cannot assign to a class member");
     default: return vm_set_error(vm, E_TYPE, "'%s' object does not support member assignment", type_name(o));
@@ -379,6 +380,28 @@ static size_t int_len(int64_t v) {
 }
 
 /* CONCAT fast path: every operand is a string or an int. Returns the new string, or NULL if not applicable. */
+/* Long results of a concatenation share one growing buffer (see SString in sp.h): `s = s .. x` writes x behind the bytes s already
+ * owns and returns a new header over the longer prefix, so repeated appends cost O(len(x)) instead of O(len(s)).  The buffer is a
+ * hidden string: len = capacity, hash = bytes in use.  A second append to the same older prefix finds the bytes after it taken
+ * (used != len) and copies, so strings stay immutable. */
+enum { SHARE_MIN = 1024 };
+static SString *alloc_shared_header(VM *vm, char *dp, size_t len) {
+    SString *r = new_obj(vm, offsetof(SString, idata), T_STRING, 0);
+    r->len = (uint32_t)len;
+    r->dp = dp;
+    return r;
+}
+static void put_parts(char *d, const SpValue *ops, unsigned from, unsigned n) {
+    for (unsigned i = from; i < n; i++) {
+        if (ops[i].type == T_STRING) {
+            const SString *x = AS_STR(ops[i]);
+            memcpy(d, x->dp, x->len);
+            d += x->len;
+        } else {
+            d += sp_fmt_int(d, ops[i].as.i);
+        }
+    }
+}
 static SString *concat_fast(VM *vm, const SpValue *ops, unsigned n) {
     size_t total = 0;
     for (unsigned i = 0; i < n; i++) {
@@ -387,19 +410,37 @@ static SString *concat_fast(VM *vm, const SpValue *ops, unsigned n) {
         else return NULL;
     }
     if (total > vm->lim.max_string_bytes) vm_fatal(vm, RS_MEMORY, "string length limit exceeded");
-    SString *r = vm_alloc_string(vm, total);
-    char *d = r->data;
-    for (unsigned i = 0; i < n; i++) {
-        if (ops[i].type == T_STRING) {
-            const SString *x = AS_STR(ops[i]);
-            memcpy(d, x->data, x->len);
-            d += x->len;
-        } else {
-            d += sp_fmt_int(d, ops[i].as.i);
+    if (total >= SHARE_MIN && ops[0].type == T_STRING && AS_STR(ops[0])->len >= SHARE_MIN / 2) {
+        const SString *a = AS_STR(ops[0]);
+        SString *own = a->dp != a->idata ? (SString *)(void *)(a->dp - offsetof(SString, idata)) : NULL;
+        if (own != NULL && own->hash == a->len && (size_t)own->len >= total) {   /* the bytes behind `a` are free: extend in place */
+            put_parts(own->idata + a->len, ops, 1, n);
+            own->hash = (uint32_t)total;
+            own->idata[total] = 0;
+            return alloc_shared_header(vm, own->idata, total);
+        }
+        {   /* a new buffer with room to grow */
+            size_t cap = total + total / 2 + 64;
+            SString *nb;
+            if (cap > vm->lim.max_string_bytes) cap = vm->lim.max_string_bytes;
+            if (cap < total) cap = total;
+            nb = new_obj(vm, offsetof(SString, idata) + cap + 1, T_STRING, 0);
+            nb->len = (uint32_t)cap;
+            nb->dp = nb->idata;
+            memcpy(nb->idata, a->dp, a->len);
+            put_parts(nb->idata + a->len, ops, 1, n);
+            nb->hash = (uint32_t)total;
+            nb->idata[total] = 0;
+            nb->idata[cap] = 0;
+            return alloc_shared_header(vm, nb->idata, total);
         }
     }
-    string_finish(r);
-    return r;
+    {
+        SString *r = vm_alloc_string(vm, total);
+        put_parts(r->dp, ops, 0, n);
+        string_finish(r);
+        return r;
+    }
 }
 
 /* for the JIT: the same fast path (strings and ints only; NULL otherwise) */
@@ -659,9 +700,9 @@ void vm_print_uncaught(VM *vm, int use_json) {
     if (use_json) {
         (void)fprintf(stderr,
                       "{\"severity\":\"error\",\"kind\":\"%s\",\"code\":%d,\"message\":\"%s\",\"file\":\"%s\",\"line\":%d,\"column\":%d}\n",
-                      e->kind->data, e->code, e->message->data, e->file->data, e->line, e->col);
+                      e->kind->dp, e->code, e->message->dp, e->file->dp, e->line, e->col);
         return;
     }
-    (void)fprintf(stderr, "error[%s]: %s\n  --> %s:%d:%d\ntrace (most recent call last):\n%s", e->kind->data,
-                  e->message->data, e->file->data, e->line, e->col, e->trace->data);
+    (void)fprintf(stderr, "error[%s]: %s\n  --> %s:%d:%d\ntrace (most recent call last):\n%s", e->kind->dp,
+                  e->message->dp, e->file->dp, e->line, e->col, e->trace->dp);
 }
