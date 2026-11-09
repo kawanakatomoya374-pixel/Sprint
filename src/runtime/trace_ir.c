@@ -419,6 +419,69 @@ done:
     return rc;
 }
 
+/* Bounds checks that a range loop makes redundant: for `for i in range(start, stop)` (step 1) the test `i < stop` precedes every use of
+ * i as an index in the body, so `a[i]` with a loop-invariant array a is in range for the whole loop when stop <= len(a) and
+ * start >= 0 -- two checks made once at the entry instead of one per trip. The loads are marked (aux = 1) and the entry guards are
+ * inserted before the loop test. Returns the number of loads relieved, or -1 on error. */
+int sp_tir_elide_bounds(SpTraceIR *ir) {
+    size_t fc = ir->count, n = ir->count, found = 0U;
+    SpTIRValue arrays[8], cur, stop;
+    unsigned narr = 0U;
+    const SpTIRInst *test, *add = NULL;
+    for (size_t i = 0U; i + 1U < n; i++) {
+        const SpTIROp o = ir->inst[i].op;
+        if (o >= SP_TIR_ICMP_EQ && o <= SP_TIR_ICMP_GE && !(ir->inst[i + 1U].op == SP_TIR_GUARD_TRUE && (ir->inst[i + 1U].imm & SP_TIR_GUARD_ENTRY))) { fc = i; break; }
+    }
+    if (fc >= n - 1U) return 0;
+    test = &ir->inst[fc];
+    if (test->op != SP_TIR_ICMP_LT || ir->inst[fc + 1U].op != SP_TIR_GUARD_TRUE || (ir->inst[fc + 1U].imm & SP_TIR_GUARD_INVERT)) return 0;
+    cur = test->a; stop = test->b;
+    for (size_t i = 0U; i < n; i++) {
+        const SpTIRInst *in = &ir->inst[i];
+        if (in->op == SP_TIR_PHI && in->dst == cur) {
+            for (size_t k = 0U; k < n; k++) if (ir->inst[k].dst == in->b) add = &ir->inst[k];
+            if (in->type != SP_TIR_T_I64 || add == NULL || add->op != SP_TIR_IADD || add->aux != 1U || add->a != cur) return 0;
+            for (size_t k = 0U; k < n; k++) if (ir->inst[k].dst == add->b && (ir->inst[k].op != SP_TIR_CONST_I64 || ir->inst[k].imm != 1U)) return 0;
+        }
+    }
+    if (add == NULL) return 0;
+    for (size_t i = fc + 2U; i < n; i++) {
+        SpTIRInst *in = &ir->inst[i];
+        int invariant = 0;
+        if (in->op != SP_TIR_ALOAD || in->b != cur || in->aux == 1U) continue;
+        for (size_t k = 0U; k < fc && !invariant; k++) {
+            const SpTIRInst *d = &ir->inst[k];
+            if (d->dst != in->a) continue;
+            invariant = (d->op == SP_TIR_PHI && d->b == d->dst) || d->op == SP_TIR_ALOAD;
+        }
+        if (!invariant) continue;
+        in->aux = 1U;
+        found++;
+        {
+            unsigned u;
+            for (u = 0U; u < narr && arrays[u] != in->a; u++) {}
+            if (u == narr) { if (narr == 8U) return -1; arrays[narr++] = in->a; }
+        }
+    }
+    if (found == 0U) return 0;
+    if (!tir_reserve(ir, (size_t)narr + 1U)) return -1;
+    memmove(&ir->inst[fc + narr + 1U], &ir->inst[fc], (n - fc) * sizeof ir->inst[0]);
+    for (unsigned u = 0U; u < narr; u++) {
+        SpTIRInst g;
+        memset(&g, 0, sizeof g);
+        g.op = SP_TIR_CGUARD; g.type = SP_TIR_T_REF; g.a = arrays[u]; g.b = stop; g.aux = 2U;
+        ir->inst[fc + u] = g;
+    }
+    {
+        SpTIRInst g;
+        memset(&g, 0, sizeof g);
+        g.op = SP_TIR_CGUARD; g.type = SP_TIR_T_I64; g.a = cur; g.b = SP_TIR_NO_VALUE; g.aux = 3U;
+        ir->inst[fc + narr] = g;
+    }
+    ir->count = n + (size_t)narr + 1U;
+    return (int)found;
+}
+
 int sp_tir_emit_ucell(SpTraceIR *ir, SpTIRValue fn, uint32_t idx, SpTIRValue *out) {
     SpTIRType t;
     if (!tir_value_type(ir, fn, &t) || t != SP_TIR_T_REF) return 0;
@@ -694,7 +757,8 @@ int sp_tir_verify(const SpTraceIR *ir, char *message, size_t message_size) {
             }
             break;
         case SP_TIR_CGUARD:
-            if (!tir_value_defined_before(defs, in->a, i, (size_t)ir->nvalues) || types[in->a] != SP_TIR_T_REF) {
+            if (!tir_value_defined_before(defs, in->a, i, (size_t)ir->nvalues) || types[in->a] != (in->aux == 3U ? SP_TIR_T_I64 : SP_TIR_T_REF) ||
+                (in->aux == 2U && (!tir_value_defined_before(defs, in->b, i, (size_t)ir->nvalues) || types[in->b] != SP_TIR_T_I64))) {
                 tir_error(message, message_size, "invalid class guard operand");
                 goto done;
             }

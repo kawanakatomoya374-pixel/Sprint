@@ -94,8 +94,8 @@ typedef struct {
     size_t len;
     struct { size_t disp; unsigned label; int32_t addend; } fix[512];
     size_t nfix;
-    size_t labels[6];
-    uint8_t label_set[6];
+    size_t labels[10];
+    uint8_t label_set[10];
     int failed;
 } TraceAsm;
 
@@ -106,7 +106,7 @@ typedef struct {
     unsigned target;
 } TracePatch;
 
-enum { TA_LOOP = 0, TA_EXIT, TA_DEOPT, TA_MISS, TA_BUDGET, TA_EPILOGUE };
+enum { TA_LOOP = 0, TA_EXIT, TA_DEOPT, TA_MISS, TA_BUDGET, TA_EPILOGUE, TA_UNDO0 /* .. TA_UNDO0 + 3: see ta_coalesce_phi */ };
 #define TA_MEMREG 0xFEU /* regs[] mark of a loop-invariant integer that stays in its slot (see ta_is_invariant_mem) */
 #define TA_NO_LABEL ((unsigned)-1)
 
@@ -302,6 +302,7 @@ static int ta_emit_phi_moves(const SpTraceIR *ir, const uint8_t *regs, TraceAsm 
         if (phi->dst == 0U || phi->dst > ir->nvalues || phi->b == 0U ||
             phi->b > ir->nvalues || regs[phi->dst] == UINT8_MAX ||
             regs[phi->b] == UINT8_MAX || count >= sizeof dst) return 0;
+        if (regs[phi->dst] == regs[phi->b]) continue;   /* coalesced: already in place */
         dst[count] = regs[phi->dst];
         src[count] = regs[phi->b];
         active[count] = 1U;
@@ -504,7 +505,7 @@ static int ta_is_invariant_mem(const SpTraceIR *ir, SpTIRValue phi_dst) {
         if (in->a == phi_dst && in->op >= SP_TIR_ICMP_EQ && in->op <= SP_TIR_ICMP_GE && ta_is_entry_cmp(ir, (size_t)(in - ir->inst)) &&
             ta_is_folded(ir, in->b)) { uses++; continue; }   /* the entry guard reads the slot directly */
         if (in->a == phi_dst || ((in->op == SP_TIR_ASTORE || in->op == SP_TIR_FSTORE) && in->aux == phi_dst)) return 0;
-        if (in->b == phi_dst) { if (!arith) return 0; uses++; }
+        if (in->b == phi_dst) { if (!arith && !(in->op == SP_TIR_CGUARD && in->aux == 2U)) return 0; uses++; }
     }
     return uses > 0;
 }
@@ -812,6 +813,27 @@ static int ta_uses_rax_rdx(const SpTraceIR *ir, const uint8_t *regs) {
     return 0;
 }
 
+/* `s += x` at the end of the iteration: the sum can be computed in the accumulator's own register when nothing after it can leave the
+ * trace (a leaving path would see the new value instead of the iteration's start state); an overflow is undone by the inverse
+ * operation before it deoptimises. Returns the accumulator PHI, or 0. */
+static SpTIRValue ta_coalesce_phi(const SpTraceIR *ir, size_t i) {
+    const SpTIRInst *in = &ir->inst[i];
+    const SpTIRInst *phi = NULL;
+    if ((in->op != SP_TIR_IADD && in->op != SP_TIR_ISUB) || in->a == 0U || in->b == 0U || in->a == in->b || in->dst == 0U) return 0U;
+    for (size_t k = 0U; k < ir->count; k++)
+        if (ir->inst[k].op == SP_TIR_PHI && ir->inst[k].dst == in->a) phi = &ir->inst[k];
+    if (phi == NULL || phi->b != in->dst || phi->type != SP_TIR_T_I64 || phi->aux != 0U || ta_is_fparam(ir, phi->a)) return 0U;
+    for (size_t k = 0U; k < ir->count; k++) {
+        const SpTIRInst *o = &ir->inst[k];
+        if (o->op == SP_TIR_PHI && o != phi && (o->a == in->a || o->b == in->a)) return 0U;
+        if (k <= i) continue;
+        if (o->a == in->a || o->b == in->a || ((o->op == SP_TIR_ASTORE || o->op == SP_TIR_FSTORE) && o->aux == in->a)) return 0U;
+        if (o->op != SP_TIR_PHI && o->op != SP_TIR_LOOP && o->op != SP_TIR_CONST_I64 && o->op != SP_TIR_CONST_F64 &&
+            o->op != SP_TIR_CONST_BOOL && o->op != SP_TIR_VFIELD) return 0U;
+    }
+    return phi->dst;
+}
+
 static int ta_alloc_regs(const SpTraceIR *ir, const int32_t *phi_local, uint8_t **regs_out) {
     size_t n = (size_t)ir->nvalues + 1U;
     uint8_t *regs = (uint8_t *)malloc(n);
@@ -933,6 +955,11 @@ static int ta_alloc_regs(const SpTraceIR *ir, const int32_t *phi_local, uint8_t 
         if (in->dst == 0U || in->op == SP_TIR_PARAM || in->op == SP_TIR_PHI) continue;
         if (in->op == SP_TIR_NEWINST && in->aux == 1U) continue;   /* sunk: no code, no register */
         if (pinned[in->dst]) continue;
+        if (ta_coalesce_phi(ir, i) != 0U && regs[in->a] < 16U && pinned[in->a] && regs[in->b] < 16U) {
+            regs[in->dst] = regs[in->a];
+            pinned[in->dst] = 1U;
+            continue;
+        }
         if (in->op == SP_TIR_CONST_I64 && ta_is_folded(ir, in->dst)) continue;
         if ((in->op == SP_TIR_ICMP_EQ || in->op == SP_TIR_ICMP_NE || in->op == SP_TIR_ICMP_LT ||
              in->op == SP_TIR_ICMP_LE || in->op == SP_TIR_ICMP_GT || in->op == SP_TIR_ICMP_GE ||
@@ -983,7 +1010,10 @@ static int ta_emit_trace_ir(const SpTraceIR *ir, const int32_t *phi_local, unsig
     size_t frame_size = 16U;
     fail_at = SIZE_MAX;
     uint8_t *regs = NULL;
-    size_t pending[16], npending = 0U;   /* ASTORE instructions deferred to the end of the iteration */
+    size_t pending[16], npending = 0U;
+    SpTIROp undo_op[4];
+    uint8_t undo_dst[4], undo_src[4];
+    unsigned nundo = 0U;   /* ASTORE instructions deferred to the end of the iteration */
     uint32_t exit_token = 0U, deopt_token = 0U, miss_token = 0U, budget_token = 0U;
     int ok = 0;
     if (!snapshot_set ||
@@ -1038,7 +1068,16 @@ static int ta_emit_trace_ir(const SpTraceIR *ir, const int32_t *phi_local, unsig
         case SP_TIR_IADD: case SP_TIR_ISUB: case SP_TIR_IMUL:
             if (rb == UINT8_MAX && dst != UINT8_MAX && ra != UINT8_MAX && ta_is_folded(ir, in->b)) {
                 int64_t kb = 0;
-                if (!ta_const_i64(ir, in->b, &kb) || !ta_reg_mov(a, dst, ra)) goto done;
+                if (!ta_const_i64(ir, in->b, &kb)) goto done;
+                if (in->op == SP_TIR_IADD && in->aux == 1U) {   /* cannot overflow (a range counter below its bound): one lea, no check */
+                    TracePatch lp = ta_patch();
+                    lp.h[0] = (int32_t)kb;
+                    lp.b[0] = (uint8_t)(0x48U | (dst >= 8U ? 0x04U : 0U) | (ra >= 8U ? 0x01U : 0U));
+                    lp.b[1] = (uint8_t)(0x80U | ((dst & 7U) << 3) | (ra & 7U));
+                    if (!ta_stencil(a, ST_tr_lea_disp, &lp)) goto done;
+                    break;
+                }
+                if (!ta_reg_mov(a, dst, ra)) goto done;
                 if (in->op == SP_TIR_IMUL ? !ta_imul_imm(a, dst, dst, (int32_t)kb)
                                           : !ta_alu_imm(a, dst, in->op == SP_TIR_IADD ? 0U : 5U, (int32_t)kb)) goto done;
                 if (!ta_jcc(a, 0x80U, TA_DEOPT)) goto done;
@@ -1052,6 +1091,12 @@ static int ta_emit_trace_ir(const SpTraceIR *ir, const int32_t *phi_local, unsig
                 break;
             }
             if (dst == UINT8_MAX || ra == UINT8_MAX || rb == UINT8_MAX || ra == TA_MEMREG || rb == TA_MEMREG) goto done;
+            if (dst == ra && in->op != SP_TIR_IMUL && ta_coalesce_phi(ir, i) != 0U && nundo < 4U) {
+                undo_op[nundo] = in->op; undo_dst[nundo] = dst; undo_src[nundo] = rb;
+                if (!ta_reg_binop(a, dst, rb, in->op == SP_TIR_IADD ? 0x01U : 0x29U) || !ta_jcc(a, 0x80U, TA_UNDO0 + nundo)) goto done;
+                nundo++;
+                break;
+            }
             if (!ta_reg_mov(a, dst, ra)) goto done;
             if (in->op == SP_TIR_IADD) {
                 if (!ta_reg_binop(a, dst, rb, 0x01U)) goto done;
@@ -1135,7 +1180,8 @@ static int ta_emit_trace_ir(const SpTraceIR *ir, const int32_t *phi_local, unsig
             break;
         case SP_TIR_ALOAD:
             if (dst >= 16U || ra >= 16U || rb >= 16U || in->imm > 255U) goto done;
-            if (!ta_ab_bounds(a, ra, rb) || !ta_jcc(a, 0x83U, TA_DEOPT) || !ta_ab_addr(a, ra, rb) ||
+            if (in->aux != 1U && (!ta_ab_bounds(a, ra, rb) || !ta_jcc(a, 0x83U, TA_DEOPT))) goto done;   /* aux 1: range proven at entry */
+            if (!ta_ab_addr(a, ra, rb) ||
                 !ta_ab_tag(a, (uint8_t)in->imm) || !ta_jcc(a, 0x85U, TA_DEOPT) || !ta_ab_load(a, dst)) goto done;
             break;
         case SP_TIR_FLOAD:
@@ -1144,6 +1190,20 @@ static int ta_emit_trace_ir(const SpTraceIR *ir, const int32_t *phi_local, unsig
                 !ta_field_load(a, dst, ra, in->aux)) goto done;
             break;
         case SP_TIR_CGUARD:
+            if (in->aux == 2U) {   /* entry: bound (rb) <= length of the array */
+                uint8_t bound = rb;
+                if (ra >= 16U) goto done;
+                if (rb == TA_MEMREG && in->b <= ir->nvalues && phi_local[in->b] >= 0) {
+                    if (!ta_local_load_reg(a, (uint32_t)phi_local[in->b], 10U)) goto done;
+                    bound = 10U;
+                }
+                if (bound >= 16U || !ta_ab_bounds(a, ra, bound) || !ta_jcc(a, 0x87U, TA_DEOPT)) goto done;
+                break;
+            }
+            if (in->aux == 3U) {   /* entry: the counter is not negative */
+                if (ra >= 16U || !ta_reg_test(a, ra) || !ta_jcc(a, 0x88U, TA_DEOPT)) goto done;
+                break;
+            }
             if (in->aux == 1U && ra == TA_MEMREG && phi_local[in->a] >= 0) {   /* the reference sits in its slot */
                 if (!ta_reg_imm(a, 10U, in->imm) || !ta_alu_mem(a, 10U, 0x3bU, (uint32_t)phi_local[in->a]) || !ta_jcc(a, 0x85U, TA_DEOPT)) goto done;
                 break;
@@ -1214,6 +1274,10 @@ static int ta_emit_trace_ir(const SpTraceIR *ir, const int32_t *phi_local, unsig
         default:
             goto done;
         }
+    }
+    for (unsigned u = 0U; u < nundo; u++) {   /* an overflowed accumulation: take it back, then deoptimise */
+        if (!ta_label(a, TA_UNDO0 + u) ||
+            !ta_reg_binop(a, undo_dst[u], undo_src[u], undo_op[u] == SP_TIR_IADD ? 0x29U : 0x01U) || !ta_jmp(a, TA_DEOPT)) goto done;
     }
     if (!a->label_set[TA_LOOP] || !ta_label(a, TA_EXIT)) goto done;
     if (!ta_emit_snapshot_stores(ir, a, &snapshot_set->snapshots[SP_JIT_SNAPSHOT_EXIT], regs,
@@ -2739,7 +2803,9 @@ walked:
             }
             if (!sp_tir_emit_guard(ir, cond, i + 1U, flags)) goto done;
             stack[depth++] = cur;
-            if (!sp_tir_emit_binary(ir, SP_TIR_IADD, cur, kstep, &nx)) goto done;   /* an overflow deoptimises: the interpreter ends the loop */
+            if (!sp_tir_emit_binary(ir, SP_TIR_IADD, cur, kstep, &nx)) goto done;
+            if (stepv == 1 || stepv == -1) ir->inst[ir->count - 1U].aux = 1U;   /* cur is strictly inside the bounds just tested: no overflow */
+            /* an overflow otherwise deoptimises: the interpreter ends the loop */
             current[po->arg] = nx;
             stored = 1;
             break;
@@ -2799,7 +2865,7 @@ walked:
     }
     for (uint32_t i = 0U; i < slot_total; i++)
         if (used[i] && !sp_tir_set_phi_backedge(ir, phi[i], current[i])) goto done;
-    if (sp_tir_hoist_loads(ir) < 0) goto done;
+    if (sp_tir_hoist_loads(ir) < 0 || sp_tir_elide_bounds(ir) < 0) goto done;
     /* the loop label is planted at the first comparison, and only its operands live across trips: that comparison must sit at the
      * start of the iteration, with nothing but its own constants before it */
     {

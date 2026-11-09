@@ -1730,6 +1730,11 @@ ST tr_sar_imm                   # HB0 = REX.W(+B), HB1 = modrm (/7 + register), 
     .byte HB0, 0xc1, HB1, HB2
 
 # integer ALU op with a 32-bit immediate (add /0, sub /5, cmp /7): HB0 = REX.W(+B), HB1 = modrm, H0 = the immediate
+# lea reg, [reg + disp32]: HB0 = REX.W(+R,+B), HB1 = modrm (mod 10)
+ST tr_lea_disp
+    .byte HB0, 0x8d, HB1
+    .long H0
+
 ST tr_alu_imm
     .byte HB0, 0x81, HB1
     .long H0
