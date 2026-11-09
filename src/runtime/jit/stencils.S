@@ -293,6 +293,44 @@ ST ucall_s
     jne JIT_X
     UCK_BODY 1
 
+# a function calling itself with no locals beyond its parameters (fib): no nil fill, and no register juggling -- the callee
+# runs with the same constant table, and returns with r12 at its own base, from which the caller's base is recomputed
+ST ucall_s0
+    cmpq $T_FUNCTION,H0(%r12)
+    jne JIT_X
+    mov H0+8(%r12),%rax
+    mov L_SFUNC_PROTO(%rax),%rcx
+    movabs $HQ2,%rdx
+    cmp %rdx,%rcx
+    jne JIT_X
+    cmpq $0,L_VM_ILEFT(%rbx)
+    je JIT_X
+    mov L_VM_NFRAMES(%rbx),%ecx
+    cmp L_VM_JFMAX(%rbx),%ecx
+    jge JIT_X
+    lea H0+16(%r12),%r8
+    lea H3(%r8),%r9
+    cmp L_VM_STACK_END(%rbx),%r9
+    ja JIT_X
+    decq L_VM_ILEFT(%rbx)
+    movabs $HQ,%r9
+    mov %r9,L_FR_PC(%r15)
+    add $L_FRAME,%r15
+    inc %ecx
+    mov %ecx,L_VM_NFRAMES(%rbx)
+    mov %rax,L_FR_FN(%r15)
+    mov %r8,L_FR_BASE(%r15)
+    movl $0,L_FR_KIND(%r15)
+    mov L_VM_NDR(%rbx),%r9d
+    mov %r9d,L_FR_DBASE(%r15)
+    movq $0,L_FR_UEV(%r15)
+    movq $0,L_FR_UEV+8(%r15)
+    mov L_PROTO_CODE(%rdx),%r9
+    mov %r9,L_FR_PC(%r15)
+    mov %r8,%r12
+    call JIT_T
+    sub $(H0+16),%r12
+
 # CALL with H1 arguments; the callee value is slot H0, the arguments follow.
 ST ucall
     cmpq $T_FUNCTION,H0(%r12)

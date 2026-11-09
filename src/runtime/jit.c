@@ -2143,7 +2143,8 @@ static int do_call(JC *c, uint32_t pc, int len, uint32_t *skip) {
             c->hq2 = (uint64_t)(uintptr_t)kp;
             c->tk = 3;
             c->tt = 0;
-            EM(ST_ucall_s, soff(c, pf), argc, kp->nlocals, (int32_t)need, 0, retpc);
+            if (kp->nlocals == argc) EM(ST_ucall_s0, soff(c, pf), argc, kp->nlocals, (int32_t)need, 0, retpc);
+            else EM(ST_ucall_s, soff(c, pf), argc, kp->nlocals, (int32_t)need, 0, retpc);
             goto called;
         }
         if (inl_enabled && c->cur_ic == 0 && kp != c->p && f->hint && f->hint->type == T_FUNCTION) {
