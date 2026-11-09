@@ -1928,6 +1928,69 @@ ST tr_gc_check
     .byte 0x4d, 0x3b, 0x95      # cmp H1(%r13), %r10
     .long H1
 
+# ---- string byte loads and leaf-predicate calls in traces
+ST tr_sstr_len                  # r10d = length of the string in ra: HB0 = REX(.R r10 + B), HB1 = modrm (mod 10, reg r10, rm ra)
+    .byte HB0, 0x8b, HB1
+    .long L_SSTR_LEN
+
+ST tr_sload                     # dst = byte at [ra + rb + data] (zero-extended): HB0 = REX, HB1 = modrm (mod 10, reg dst, rm 100), HB2 = SIB (index rb, base ra)
+    .byte HB0, 0x0f, 0xb6, HB1, HB2
+    .long L_SSTR_DATA
+
+ST tr_push                      # push a register: HB0 = 0x40 | REX.B, HB1 = 0x50 | reg
+    .byte HB0, HB1
+
+# call the leaf function in r10 with the two arguments the caller pushed (a below b); the result lands in dst (HB0 = REX.W|R, HB1 =
+# modrm of `mov dst, (%rsp)`), flags: non-zero when the leaf asked for the interpreter. Pool registers and the budget are preserved.
+ST tr_leaf_call
+    push %rax
+    push %rcx
+    push %rdx
+    push %rsi
+    push %rdi
+    push %r8
+    push %r9
+    push %r11
+    sub $8,%rsp
+    mov 80(%rsp),%rdi
+    mov 72(%rsp),%rsi
+    call *%r10
+    mov %rax,(%rsp)
+    mov %rdx,%r10
+    mov 8(%rsp),%r11
+    mov 16(%rsp),%r9
+    mov 24(%rsp),%r8
+    mov 32(%rsp),%rdi
+    mov 40(%rsp),%rsi
+    mov 48(%rsp),%rdx
+    mov 56(%rsp),%rcx
+    mov 64(%rsp),%rax
+    .byte HB0, 0x8b, HB1, 0x24  # mov dst, (%rsp)
+    add $88,%rsp
+    test %r10,%r10
+
+# a deopt continues in the loop's next path variant when there is one (HQ = the trace's runtime cells; deopt_entry at +24): the frame
+# already holds the iteration-start state and the budget is stored, exactly as for the host
+ST tr_deopt_link                # H0 = offset of VM.trace_hops from the budget cell (r13): each hop costs one
+    movabs $HQ,%r10
+    mov 24(%r10),%r10
+    test %r10,%r10
+    jz 1f
+    cmpq $0,H0(%r13)
+    je 1f
+    decq H0(%r13)
+    mov %r12,%rdi
+    mov %r13,%rsi
+    add $16,%rsp
+    pop %r15
+    pop %r14
+    pop %r13
+    pop %r12
+    pop %rbx
+    pop %rbp
+    jmp *%r10
+1:
+
 ST tr_div_guard                 # r10 = divisor; 0 and -1 leave through JIT_T (deopt): the interpreter raises the error / handles INT64_MIN / -1
     inc %r10
     cmp $1,%r10

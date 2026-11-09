@@ -39,10 +39,12 @@ typedef struct {
     TraceEntry link_entry;
     uint64_t last_used;
     uint64_t *clock;
+    TraceEntry deopt_entry;   /* the next path variant of this loop: a deopt jumps here, with the iteration-start state in the frame */
 } TraceRuntimeCells;
 _Static_assert(sizeof(void *) == 8U && sizeof(TraceEntry) == 8U &&
                offsetof(TraceRuntimeCells, last_used) == 8U &&
-               offsetof(TraceRuntimeCells, clock) == 16U,
+               offsetof(TraceRuntimeCells, clock) == 16U &&
+               offsetof(TraceRuntimeCells, deopt_entry) == 24U,
                "TraceJIT runtime-cell ABI");
 struct TraceRegion {
     struct TraceRegion *next;
@@ -61,6 +63,7 @@ struct TraceRegion {
     uint64_t signature_hash;
     uint64_t side_attempts[TRACE_SIDE_ATTEMPT_MAX];
     uint64_t ticks;               /* loop iterations run in this trace over its life (region-vs-trace policy) */
+    uint64_t hops, hop_iters;     /* hops between path variants taken, and loop iterations run (a chain that is switched at every other iteration costs more than the region JIT) */
     uint64_t deopts, deopt_iters; /* deopt exits taken, and loop iterations completed between them (demotion policy) */
     uint8_t dead;                 /* demoted: the loop is left to the region JIT */
     uint8_t nmod;                 /* module variables the trace keeps in scratch slots (mod_slot0 + k) of the frame */
@@ -68,6 +71,10 @@ struct TraceRegion {
     uint32_t mod_slot0;
     uint8_t slot;
     uint8_t is_side;
+    uint8_t is_variant;           /* a path variant: same entry signature as its parent, reached from the parent's deopt */
+    uint8_t vdeopts;              /* deopts that returned to the host from this trace without a variant to go to */
+    uint8_t vtries;               /* variant recordings requested for this trace */
+    uint8_t variant_pending;      /* a variant recording is under way: the next side trace compiled under this parent is that variant */
     uint8_t side_count;
     uint8_t side_attempt_count;
     uint8_t depth;
@@ -623,6 +630,29 @@ static int ta_materialize(const SpTraceIR *ir, const uint8_t *regs, SpTIRValue o
     }
     return ta_local_store_reg(a, slot, 10U);
 }
+static int ta_push(TraceAsm *a, uint8_t reg) {
+    TracePatch p = ta_patch();
+    p.b[0] = (uint8_t)(0x40U | (reg >= 8U ? 0x01U : 0U));
+    p.b[1] = (uint8_t)(0x50U | (reg & 7U));
+    return ta_stencil(a, ST_tr_push, &p);
+}
+/* dst = byte `rb` of the string in ra; an index outside 0 .. len-1 deoptimises */
+static int ta_sload(TraceAsm *a, uint8_t dst, uint8_t ra, uint8_t rb) {
+    TracePatch lp = ta_patch(), sp = ta_patch();
+    lp.b[0] = (uint8_t)(0x44U | (ra >= 8U ? 0x01U : 0U));
+    lp.b[1] = (uint8_t)(0x90U | (ra & 7U));
+    sp.b[0] = (uint8_t)(0x40U | (dst >= 8U ? 0x04U : 0U) | (rb >= 8U ? 0x02U : 0U) | (ra >= 8U ? 0x01U : 0U));
+    sp.b[1] = (uint8_t)(0x80U | ((dst & 7U) << 3) | 4U);
+    sp.b[2] = (uint8_t)(((rb & 7U) << 3) | (ra & 7U));
+    return ta_stencil(a, ST_tr_sstr_len, &lp) && ta_reg_binop(a, rb, 10U, 0x39U) && ta_jcc(a, 0x83U, TA_DEOPT) &&
+           ta_stencil(a, ST_tr_sload, &sp);
+}
+static int ta_leaf_call(TraceAsm *a, uint8_t dst, uint8_t ra, uint8_t rb, uint64_t fn) {
+    TracePatch p = ta_patch();
+    p.b[0] = (uint8_t)(0x48U | (dst >= 8U ? 0x04U : 0U));
+    p.b[1] = (uint8_t)(0x04U | ((dst & 7U) << 3));
+    return ta_push(a, ra) && ta_push(a, rb) && ta_reg_imm(a, 10U, fn) && ta_stencil(a, ST_tr_leaf_call, &p) && ta_jcc(a, 0x85U, TA_DEOPT);
+}
 static int ta_gc_check(TraceAsm *a) {
     TracePatch p = ta_patch();
     p.h[0] = (int32_t)((ptrdiff_t)offsetof(VM, bytes) - (ptrdiff_t)offsetof(VM, ileft));
@@ -720,7 +750,7 @@ static int ta_f64_guard_false(TraceAsm *a, SpTIROp op, unsigned target) {
     case SP_TIR_FSUB: case SP_TIR_FMUL: case SP_TIR_FDIV:
     case SP_TIR_FNEG: case SP_TIR_ICMP_EQ: case SP_TIR_ICMP_NE:
     case SP_TIR_ICMP_LT: case SP_TIR_ICMP_LE: case SP_TIR_ICMP_GT:
-    case SP_TIR_ICMP_GE: case SP_TIR_GUARD_TRUE: case SP_TIR_ALOAD: case SP_TIR_ASTORE: case SP_TIR_FLOAD: case SP_TIR_VFIELD: case SP_TIR_UCELL: case SP_TIR_NEWINST: case SP_TIR_FSTORE: case SP_TIR_CGUARD: case SP_TIR_LOOP:
+    case SP_TIR_ICMP_GE: case SP_TIR_GUARD_TRUE: case SP_TIR_ALOAD: case SP_TIR_ASTORE: case SP_TIR_FLOAD: case SP_TIR_VFIELD: case SP_TIR_SLOAD: case SP_TIR_LEAFCALL: case SP_TIR_UCELL: case SP_TIR_NEWINST: case SP_TIR_FSTORE: case SP_TIR_CGUARD: case SP_TIR_LOOP:
     case SP_TIR_RETURN:
         return 0;
     default:
@@ -754,6 +784,12 @@ static int ta_trace_touch(TraceAsm *a, TraceRuntimeCells *runtime) {
     p.q = (uint64_t)(uintptr_t)runtime;
     return ta_stencil(a, ST_tr_touch, &p);
 }
+static int ta_deopt_link(TraceAsm *a, TraceRuntimeCells *runtime) {
+    TracePatch p = ta_patch();
+    p.h[0] = (int32_t)((ptrdiff_t)offsetof(VM, trace_hops) - (ptrdiff_t)offsetof(VM, ileft));
+    p.q = (uint64_t)(uintptr_t)runtime;
+    return ta_stencil(a, ST_tr_deopt_link, &p);
+}
 static int ta_trace_exit(TraceAsm *a, uint32_t token, TraceRuntimeCells *runtime) {
     TracePatch p = ta_patch();
     p.h[0] = (int32_t)token;
@@ -774,7 +810,7 @@ static uint8_t ta_cmp_cc(SpTIROp op) {
     case SP_TIR_IMOD: case SP_TIR_INEG: case SP_TIR_FADD: case SP_TIR_FSUB: case SP_TIR_FMUL:
     case SP_TIR_FDIV: case SP_TIR_FNEG: case SP_TIR_FCMP_EQ: case SP_TIR_FCMP_NE:
     case SP_TIR_FCMP_LT: case SP_TIR_FCMP_LE: case SP_TIR_FCMP_GT: case SP_TIR_FCMP_GE:
-    case SP_TIR_GUARD_TRUE: case SP_TIR_ALOAD: case SP_TIR_ASTORE: case SP_TIR_FLOAD: case SP_TIR_VFIELD: case SP_TIR_UCELL: case SP_TIR_NEWINST: case SP_TIR_FSTORE: case SP_TIR_CGUARD: case SP_TIR_LOOP: case SP_TIR_RETURN: return 0U;
+    case SP_TIR_GUARD_TRUE: case SP_TIR_ALOAD: case SP_TIR_ASTORE: case SP_TIR_FLOAD: case SP_TIR_VFIELD: case SP_TIR_SLOAD: case SP_TIR_LEAFCALL: case SP_TIR_UCELL: case SP_TIR_NEWINST: case SP_TIR_FSTORE: case SP_TIR_CGUARD: case SP_TIR_LOOP: case SP_TIR_RETURN: return 0U;
     default: return 0U;
     }
 }
@@ -791,7 +827,7 @@ static uint8_t ta_cmp_false_cc(SpTIROp op) {
     case SP_TIR_IMOD: case SP_TIR_INEG: case SP_TIR_FADD: case SP_TIR_FSUB: case SP_TIR_FMUL:
     case SP_TIR_FDIV: case SP_TIR_FNEG: case SP_TIR_FCMP_EQ: case SP_TIR_FCMP_NE:
     case SP_TIR_FCMP_LT: case SP_TIR_FCMP_LE: case SP_TIR_FCMP_GT: case SP_TIR_FCMP_GE:
-    case SP_TIR_GUARD_TRUE: case SP_TIR_ALOAD: case SP_TIR_ASTORE: case SP_TIR_FLOAD: case SP_TIR_VFIELD: case SP_TIR_UCELL: case SP_TIR_NEWINST: case SP_TIR_FSTORE: case SP_TIR_CGUARD: case SP_TIR_LOOP: case SP_TIR_RETURN: return 0U;
+    case SP_TIR_GUARD_TRUE: case SP_TIR_ALOAD: case SP_TIR_ASTORE: case SP_TIR_FLOAD: case SP_TIR_VFIELD: case SP_TIR_SLOAD: case SP_TIR_LEAFCALL: case SP_TIR_UCELL: case SP_TIR_NEWINST: case SP_TIR_FSTORE: case SP_TIR_CGUARD: case SP_TIR_LOOP: case SP_TIR_RETURN: return 0U;
     default: return 0U;
     }
 }
@@ -1228,6 +1264,12 @@ static int ta_emit_trace_ir(const SpTraceIR *ir, const int32_t *phi_local, unsig
             }
             if (ra >= 16U || !(in->aux == 1U ? ta_ref_guard(a, ra, in->imm) : ta_class_guard(a, ra, in->imm))) goto done;
             break;
+        case SP_TIR_SLOAD:
+            if (dst >= 16U || ra >= 16U || rb >= 16U || !ta_sload(a, dst, ra, rb)) goto done;
+            break;
+        case SP_TIR_LEAFCALL:
+            if (dst >= 16U || ra >= 16U || (in->aux == 2U ? rb >= 16U : 0) || !ta_leaf_call(a, dst, ra, in->aux == 2U ? rb : ra, in->imm)) goto done;
+            break;
         case SP_TIR_VFIELD:
             break;
         case SP_TIR_NEWINST:
@@ -1306,7 +1348,7 @@ static int ta_emit_trace_ir(const SpTraceIR *ir, const int32_t *phi_local, unsig
     if (!ta_emit_snapshot_stores(ir, a, &snapshot_set->snapshots[SP_JIT_SNAPSHOT_DEOPT], regs,
                                  ir->nvalues) ||
         !ta_emit_module_stores(ir, phi_local, regs, snapshot_set->loop_map.slot_count, a) ||
-        !ta_store_budget(a) || !ta_trace_touch(a, runtime) || !ta_return(a, deopt_token)) goto done;
+        !ta_store_budget(a) || !ta_deopt_link(a, runtime) || !ta_trace_touch(a, runtime) || !ta_return(a, deopt_token)) goto done;
     if (!ta_label(a, TA_MISS) || !ta_trace_touch(a, runtime) || !ta_return(a, miss_token) ||
         !ta_label(a, TA_BUDGET) ||
         !ta_emit_snapshot_stores(ir, a, &snapshot_set->snapshots[SP_JIT_SNAPSHOT_BUDGET], regs,
@@ -1371,6 +1413,8 @@ static uint8_t trace_ir_runtime_type(const SpTraceIR *ir, SpTIRValue value) {
             return (uint8_t)T_BOOL;
         case SP_TIR_ALOAD: case SP_TIR_FLOAD: return (uint8_t)in->imm;
         case SP_TIR_UCELL: return (uint8_t)T_CELL;
+        case SP_TIR_SLOAD: return (uint8_t)T_INT;
+        case SP_TIR_LEAFCALL: return in->type == SP_TIR_T_BOOL ? (uint8_t)T_BOOL : (uint8_t)T_INT;
         case SP_TIR_NEWINST: return (uint8_t)T_INSTANCE;
         case SP_TIR_GUARD_TRUE: case SP_TIR_ASTORE: case SP_TIR_FSTORE: case SP_TIR_CGUARD: case SP_TIR_VFIELD: case SP_TIR_LOOP: case SP_TIR_RETURN:
             return UINT8_MAX;
@@ -1663,6 +1707,11 @@ static int trace_cache_evict_slot(struct JitProto *jp, uint8_t slot) {
                     parent->sides[parent->side_count] = NULL;
                     break;
                 }
+            }
+            if (victim->is_variant) {   /* the new tail of the chain goes back to its head again, the head itself to nothing */
+                TraceRegion *head = parent;
+                while (head->is_variant && head->parent != NULL) head = head->parent;
+                __atomic_store_n(&parent->runtime.deopt_entry, parent == head ? (TraceEntry)NULL : head->entry, __ATOMIC_RELEASE);
             }
             trace_side_attempt_remove(parent, victim->signature_hash);
             if (parent->side_count == 0U)
@@ -2110,6 +2159,7 @@ typedef struct {
     uint8_t mod;          /* a module variable (arg indexes the root frame's scratch slots whatever the depth) */
     Proto *proto;         /* the function the instruction belongs to */
     Proto *callee;        /* OP_CALL: the inlined callee */
+    uint8_t leaf;         /* OP_CALL: the callee is called as a native leaf predicate instead of being walked */
 } PathOp;
 
 /* Pending field writes of the iteration (object value + byte offset -> value): later reads of the same location take the
@@ -2179,10 +2229,48 @@ static int trace_field_access(SpTraceIR *ir, FieldState *fs, int is_set, SpTIRVa
     return sp_tir_emit_fload(ir, fty, tag, obj, off, out);
 }
 
+/* Which way did the recorded run go at the branch at `pc` of function `wp` (target = where a jump goes, fall = the next instruction)?
+ * 1 = jumped, 0 = fell through, -1 = cannot tell.  The loop's own function: the smallest recorded pc after the branch; a callee: the
+ * first step of that function after the cursor that lands on one of the two (the cursor then moves there). */
+static int walk_dir(const TraceStep *steps, unsigned count, unsigned *cur, const Proto *root, const Proto *wp,
+                    uint32_t pc, uint32_t target, uint32_t fall) {
+    if (wp == root) {
+        uint32_t next = UINT32_MAX;
+        for (unsigned k = 0U; k < count; k++)
+            if (steps[k].proto == root && steps[k].pc > pc && steps[k].pc < next) next = steps[k].pc;
+        if (next == target) return 1;
+        return next == fall ? 0 : -1;
+    }
+    for (unsigned j = *cur; j < count; j++) {
+        if (steps[j].proto != wp || steps[j].pc <= pc) continue;
+        if (steps[j].pc == target) { *cur = j; return 1; }
+        if (steps[j].pc == fall) { *cur = j; return 0; }
+    }
+    return -1;
+}
+
+/* a callee with branches that is a leaf predicate (jit_pure.c) is called natively from a trace; straight-line callees are walked */
+static _Thread_local int g_leaf_mode;   /* 0: branchy callees are walked (guards on the recorded path); 1: they are called as native leaf predicates */
+static int sink_leaf_ok(Proto *cp, unsigned nargs) {
+    if (!g_leaf_mode) return 0;
+    const uint8_t *code = cp->ocode ? cp->ocode : cp->code;
+    int branchy = 0;
+    if (nargs < 1U || nargs > 2U || (unsigned)cp->nparams != nargs) return 0;
+    for (uint32_t pc = 0U; pc < cp->code_len;) {
+        int op = code[pc], len = op_len(op);
+        if (len <= 0) return 0;
+        if (op == OP_JUMP || op == OP_JUMP_IF_FALSE || op == OP_JUMP_IF_TRUE || op == OP_JUMP_IF_FALSE_OR_POP || op == OP_JUMP_IF_TRUE_OR_POP) branchy = 1;
+        pc += (uint32_t)len;
+    }
+    if (!branchy) return 0;
+    if (!cp->leaf_tried) { cp->leaf_tried = 1U; cp->leaf = jit_leaf_compile(NULL, cp); }
+    return cp->leaf != NULL;
+}
+
 static int trace_build_ir_path_impl(Proto *p, const SpValue *locals, const SpValue *mslots, uint32_t stack_depth, uint32_t header,
                                const TraceStep *steps, unsigned count, SpTraceIR *ir,
                                int32_t **phi_local_out, uint32_t *exit_pc_out, uint32_t *backedge_pc_out,
-                               unsigned *nmod_out, uint16_t *mod_idx_out, int sink) {
+                               unsigned *nmod_out, uint16_t *mod_idx_out, int sink, unsigned nmod_seed, const uint16_t *mod_seed) {
     const uint8_t *code = p->ocode ? p->ocode : p->code;
     PathOp path[256];
     unsigned np = 0U;
@@ -2200,10 +2288,15 @@ static int trace_build_ir_path_impl(Proto *p, const SpValue *locals, const SpVal
     unsigned nmod = 0U, slot_total;
 #define SLOTV(I) ((I) < slot_count ? locals[(I)] : mslots[mod_idx[(I) - slot_count]])
     const SArray **vhint = NULL;   /* per SSA value: the array object it held when the trace was recorded (element types come from it) */
+    const Proto *leafp[4];            /* callees called as native leaf predicates: their recorded steps are not walked */
+    unsigned nleafp = 0U;
     FieldState fs;
     GuardSet gs;
     VObj vobj[8];
     unsigned nvobj = 0U;
+    SpTIRValue known_v[16];           /* values a guard has settled ... */
+    uint8_t known_t[16];              /* ... to true (1) or false (2) */
+    unsigned nknown = 0U;
     uint8_t *cand = NULL;             /* sink mode: slots that hold a sunk instance across the loop */
     SpTIRValue (*fpar)[8] = NULL;     /* ... their field parameters (entry values) */
     SpTIRValue (*fphi)[8] = NULL;     /* ... and field phis */
@@ -2219,6 +2312,7 @@ static int trace_build_ir_path_impl(Proto *p, const SpValue *locals, const SpVal
     unsigned nucm = 0U;
     const SInstance **ihint = NULL;   /* per SSA value: the instance it held at recording time (its class is guarded in the trace) */
     const char *why = "path builder: unsupported";
+    if (mod_seed != NULL) { for (unsigned k = 0U; k < nmod_seed && k < 8U; k++) mod_idx[k] = mod_seed[k]; nmod = nmod_seed < 8U ? nmod_seed : 8U; }
 
     if (!p || !locals || !code || !steps || count < 2U || count > 256U || p->nlocals <= 0 || p->nlocals > 512 ||
         stack_depth > UINT16_MAX - (uint32_t)p->nlocals || steps[0].proto != p) return 0;
@@ -2249,12 +2343,12 @@ static int trace_build_ir_path_impl(Proto *p, const SpValue *locals, const SpVal
             len = op_len(op);
             if (len <= 0 || pc + (uint32_t)len > wp->code_len) { why = "bad instruction"; goto done; }
             po = &path[np++];
-            po->pc = pc; po->op = (uint8_t)op; po->lvl = (uint8_t)lvl; po->mod = 0U; po->proto = wp; po->callee = NULL; po->arg = 0U; po->taken = 0U; po->target = 0U;
+            po->pc = pc; po->op = (uint8_t)op; po->lvl = (uint8_t)lvl; po->mod = 0U; po->leaf = 0U; po->proto = wp; po->callee = NULL; po->arg = 0U; po->taken = 0U; po->target = 0U;
             switch (op) {
             case OP_JUMP: {
                 int32_t off = rd32s(wc + pc + 1U);
                 int64_t t = (int64_t)pc + 5 + off;
-                if (lvl > 0U) { why = "jump in an inlined callee"; goto done; }
+                if (lvl > 0U && off < 0) { why = "backward jump in an inlined callee"; goto done; }
                 if (off < 0) {
                     if (t != (int64_t)header) { why = "backward jump is not the loop edge"; goto done; }
                     backedge = pc;
@@ -2264,16 +2358,14 @@ static int trace_build_ir_path_impl(Proto *p, const SpValue *locals, const SpVal
                 pc = (uint32_t)t;
                 continue;
             }
-            case OP_JUMP_IF_FALSE: case OP_JUMP_IF_TRUE: {
+            case OP_JUMP_IF_FALSE: case OP_JUMP_IF_TRUE: case OP_JUMP_IF_FALSE_OR_POP: case OP_JUMP_IF_TRUE_OR_POP: {
                 int32_t off = rd32s(wc + pc + 1U);
                 int64_t t = (int64_t)pc + 5 + off;
-                uint32_t next = UINT32_MAX;
-                if (lvl > 0U) { why = "branch in an inlined callee"; goto done; }
+                int dir;
                 if (off <= 0 || t >= (int64_t)wp->code_len) goto done;
-                for (unsigned k = 0U; k < count; k++)
-                    if (steps[k].proto == p && steps[k].pc > pc && steps[k].pc < next) next = steps[k].pc;
-                if (next == (uint32_t)t) po->taken = 1U;
-                else if (next != pc + 5U) { why = "cannot tell the branch direction"; goto done; }
+                dir = walk_dir(steps, count, &cur, p, wp, pc, (uint32_t)t, pc + 5U);
+                if (dir < 0) { why = "cannot tell the branch direction"; goto done; }
+                po->taken = (uint8_t)dir;
                 po->target = (uint32_t)t;
                 pc = po->taken ? (uint32_t)t : pc + 5U;
                 continue;
@@ -2336,6 +2428,14 @@ static int trace_build_ir_path_impl(Proto *p, const SpValue *locals, const SpVal
                 if (cp == NULL || cp->nlocals > 64 || (cp->nparams != (int)(po->arg + (op == OP_INVOKE ? 1U : 0U)) && (op == OP_INVOKE || cp->nparams != (int)po->arg + 1)) || cp->has_rest || cp->ndefaults != 0 ||
                     cp->nrequired != cp->nparams || cp->nlocals < cp->nparams) { why = "callee shape"; goto done; }
                 po->callee = cp;
+                if (op == OP_CALL && sink_leaf_ok(cp, (unsigned)po->arg)) {   /* a branchy integer predicate: one native call, its steps are skipped */
+                    po->leaf = 1U;
+                    if (nleafp < 4U) leafp[nleafp++] = cp; else { why = "too many leaf predicates"; goto done; }
+                    while (k < count && steps[k].proto != wp) k++;
+                    cur = k;
+                    pc += clen;
+                    continue;
+                }
                 saved_pc[lvl] = pc + clen; saved_p[lvl] = wp;
                 lvl++;
                 wp = cp; wc = cp->ocode ? cp->ocode : cp->code; pc = 0U; cur = k;
@@ -2364,6 +2464,7 @@ walked:
     for (unsigned k = 0U; k < count; k++) {
         int found = 0;
         for (unsigned i = 0U; i < np && !found; i++) found = path[i].pc == steps[k].pc && path[i].proto == steps[k].proto;
+        for (unsigned i = 0U; i < nleafp && !found; i++) found = leafp[i] == steps[k].proto;   /* steps of a leaf predicate: not walked */
         if (!found) { why = "walked path differs from the recorded one"; goto done; }
     }
 
@@ -2572,10 +2673,11 @@ walked:
         case OP_EQ: case OP_NE: case OP_LT: case OP_LE: case OP_GT: case OP_GE: {
             SpTIROp cmp;
             SpTIRType ta, tb;
-            if (depth < 2U || i + 1U >= np ||
-                (path[i + 1U].op != OP_JUMP_IF_FALSE && path[i + 1U].op != OP_JUMP_IF_TRUE)) { why = "comparison not feeding a branch"; goto done; }
+            if (depth < 2U) goto done;
             b = stack[--depth]; a = stack[--depth];
             ta = ir->value_types[a]; tb = ir->value_types[b];
+            if (ta == SP_TIR_T_F64 && (i + 1U >= np || (path[i + 1U].op != OP_JUMP_IF_FALSE && path[i + 1U].op != OP_JUMP_IF_TRUE &&
+                path[i + 1U].op != OP_JUMP_IF_FALSE_OR_POP && path[i + 1U].op != OP_JUMP_IF_TRUE_OR_POP))) { why = "float comparison not feeding a branch"; goto done; }
             if (ta != tb || (ta != SP_TIR_T_I64 && ta != SP_TIR_T_F64) ||
                 !trace_cmp_ir(po->op, ta == SP_TIR_T_F64, &cmp) || !sp_tir_emit_binary(ir, cmp, a, b, &r)) goto done;
             stack[depth++] = r;
@@ -2588,6 +2690,11 @@ walked:
             SpValue e0;
             if (depth < 2U) goto done;
             b = stack[--depth]; a = stack[--depth];
+            if (ir->value_types[a] == SP_TIR_T_REF && trace_ir_runtime_type(ir, a) == (uint8_t)T_STRING && ir->value_types[b] == SP_TIR_T_I64) {
+                if (!sp_tir_emit_sload(ir, a, b, &r)) goto done;   /* s[i]: the byte, a bounds check, strings are immutable */
+                stack[depth++] = r;
+                break;
+            }
             h = (a <= ir->nvalues + 0U && a < (uint32_t)slot_total * 2U + (uint32_t)np * 3U + 16U) ? vhint[a] : NULL;
             if (ir->value_types[a] != SP_TIR_T_REF || trace_ir_runtime_type(ir, a) != (uint8_t)T_ARRAY ||
                 ir->value_types[b] != SP_TIR_T_I64 || h == NULL || h->len <= 0) { why = "array read: unknown array or index type"; goto done; }
@@ -2720,6 +2827,19 @@ walked:
             if (n > 16U || depth < n + 1U || blvl >= 3U) goto done;
             for (unsigned k = n; k > 0U; k--) args[k - 1U] = stack[--depth];
             fv = stack[--depth];
+            if (po->leaf) {   /* a native leaf predicate: identity guard, integer arguments, one call */
+                const SFunc *lh = fv < (uint32_t)slot_total * 2U + (uint32_t)np * 3U + 16U ? fhint[fv] : NULL;
+                if (lh == NULL || ir->value_types[fv] != SP_TIR_T_REF || trace_ir_runtime_type(ir, fv) != (uint8_t)T_FUNCTION ||
+                    lh->proto != po->callee || lh->proto->leaf == NULL || (n != 1U && n != 2U)) { why = "call: leaf predicate callee"; goto done; }
+                if (!trace_guard_once(ir, &gs, 1, fv, (uint64_t)(uintptr_t)lh)) goto done;
+                {
+                    void *lfn = jit_leaf_fn(lh->proto->leaf);
+                    if (!sp_tir_emit_leafcall(ir, jit_leaf_is_bool(lh->proto->leaf) ? SP_TIR_T_BOOL : SP_TIR_T_I64,
+                                              (uint64_t)(uintptr_t)lfn, args[0], n == 2U ? args[1] : 0U, n, &r)) { why = "leaf call operands"; goto done; }
+                }
+                stack[depth++] = r;
+                break;
+            }
             if (fv < (uint32_t)slot_total * 2U + (uint32_t)np * 3U + 16U && chint[fv] != NULL &&
                 ir->value_types[fv] == SP_TIR_T_REF && trace_ir_runtime_type(ir, fv) == (uint8_t)T_CLASS) {
                 const SClass *kc = chint[fv];
@@ -2828,14 +2948,44 @@ walked:
             stored = 1;
             break;
         }
+        case OP_JUMP_IF_FALSE_OR_POP: case OP_JUMP_IF_TRUE_OR_POP: {
+            /* `a and b` / `a or b`: the recorded direction becomes a guard; when the value stays (the jump was taken) its truth is known */
+            SpTIRValue cond;
+            const SpTIRInst *last;
+            int need_true, is_float_cmp, kn = 0;
+            unsigned flags = SP_TIR_GUARD_DEOPT;
+            if (depth == 0U || ir->count == 0U) goto done;
+            cond = stack[depth - 1U];
+            if (ir->value_types[cond] != SP_TIR_T_BOOL) { why = "and/or on a non-boolean"; goto done; }
+            need_true = (po->op == OP_JUMP_IF_FALSE_OR_POP) != (po->taken != 0U);
+            for (unsigned k = 0U; k < nknown; k++) if (known_v[k] == cond) kn = known_t[k];
+            if (kn != 0) {
+                if ((kn == 1) != (need_true != 0)) { why = "branch contradicts an earlier guard"; goto done; }
+            } else {
+                last = &ir->inst[ir->count - 1U];
+                if (last->dst != cond) { why = "and/or condition is not the preceding comparison"; goto done; }
+                is_float_cmp = last->op >= SP_TIR_FCMP_EQ && last->op <= SP_TIR_FCMP_GE;
+                if (!need_true) flags |= SP_TIR_GUARD_INVERT;
+                if (!need_true && is_float_cmp) { why = "inverted float guard"; goto done; }
+                if (!sp_tir_emit_guard(ir, cond, i + 1U, flags)) goto done;
+                if (nknown < 16U) { known_v[nknown] = cond; known_t[nknown] = (uint8_t)(need_true ? 1 : 2); nknown++; }
+            }
+            if (!po->taken) depth--;   /* continuing pops the value; a taken jump leaves it for the code at the target */
+            break;
+        }
         case OP_JUMP_IF_FALSE: case OP_JUMP_IF_TRUE: {
             SpTIRValue cond;
             const SpTIRInst *last;
-            int need_true, is_float_cmp;
+            int need_true, is_float_cmp, kn = 0;
             unsigned flags = SP_TIR_GUARD_DEOPT;
             uint32_t leave;
             if (depth == 0U || ir->count == 0U) goto done;
             cond = stack[--depth];
+            for (unsigned k = 0U; k < nknown; k++) if (known_v[k] == cond) kn = known_t[k];
+            if (kn != 0) {   /* the value's truth was settled by an earlier guard: nothing to test */
+                if ((kn == 1) != (((po->op == OP_JUMP_IF_FALSE) != (po->taken != 0U)) != 0)) { why = "branch contradicts an earlier guard"; goto done; }
+                break;
+            }
             last = &ir->inst[ir->count - 1U];
             if (last->dst != cond) { why = "branch condition is not the preceding comparison"; goto done; }
             is_float_cmp = last->op >= SP_TIR_FCMP_EQ && last->op <= SP_TIR_FCMP_GE;
@@ -2938,14 +3088,23 @@ done:
 static int trace_build_ir_path(Proto *p, const SpValue *locals, const SpValue *mslots, uint32_t stack_depth, uint32_t header,
                                const TraceStep *steps, unsigned count, SpTraceIR *ir,
                                int32_t **phi_local_out, uint32_t *exit_pc_out, uint32_t *backedge_pc_out,
-                               unsigned *nmod_out, uint16_t *mod_idx_out) {
+                               unsigned *nmod_out, uint16_t *mod_idx_out, unsigned nmod_seed, const uint16_t *mod_seed) {
     static int sink_on = -1;
     if (sink_on < 0) { const char *e = getenv("SPRINT_TRACE_SINK"); sink_on = !(e && e[0] == '0'); }
+    g_leaf_mode = 0;
     if (sink_on && trace_build_ir_path_impl(p, locals, mslots, stack_depth, header, steps, count, ir, phi_local_out,
-                                            exit_pc_out, backedge_pc_out, nmod_out, mod_idx_out, 1)) return 1;
+                                            exit_pc_out, backedge_pc_out, nmod_out, mod_idx_out, 1, nmod_seed, mod_seed)) return 1;
     sp_tir_init(ir);
-    return trace_build_ir_path_impl(p, locals, mslots, stack_depth, header, steps, count, ir, phi_local_out,
-                                    exit_pc_out, backedge_pc_out, nmod_out, mod_idx_out, 0);
+    if (trace_build_ir_path_impl(p, locals, mslots, stack_depth, header, steps, count, ir, phi_local_out,
+                                 exit_pc_out, backedge_pc_out, nmod_out, mod_idx_out, 0, nmod_seed, mod_seed)) return 1;
+    sp_tir_init(ir);
+    g_leaf_mode = 1;   /* last resort: a branchy integer predicate that cannot be walked is called natively */
+    {
+        int ok = trace_build_ir_path_impl(p, locals, mslots, stack_depth, header, steps, count, ir, phi_local_out,
+                                          exit_pc_out, backedge_pc_out, nmod_out, mod_idx_out, 0, nmod_seed, mod_seed);
+        g_leaf_mode = 0;
+        return ok;
+    }
 }
 
 int jit_trace_compile(VM *vm, Proto *p, uint32_t header, const TraceStep *steps, unsigned count,
@@ -2992,8 +3151,9 @@ int jit_trace_compile(VM *vm, Proto *p, uint32_t header, const TraceStep *steps,
                         &ir, &phi_local, &exit_pc, &backedge_pc)) {
         /* the narrow builder refused (it destroyed its IR): try the general path builder */
         sp_tir_init(&ir);
-        if (!trace_build_ir_path(p, trace_base, is_side ? NULL : vm->slots, stack_depth, header, steps, count,
-                                 &ir, &phi_local, &exit_pc, &backedge_pc, &nmod, mod_idx)) { fail_reason = "trace IR build rejected path"; goto done; }
+        if (!trace_build_ir_path(p, trace_base, vm->slots, stack_depth, header, steps, count,
+                                 &ir, &phi_local, &exit_pc, &backedge_pc, &nmod, mod_idx,
+                                 is_side ? parent->nmod : 0U, is_side ? parent->mod_idx : NULL)) { fail_reason = "trace IR build rejected path"; goto done; }
     }
     as = (TraceAsm *)calloc(1U, sizeof *as);
     tr = (TraceRegion *)calloc(1U, sizeof *tr);
@@ -3013,7 +3173,7 @@ int jit_trace_compile(VM *vm, Proto *p, uint32_t header, const TraceStep *steps,
     }
     tr->signature_hash = trace_signature_hash(tr, trace_base, stack_depth);
     if (tr->signature_hash == 0U) { fail_reason = "invalid trace entry signature"; goto done; }
-    if (is_side && trace_side_attempted(parent, tr->signature_hash) == 0) {
+    if (is_side && !parent->variant_pending && trace_side_attempted(parent, tr->signature_hash) == 0) {
         fail_reason = "side trace signature was not requested"; goto done;
     }
     for (uint8_t k = 0U; k < (uint8_t)SP_JIT_SNAPSHOT_KIND_COUNT; k++) {
@@ -3067,6 +3227,21 @@ int jit_trace_compile(VM *vm, Proto *p, uint32_t header, const TraceStep *steps,
             goto done;
         }
         trace_update_incoming_links(jp, parent, (TraceEntry)NULL);
+        /* module variables this side trace added to the shared scratch list must also be in the lists of its ancestors: the host
+         * copies in what the trace it enters (an ancestor) lists */
+        if (tr->nmod > parent->nmod)
+            for (TraceRegion *anc = parent; anc != NULL; anc = anc->parent)
+                if (anc->nmod < tr->nmod) {
+                    for (unsigned k = anc->nmod; k < tr->nmod; k++) anc->mod_idx[k] = tr->mod_idx[k];
+                    anc->nmod = tr->nmod;
+                }
+        if (parent->variant_pending) {   /* a path variant: the parent's deopt continues here */
+            TraceRegion *head = parent;
+            while (head->is_variant && head->parent != NULL) head = head->parent;
+            tr->is_variant = 1U;
+            __atomic_store_n(&parent->runtime.deopt_entry, tr->entry, __ATOMIC_RELEASE);
+            __atomic_store_n(&tr->runtime.deopt_entry, head->entry, __ATOMIC_RELEASE);   /* a loop that changes path goes round the chain */
+        }
     } else if (!trace_index_insert(jp, tr)) {
         free(jp->trace_index);
         jp->trace_index = NULL;
@@ -3078,7 +3253,7 @@ int jit_trace_compile(VM *vm, Proto *p, uint32_t header, const TraceStep *steps,
     if (debug && debug[0] == '2') {   /* SPRINT_TRACE_JIT_DEBUG=2: raw code to /tmp/sprint_trace_<name>_<header>.bin (objdump -D -b binary -mi386:x86-64) */
         char path[160];
         FILE *df;
-        (void)snprintf(path, sizeof path, "/tmp/sprint_trace_%s_%u.bin", p->name ? p->name : "x", header);
+        (void)snprintf(path, sizeof path, "/tmp/sprint_trace_%s_%u_s%u.bin", p->name ? p->name : "x", header, (unsigned)slot);
         df = fopen(path, "wb");
         if (df != NULL) { (void)fwrite(mem, 1U, as->len, df); (void)fclose(df); }
     }
@@ -3100,6 +3275,7 @@ done:
         if (debug && debug[0] && debug[0] != '0')
             (void)fprintf(stderr, "trace-jit: rejected %s@%u: %s\n", p->name ? p->name : "?", header, fail_reason);
     }
+    if (parent != NULL) parent->variant_pending = 0U;
     jit_code_unmap(mem, map_size);
     if (as) free(as);
     if (tr) sp_jit_snapshot_set_destroy(&tr->snapshot_set);
@@ -3118,6 +3294,20 @@ uint64_t jit_trace_inner_ticks(const Proto *p, uint32_t header, uint32_t here) {
     for (const TraceRegion *tr = jp->traces; tr != NULL; tr = tr->next)
         if (!tr->is_side && !tr->dead && tr->entry != NULL && tr->header > header && tr->header < here) total += tr->ticks + 1U;
     return total;
+}
+
+/* the chain of path variants of a loop: head (the trace that was recorded first) -> v1 -> v2 -> ... */
+static TraceRegion *trace_variant_head(TraceRegion *t) {
+    while (t->is_variant && t->parent != NULL) t = t->parent;
+    return t;
+}
+static TraceRegion *trace_variant_tail(TraceRegion *t) {
+    for (;;) {
+        TraceRegion *next = NULL;
+        for (uint8_t i = 0U; i < t->side_count; i++) if (t->sides[i] != NULL && t->sides[i]->is_variant) next = t->sides[i];
+        if (next == NULL) return t;
+        t = next;
+    }
 }
 
 int jit_trace_site(VM *vm, Proto *p, const uint8_t *hdr, SpValue *base, SpValue *sp,
@@ -3173,6 +3363,7 @@ int jit_trace_site(VM *vm, Proto *p, const uint8_t *hdr, SpValue *base, SpValue 
         if (base + first->mod_slot0 + first->nmod + 8U > vm->stack_end) return 0;
         for (unsigned k = 0U; k < first->nmod; k++) base[first->mod_slot0 + k] = vm->slots[first->mod_idx[k]];
     }
+    vm->trace_hops = 256U;
     result = first->entry(base, &vm->ileft);
     if (budget_before >= vm->ileft) first->ticks += budget_before - vm->ileft;
     if (first->nmod != 0U)
@@ -3180,6 +3371,19 @@ int jit_trace_site(VM *vm, Proto *p, const uint8_t *hdr, SpValue *base, SpValue 
     if (result == UINT32_MAX ||
         !sp_jit_snapshot_decode_token(result, &snapshot_slot, &snapshot_kind)) return 0;
     TraceRegion *owner = jp->trace_slots[snapshot_slot];
+    if (owner != NULL && vm->trace_hops < 256U) {   /* path-variant hops during this run: too many per iteration and the loop is better off in the region JIT */
+        TraceRegion *hr = trace_root_region(owner);
+        if (hr != NULL && budget_before >= vm->ileft) {
+            hr->hops += 256U - vm->trace_hops;
+            hr->hop_iters += budget_before - vm->ileft;
+            if (hr->hops >= 4096U && hr->hop_iters < hr->hops * 6U && !hr->dead) {
+                hr->dead = 1;
+                if (trace_debug_env())
+                    (void)fprintf(stderr, "trace-jit: demoted %s@%u to the region JIT (%llu variant hops over %llu iterations)\n",
+                                  p->name ? p->name : "?", hr->header, (unsigned long long)hr->hops, (unsigned long long)hr->hop_iters);
+            }
+        }
+    }
     if (debug && debug[0] && debug[0] != '0')
         (void)fprintf(stderr, "trace-jit: result slot=%u kind=%u owner=%s@%u\n",
                       (unsigned)snapshot_slot, (unsigned)snapshot_kind,
@@ -3188,7 +3392,8 @@ int jit_trace_site(VM *vm, Proto *p, const uint8_t *hdr, SpValue *base, SpValue 
     if (!owner || !owner->mem || owner->snapshot_set.snapshots[snapshot_kind].kind != snapshot_kind) return 0;
     if (snapshot_kind == SP_JIT_SNAPSHOT_DEOPT) {
         TraceRegion *rt = trace_root_region(owner);
-        if (rt != NULL) {
+        /* while path variants can still be recorded the deopts are the loop's way of asking for them: not yet counted against the trace */
+        if (rt != NULL && (trace_variant_head(owner)->vtries >= 3U || trace_variant_tail(trace_variant_head(owner))->depth >= TRACE_SIDE_DEPTH_MAX || rt->dead)) {
             rt->deopts++;
             rt->deopt_iters += budget_before >= vm->ileft ? budget_before - vm->ileft : 0U;
             if (rt->deopts >= (uint64_t)TRACE_DEOPT_MIN && rt->deopt_iters < rt->deopts * (uint64_t)TRACE_DEOPT_ITERS) {
@@ -3234,6 +3439,20 @@ int jit_trace_site(VM *vm, Proto *p, const uint8_t *hdr, SpValue *base, SpValue 
     if (vm->bytes >= vm->gc_next) vm_gc(vm);   /* a trace that allocates left at its back edge: the frame is consistent again */
     requested_signature = miss_parent != NULL && snapshot_kind == SP_JIT_SNAPSHOT_MISS ?
         trace_signature_hash(miss_parent, base, stack_depth) : 0U;
+    if (snapshot_kind == SP_JIT_SNAPSHOT_DEOPT && owner != NULL && side_parent_slot_out != NULL) {
+        TraceRegion *head = trace_variant_head(owner), *tail = trace_variant_tail(head), *vroot = trace_root_region(owner);
+        /* low progress since entry: the chain went round without finding a path that fits (a long run of matching paths ends in hops==0 too) */
+        if (budget_before - vm->ileft < 32U && !head->dead && vroot != NULL && !vroot->dead && tail->depth < TRACE_SIDE_DEPTH_MAX && head->vtries < 3U &&
+            trace_side_total(vroot) < TRACE_SIDE_MAX && ++head->vdeopts >= 2U) {
+            /* the loop keeps leaving the chain of its traces by a guard: record the path it takes now as one more variant */
+            head->vdeopts = 0U; head->vtries++; tail->variant_pending = 1U;
+            *side_parent_slot_out = tail->slot;
+            if (debug && debug[0] && debug[0] != '0')
+                (void)fprintf(stderr, "trace-jit: variant-record-request %s@%u parent-slot=%u depth=%u\n",
+                              p->name ? p->name : "?", tail->header, (unsigned)tail->slot, (unsigned)tail->depth);
+            return 2;
+        }
+    }
     if (snapshot_kind == SP_JIT_SNAPSHOT_MISS && miss_parent != NULL &&
         miss_parent->nmod == 0U && miss_parent->side_count < TRACE_SIDE_MAX && miss_parent->depth < TRACE_SIDE_DEPTH_MAX &&
         trace_side_total(trace_root_region(miss_parent)) < TRACE_SIDE_MAX &&

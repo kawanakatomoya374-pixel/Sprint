@@ -709,6 +709,7 @@ struct VM {
     int fatal_status;
     RunStatusInt result;
     uint64_t ileft; /* remaining ticks of the current chunk */
+    uint64_t trace_hops; /* TraceJIT: deopt-to-variant hops left in the current native run (a loop with no matching path must come back to the host) */
     uint64_t ibank; /* budget not yet handed out (UINT64_MAX = unlimited) */
     char fatal_msg[256];
 

@@ -26,6 +26,8 @@ typedef enum {
     SP_TIR_FLOAD,   /* dst = a.slot: a is an instance reference, aux the slot, imm the field tag the trace was recorded with; a tag mismatch deoptimises */
     SP_TIR_FSTORE,  /* a.slot = value aux (no result), imm = the slot; performed after the iteration's last deopt point, like ASTORE */
     SP_TIR_NEWINST, /* dst = a fresh instance of class imm (a pointer) with its default slots; never merged or reordered */
+    SP_TIR_SLOAD,   /* dst = the byte at index b of string a (immutable); an index outside 0 .. len-1 deoptimises */
+    SP_TIR_LEAFCALL,/* dst = a call of the leaf predicate imm (a function pointer) with arguments a (and b when aux == 2); a failed call deoptimises; the type is I64 or BOOL */
     SP_TIR_UCELL,   /* dst = the upvalue cell idx (aux) of closure a (a REF to a cell); a is loop-invariant */
     SP_TIR_VFIELD,  /* describes a sunk object: a = the virtual PHI standing for the object, b = the PHI carrying its field at byte offset aux (imm = tag); no result */
     SP_TIR_CGUARD,  /* deoptimise unless instance a has class imm (a pointer); aux == 1: unless reference a itself equals imm; no result */
@@ -75,6 +77,8 @@ int sp_tir_emit_newinst(SpTraceIR *ir, uint64_t cls, SpTIRValue *out);
 int sp_tir_hoist_loads(SpTraceIR *ir);
 int sp_tir_elide_bounds(SpTraceIR *ir);
 int sp_tir_elide_tags(SpTraceIR *ir);
+int sp_tir_emit_sload(SpTraceIR *ir, SpTIRValue string, SpTIRValue index, SpTIRValue *out);
+int sp_tir_emit_leafcall(SpTraceIR *ir, SpTIRType type, uint64_t fn, SpTIRValue a, SpTIRValue b, unsigned argc, SpTIRValue *out);
 int sp_tir_emit_ucell(SpTraceIR *ir, SpTIRValue fn, uint32_t idx, SpTIRValue *out);
 int sp_tir_emit_fparam(SpTraceIR *ir, SpTIRType type, SpTIRValue object, uint32_t offset, uint64_t cls, SpTIRValue *out);
 int sp_tir_emit_vfield(SpTraceIR *ir, SpTIRValue object_phi, SpTIRValue field_phi, uint32_t offset, uint8_t tag);
