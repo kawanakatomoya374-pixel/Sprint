@@ -402,6 +402,8 @@ struct Proto {
     struct JitProto *jit;  /* compiled loop regions (JIT) */
     int jhot;              /* back-edge countdown until the JIT is consulted (0 = not initialised) */
     struct JitUnit *junit; /* native entry of the whole function (JIT), NULL = not compiled */
+    struct JitLeaf *leaf;  /* a non-recursive integer predicate compiled to a leaf function (jit_pure.c), or NULL; leaf_tried: attempted */
+    uint8_t leaf_tried;
     struct JitPure *pure;  /* a pure self-recursive integer function compiled to a native function (jit_pure.c), or NULL */
     int jcall;             /* call countdown until the JIT is asked to compile the function (0 = not initialised) */
     int compile_index;     /* stable index in Program.protos while compiling */
@@ -928,6 +930,12 @@ JitUnit *jit_call_hot(VM *vm, SFunc *fn, SpValue *base);
  * *left = budget left), 0 = the interpreter performs it. */
 typedef struct JitPure JitPure;
 struct JitPure *jit_pure_compile(VM *vm, Proto *p);
+/* leaf predicates (non-recursive integer functions) that compiled loops call directly */
+struct JitLeaf;
+struct JitLeaf *jit_leaf_compile(VM *vm, Proto *p);
+void *jit_leaf_fn(const struct JitLeaf *jl);
+int jit_leaf_is_bool(const struct JitLeaf *jl);
+void jit_leaf_free(struct JitLeaf *jl);
 void jit_pure_free(Proto *p);
 int jit_pure_enter(VM *vm, Proto *p, const SpValue *args, uint64_t *left, int64_t *out);
 /* Run a unit whose frame is already pushed (nf = top frame, base = its base); state as for jit_site. */

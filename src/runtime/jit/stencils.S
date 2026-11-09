@@ -331,6 +331,55 @@ ST ucall_s0
     call JIT_T
     sub $(H0+16),%r12
 
+# a call of a leaf predicate (jit_pure.c): callee slot H0, 1..3 integer arguments in the slots after it, HQ = the callee's Proto,
+# HQ2 = the leaf function (arguments in rdi rsi rdx, result in rax, rdx != 0 asks for the interpreter), H3 = tag of the result.
+# Every failed guard leaves through JIT_X before anything has been done.
+.macro LEAF_HEAD
+    cmpq $T_FUNCTION,H0(%r12)
+    jne JIT_X
+    mov H0+8(%r12),%rax
+    movabs $HQ,%rcx
+    cmp L_SFUNC_PROTO(%rax),%rcx
+    jne JIT_X
+.endm
+.macro LEAF_TAIL
+    movabs $HQ2,%rax
+    call *%rax
+    test %edx,%edx
+    jnz JIT_X
+    movq $H3,H0(%r12)
+    mov %rax,H0+8(%r12)
+.endm
+ST leaf1
+    LEAF_HEAD
+    cmpq $T_INT,H0+16(%r12)
+    jne JIT_X
+    mov H0+24(%r12),%rdi
+    LEAF_TAIL
+
+ST leaf2
+    LEAF_HEAD
+    cmpq $T_INT,H0+16(%r12)
+    jne JIT_X
+    cmpq $T_INT,H0+32(%r12)
+    jne JIT_X
+    mov H0+24(%r12),%rdi
+    mov H0+40(%r12),%rsi
+    LEAF_TAIL
+
+ST leaf3
+    LEAF_HEAD
+    cmpq $T_INT,H0+16(%r12)
+    jne JIT_X
+    cmpq $T_INT,H0+32(%r12)
+    jne JIT_X
+    cmpq $T_INT,H0+48(%r12)
+    jne JIT_X
+    mov H0+24(%r12),%rdi
+    mov H0+40(%r12),%rsi
+    mov H0+56(%r12),%rdx
+    LEAF_TAIL
+
 # CALL with H1 arguments; the callee value is slot H0, the arguments follow.
 ST ucall
     cmpq $T_FUNCTION,H0(%r12)

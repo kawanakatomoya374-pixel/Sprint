@@ -359,6 +359,218 @@ fail:
     return NULL;
 }
 
+
+/* ---- leaf predicates: non-recursive integer functions called from compiled loops (is_digit, is_alpha ...) -------------------
+ * int/bool f(int a, int b, int c) made of arithmetic, comparisons and `and` / `or`.  C ABI: arguments in rdi rsi rdx, the result
+ * in rax, rdx = 0 when it is valid and 1 when the call must be redone by the interpreter (an overflow).  Only caller-saved
+ * registers are used, so the compiled loop can call it between its own instructions. */
+typedef struct JitLeaf {
+    void *mem;
+    size_t msize;
+    void *fn;
+    int nparams;
+    int is_bool;
+} JitLeaf;
+
+static const uint8_t LSREG[6] = {R_AX, R_CX, R_8, R_9, 10, 11};
+static void setcc_movzx(Buf *c, unsigned cc, int dst) {   /* dst = (flags satisfy cc) ? 1 : 0 */
+    put(c, 0x40U | (unsigned)((dst >> 3) & 1)); put(c, 0x0f); put(c, 0x90U | cc); put(c, 0xc0U | (unsigned)(dst & 7));
+    put(c, 0x48U | (unsigned)(((dst >> 3) & 1) << 2) | (unsigned)((dst >> 3) & 1)); put(c, 0x0f); put(c, 0xb6); put(c, 0xc0U | (unsigned)((dst & 7) << 3) | (unsigned)(dst & 7));
+}
+
+struct JitLeaf *jit_leaf_compile(VM *vm, Proto *p) {
+    const uint8_t *code = p->ocode ? p->ocode : p->code;
+    const uint32_t n = p->code_len;
+    const int np = p->nparams;
+    typedef struct { EKind k; int64_t v; int isbool; } LEnt;
+    LEnt st[6];
+    int depth = 0, ret_kind = -1;
+    Fix fix[MAX_FIX];
+    int nfix = 0;
+    uint32_t *lab = NULL;
+    uint8_t *istart = NULL, *target = NULL;
+    int8_t *tdepth = NULL;
+    Buf c;
+    struct JitLeaf *jl = NULL;
+    size_t reachable = 1, fail_at = 0, page, msize;
+    uint8_t *mem = NULL;
+    (void)vm;
+    if (np < 1 || np > 3 || p->nlocals != np || p->has_rest || p->ndefaults != 0 || p->nrequired != np || n == 0 || n > 1024) return NULL;
+    lab = (uint32_t *)calloc((size_t)n + 1U, sizeof *lab);
+    istart = (uint8_t *)calloc((size_t)n + 1U, 1U);
+    target = (uint8_t *)calloc((size_t)n + 1U, 1U);
+    tdepth = (int8_t *)calloc((size_t)n + 1U, 1U);
+    c.cap = 8192; c.n = 0; c.ok = 1;
+    c.b = (uint8_t *)malloc(c.cap);
+    if (!lab || !istart || !target || !tdepth || !c.b) goto fail;
+    for (uint32_t pc = 0; pc < n;) {
+        int op = code[pc], len = op_len(op);
+        if (len <= 0 || pc + (uint32_t)len > n) goto fail;
+        istart[pc] = 1;
+        switch (op) {
+        case OP_JUMP: case OP_JUMP_IF_FALSE: case OP_JUMP_IF_TRUE: case OP_JUMP_IF_FALSE_OR_POP: case OP_JUMP_IF_TRUE_OR_POP: {
+            int32_t off = (int32_t)((uint32_t)code[pc + 1] | ((uint32_t)code[pc + 2] << 8) | ((uint32_t)code[pc + 3] << 16) | ((uint32_t)code[pc + 4] << 24));
+            int64_t t = (int64_t)pc + 5 + off;
+            if (off <= 0 || t >= (int64_t)n) goto fail;
+            target[t] = 1;
+            break;
+        }
+        case OP_LOAD_LOCAL: case OP_SMALLINT: case OP_CONST: case OP_NOP: case OP_POP:
+        case OP_ADD: case OP_SUB: case OP_MUL: case OP_EQ: case OP_NE: case OP_LT: case OP_LE: case OP_GT: case OP_GE:
+        case OP_RETURN: case OP_RETURN_NIL:
+            break;
+        default: goto fail;
+        }
+        pc += (uint32_t)len;
+    }
+    fail_at = 0;   /* the "redo" exit is emitted after the code; fixups below */
+#define LMAT(i) do { LEnt *e_ = &st[i]; if (e_->k == E_IMM) mov_ri(&c, LSREG[i], e_->v); else if (e_->k == E_LOCAL) mov_rr(&c, LSREG[i], AREG[e_->v]); e_->k = E_REG; } while (0)
+    for (uint32_t pc = 0; pc < n;) {
+        int op = code[pc], len = op_len(op);
+        lab[pc] = (uint32_t)c.n;
+        if (target[pc]) {
+            if (reachable) { if (depth != tdepth[pc]) goto fail; }
+            else { depth = tdepth[pc]; if (depth > 0) { st[depth - 1].k = E_REG; st[depth - 1].isbool = 1; st[depth - 1].v = 0; } }
+            reachable = 1;
+        }
+        if (!reachable) { pc += (uint32_t)len; continue; }
+        switch (op) {
+        case OP_NOP: break;
+        case OP_LOAD_LOCAL: {
+            unsigned k = (unsigned)code[pc + 1] | ((unsigned)code[pc + 2] << 8);
+            if (k >= (unsigned)np || depth >= 6) goto fail;
+            st[depth].k = E_LOCAL; st[depth].v = (int64_t)k; st[depth].isbool = 0; depth++;
+            break;
+        }
+        case OP_SMALLINT: {
+            if (depth >= 6) goto fail;
+            st[depth].k = E_IMM; st[depth].v = (int16_t)((unsigned)code[pc + 1] | ((unsigned)code[pc + 2] << 8)); st[depth].isbool = 0; depth++;
+            break;
+        }
+        case OP_CONST: {
+            unsigned k = (unsigned)code[pc + 1] | ((unsigned)code[pc + 2] << 8);
+            if (k >= (unsigned)p->nconsts || p->consts[k].type != T_INT || !fits32(p->consts[k].as.i) || depth >= 6) goto fail;
+            st[depth].k = E_IMM; st[depth].v = p->consts[k].as.i; st[depth].isbool = 0; depth++;
+            break;
+        }
+        case OP_POP: if (depth == 0) goto fail; depth--; break;
+        case OP_ADD: case OP_SUB: case OP_MUL: {
+            LEnt b;
+            int da;
+            if (depth < 2) goto fail;
+            b = st[--depth]; da = depth - 1;
+            if (st[da].isbool || b.isbool) goto fail;
+            LMAT(da);
+            if (b.k == E_IMM && fits32(b.v)) {
+                if (op == OP_MUL) { put(&c, 0x48U | (unsigned)(((LSREG[da] >> 3) & 1) << 2) | (unsigned)((LSREG[da] >> 3) & 1)); put(&c, 0x69); put(&c, 0xc0U | (unsigned)((LSREG[da] & 7) << 3) | (unsigned)(LSREG[da] & 7)); put32(&c, (int32_t)b.v); }
+                else alu_ri(&c, op == OP_ADD ? 0U : 5U, LSREG[da], (int32_t)b.v);
+            } else {
+                int rb;
+                if (b.k == E_LOCAL) rb = AREG[b.v];
+                else { if (b.k == E_IMM) mov_ri(&c, LSREG[da + 1], b.v); rb = LSREG[da + 1]; }
+                if (op == OP_MUL) { put(&c, 0x48U | (unsigned)(((LSREG[da] >> 3) & 1) << 2) | (unsigned)((rb >> 3) & 1)); put(&c, 0x0f); put(&c, 0xaf); put(&c, 0xc0U | (unsigned)((LSREG[da] & 7) << 3) | (unsigned)(rb & 7)); }
+                else rr(&c, op == OP_ADD ? 0x01U : 0x29U, rb, LSREG[da]);
+            }
+            put(&c, 0x0f); put(&c, 0x80);      /* jo redo */
+            if (nfix >= MAX_FIX) goto fail;
+            fix[nfix].at = c.n; fix[nfix].is_fail = 1; fix[nfix].target_pc = 0; nfix++; put32(&c, 0);
+            st[da].k = E_REG; st[da].isbool = 0;
+            break;
+        }
+        case OP_EQ: case OP_NE: case OP_LT: case OP_LE: case OP_GT: case OP_GE: {
+            LEnt b, a;
+            int da, ra;
+            unsigned cc;
+            if (depth < 2) goto fail;
+            b = st[--depth]; da = depth - 1; a = st[da];
+            if (a.isbool || b.isbool) goto fail;
+            if (a.k == E_LOCAL) ra = AREG[a.v]; else { LMAT(da); ra = LSREG[da]; }
+            if (b.k == E_IMM && fits32(b.v)) alu_ri(&c, 7U, ra, (int32_t)b.v);
+            else {
+                int rb;
+                if (b.k == E_LOCAL) rb = AREG[b.v];
+                else { if (b.k == E_IMM) mov_ri(&c, LSREG[da + 1], b.v); rb = LSREG[da + 1]; }
+                rr(&c, 0x39, rb, ra);
+            }
+            switch (op) {
+            case OP_LT: cc = 0xcU; break; case OP_LE: cc = 0xeU; break; case OP_GT: cc = 0xfU; break;
+            case OP_GE: cc = 0xdU; break; case OP_EQ: cc = 0x4U; break; default: cc = 0x5U; break;
+            }
+            setcc_movzx(&c, cc, LSREG[da]);
+            st[da].k = E_REG; st[da].isbool = 1;
+            break;
+        }
+        case OP_JUMP_IF_FALSE_OR_POP: case OP_JUMP_IF_TRUE_OR_POP: {
+            int32_t off = (int32_t)((uint32_t)code[pc + 1] | ((uint32_t)code[pc + 2] << 8) | ((uint32_t)code[pc + 3] << 16) | ((uint32_t)code[pc + 4] << 24));
+            int64_t t = (int64_t)pc + 5 + off;
+            int d = depth - 1;
+            if (depth < 1 || !st[d].isbool || st[d].k != E_REG) goto fail;
+            rr(&c, 0x85, LSREG[d], LSREG[d]);                       /* test r, r */
+            put(&c, 0x0f); put(&c, op == OP_JUMP_IF_FALSE_OR_POP ? 0x84U : 0x85U);   /* jz / jnz: the value stays, the jump is taken */
+            if (nfix >= MAX_FIX) goto fail;
+            fix[nfix].at = c.n; fix[nfix].is_fail = 0; fix[nfix].target_pc = (size_t)t; nfix++; put32(&c, 0);
+            if (tdepth[t] != 0 && tdepth[t] != depth) goto fail;
+            tdepth[t] = (int8_t)depth;
+            depth--;                                                   /* continuing pops it */
+            break;
+        }
+        case OP_RETURN: {
+            LEnt r;
+            int kind;
+            if (depth != 1) goto fail;
+            r = st[--depth];
+            kind = r.isbool ? 1 : 0;
+            if (ret_kind >= 0 && ret_kind != kind) goto fail;
+            ret_kind = kind;
+            if (r.k == E_IMM) mov_ri(&c, R_AX, r.v);
+            else if (r.k == E_LOCAL) mov_rr(&c, R_AX, AREG[r.v]);
+            else mov_rr(&c, R_AX, LSREG[0]);
+            put(&c, 0x31); put(&c, 0xd2); put(&c, 0xc3);              /* xor edx, edx ; ret */
+            reachable = 0;
+            break;
+        }
+        case OP_RETURN_NIL: goto fail;
+        default: goto fail;
+        }
+        pc += (uint32_t)len;
+    }
+    if (!c.ok || ret_kind < 0) goto fail;
+    fail_at = c.n;                                                    /* redo: mov edx, 1 ; ret */
+    put(&c, 0xba); put32(&c, 1); put(&c, 0xc3);
+    for (int i = 0; i < nfix; i++) {
+        int64_t tgt;
+        int32_t rel;
+        if (fix[i].is_fail) tgt = (int64_t)fail_at;
+        else {
+            if (fix[i].target_pc >= n || !istart[fix[i].target_pc]) goto fail;
+            tgt = (int64_t)lab[fix[i].target_pc];
+        }
+        rel = (int32_t)(tgt - (int64_t)(fix[i].at + 4));
+        memcpy(c.b + fix[i].at, &rel, 4);
+    }
+    page = (size_t)sysconf(_SC_PAGESIZE);
+    msize = ((c.n + page - 1) / page) * page;
+    mem = (uint8_t *)mmap(NULL, msize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (mem == MAP_FAILED) { mem = NULL; goto fail; }
+    memcpy(mem, c.b, c.n);
+    if (mprotect(mem, msize, PROT_READ | PROT_EXEC) != 0) { (void)munmap(mem, msize); goto fail; }
+    jl = (struct JitLeaf *)calloc(1, sizeof *jl);
+    if (!jl) { (void)munmap(mem, msize); goto fail; }
+    jl->mem = mem; jl->msize = msize; jl->fn = mem; jl->nparams = np; jl->is_bool = ret_kind;
+    free(lab); free(istart); free(target); free(tdepth); free(c.b);
+    return jl;
+fail:
+    free(lab); free(istart); free(target); free(tdepth); free(c.b);
+    return NULL;
+}
+void *jit_leaf_fn(const struct JitLeaf *jl) { return jl->fn; }
+int jit_leaf_is_bool(const struct JitLeaf *jl) { return jl->is_bool; }
+void jit_leaf_free(struct JitLeaf *jl) {
+    if (!jl) return;
+    if (jl->mem) (void)munmap(jl->mem, jl->msize);
+    free(jl);
+}
+
 void jit_pure_free(Proto *p) {
     JitPure *jp = p->pure;
     if (!jp) return;
@@ -417,6 +629,10 @@ int jit_pure_enter(VM *vm, Proto *p, const SpValue *args, uint64_t *left, int64_
 #else
 
 JitPure *jit_pure_compile(VM *vm, Proto *p) { (void)vm; (void)p; return NULL; }
+struct JitLeaf *jit_leaf_compile(VM *vm, Proto *p) { (void)vm; (void)p; return NULL; }
+void *jit_leaf_fn(const struct JitLeaf *jl) { (void)jl; return NULL; }
+int jit_leaf_is_bool(const struct JitLeaf *jl) { (void)jl; return 0; }
+void jit_leaf_free(struct JitLeaf *jl) { (void)jl; }
 void jit_pure_free(Proto *p) { (void)p; }
 int jit_pure_enter(VM *vm, Proto *p, const SpValue *args, uint64_t *left, int64_t *out) { (void)vm; (void)p; (void)args; (void)left; (void)out; return 0; }
 

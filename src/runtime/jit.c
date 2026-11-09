@@ -195,6 +195,8 @@ void jit_roots(Proto *p, void (*mark)(VM *, SpValue), VM *vm) {
 
 void jit_free_proto(Proto *p) {
     jit_pure_free(p);
+    jit_leaf_free(p->leaf);
+    p->leaf = NULL;
     struct JitProto *jp = p->jit;
     if (!jp) return;
     for (int i = 0; i < jp->n; i++) region_free(jp->r[i]);
@@ -2165,6 +2167,20 @@ static int do_call(JC *c, uint32_t pc, int len, uint32_t *skip) {
         if (inl_enabled && c->cur_ic == 0 && kp != c->p && f->hint && f->hint->type == T_FUNCTION) {
             const uint8_t *kcode = kp->ocode ? kp->ocode : kp->code;
             if (c->vm->jit_dbg) (void)fprintf(stderr, "jit: inline? %s cand=%d\n", kp->name ? kp->name : "?", inl_candidate(kp, kcode, 1));
+            if (!inl_candidate(kp, kcode, 1) && argc >= 1 && argc <= 3) {   /* a branchy integer predicate: a direct call of its leaf function */
+                Proto *mkp = (Proto *)(uintptr_t)kp;
+                if (!mkp->leaf_tried) { mkp->leaf_tried = 1; mkp->leaf = jit_leaf_compile(c->vm, mkp); }
+                if (mkp->leaf) {
+                    { void *leaf_fn = jit_leaf_fn(mkp->leaf); c->hq2 = (uint64_t)(uintptr_t)leaf_fn; }
+                    EM(argc == 1 ? ST_leaf1 : argc == 2 ? ST_leaf2 : ST_leaf3, soff(c, pf), 0, 0, (int32_t)(jit_leaf_is_bool(mkp->leaf) ? T_BOOL : T_INT), 0, (uint64_t)(uintptr_t)kp);
+                    c->dep -= argc + 1;
+                    Ent *lr = push(c, EK_MEM, jit_leaf_is_bool(mkp->leaf) ? TY_BOOL : TY_INT, 0);
+                    if (!lr) return 0;
+                    lr->ppc = pc;
+                    c->rax_off = -1; c->xmm_off = -1; c->skip1 = 0; c->skipx = 0;
+                    return 1;
+                }
+            }
             if (inl_candidate(kp, kcode, 1)) {
                 size_t scn = c->cn;
                 int snfx = c->nfx, snex = c->nex, snic = c->nic;
