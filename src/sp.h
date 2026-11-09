@@ -216,6 +216,7 @@ typedef struct SpValue {
 struct Obj {
     uint8_t type;
     uint8_t marked;
+    uint8_t xt;    /* arrays: the one type every element is known to have, 0 when unknown (see array_note_push / array_note_store) */
     uint32_t id;   /* identity number shown in "<function #N>" and mixed into hashes (wraps after 2^32 objects) */
     Obj *next;
 };
@@ -761,6 +762,11 @@ SString *vm_new_string(VM *vm, const char *s, size_t len);
 SString *vm_alloc_string(VM *vm, size_t len); /* uninitialised data, hash unset */
 void string_finish(SString *s);
 SArray *vm_new_array(VM *vm, int64_t cap);
+/* The element-type note of an array (Obj.xt): trace code that reads elements of an array whose note it has checked once need not check
+ * each element's tag. Every write of an element into an array that may carry a note goes through one of these (or an equivalent
+ * stencil); building an array by raw stores leaves the note at 0 (unknown). */
+static inline void array_note_push(SArray *a, SpValue v) { a->h.xt = (uint8_t)((a->len == 0 || a->h.xt == v.type) ? v.type : 0U); }
+static inline void array_note_store(SArray *a, SpValue v) { if (a->h.xt != v.type) a->h.xt = 0U; }
 int array_push(VM *vm, SArray *a, SpValue v);
 int array_reserve(VM *vm, SArray *a, int64_t need);
 SFunc *vm_new_closure_obj(VM *vm, Proto *p, int nup);

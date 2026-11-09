@@ -455,7 +455,7 @@ static RunStatus RUN_LOOP_NAME(VM *vm, VMTraceCapture **capp, RunCold *ccold, in
             if (sp[-3].type == T_ARRAY && sp[-2].type == T_INT) {
                 SArray *sa = AS_ARRAY(sp[-3]);
                 int64_t si = sp[-2].as.i;
-                if (si >= 0 && si < sa->len) { sa->items[si] = sp[-1]; sp -= 3; NEXT(); }
+                if (si >= 0 && si < sa->len) { array_note_store(sa, sp[-1]); sa->items[si] = sp[-1]; sp -= 3; NEXT(); }
             } else if (sp[-3].type == T_NATIVE && typed_poke(sp[-3], sp[-2], sp[-1])) {
                 sp -= 3;
                 NEXT();
@@ -629,6 +629,7 @@ static RunStatus RUN_LOOP_NAME(VM *vm, VMTraceCapture **capp, RunCold *ccold, in
                     memcmp(mname->data, "append", 6) == 0 && AS_ARRAY(recv)->len < AS_ARRAY(recv)->cap) {
                     /* array.append without growth: no allocation, no GC point */
                     SArray *aa = AS_ARRAY(recv);
+                    array_note_push(aa, ov[1]);
                     aa->items[aa->len++] = ov[1];
                     sp = ov;
                     PUSH(v_nil());
@@ -1588,9 +1589,11 @@ static RunStatus RUN_LOOP_NAME(VM *vm, VMTraceCapture **capp, RunCold *ccold, in
                 SArray *arr = AS_ARRAY(qa);
                 if (qb.as.i >= 0 && qb.as.i < arr->len) {
                     if (ipc[0] == OP_Q_SETIDX_LLL) {
+                        array_note_store(arr, base[rd16(ipc + 7)]);
                         arr->items[qb.as.i] = base[rd16(ipc + 7)];
                         pc = ipc + 10;
                     } else {
+                        array_note_store(arr, v_bool(ipc[6] == OP_TRUE));
                         arr->items[qb.as.i] = v_bool(ipc[6] == OP_TRUE);
                         pc = ipc + 8;
                     }

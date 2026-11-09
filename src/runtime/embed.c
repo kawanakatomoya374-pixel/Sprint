@@ -502,6 +502,7 @@ SpStatus sp_array_set(SpVM *vm, SpValue a, int64_t i, SpValue v) {
     if (s != SP_OK) return s;
     SArray *arr = AS_ARRAY(a);
     if (i < 0 || i >= arr->len) return rt_fail(vm, E_INDEX, "array index %lld out of range (length %lld)", (long long)i, (long long)arr->len);
+    array_note_store(arr, v);
     arr->items[i] = v;
     return SP_OK;
 }

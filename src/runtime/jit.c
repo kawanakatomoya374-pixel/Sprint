@@ -480,6 +480,20 @@ static int x_rr(JC *c, int pfx, int w, int op1, int op2, int reg, int rm) {
     b[n++] = (uint8_t)(0xc0 | ((reg & 7) << 3) | (rm & 7));
     return xput(c, b, n);
 }
+/* The element-type note of an array (Obj.xt, see array_note_store): before a store into the array in register rp, drop it to 0 unless the
+ * stored value has the noted type. The type is the constant `tag`, or (tag < 0) the type byte of the slot at [base + off]. */
+static int x_note_store(JC *c, int rp, int tag, int base, int32_t off) {
+    uint8_t je[2], imm0 = 0, itag = (uint8_t)tag;
+    const int xo = (int)offsetof(Obj, xt);
+    if (tag >= 0) {
+        if (!x_mem(c, 0, 0, 0x80, -1, 7, rp, xo) || !xput(c, &itag, 1)) return 0;
+    } else {
+        if (!x_mem(c, 0, 0, 0x0f, 0xb6, R_RCX, base, off) || !x_mem(c, 0, 0, 0x38, -1, R_RCX, rp, xo)) return 0;
+    }
+    je[0] = 0x74;
+    je[1] = (uint8_t)(1 + 1 + ((rp & 7) == 4 ? 1 : 0) + 4 + 1 + (((rp >> 3) & 1) ? 1 : 0));
+    return xput(c, je, 2) && x_mem(c, 0, 0, 0xc6, -1, 0, rp, xo) && xput(c, &imm0, 1);
+}
 static int x_imm32(JC *c, int32_t v) { uint8_t b[4]; memcpy(b, &v, 4); return xput(c, b, 4); }
 /* mov r, [base+d] / mov [base+d], r / mov r, r / mov qword [base+d], imm32 / mov r, imm */
 static int x_ld(JC *c, int r, int base, int32_t d) { return x_mem(c, 0, 1, 0x8b, -1, r, base, d); }
@@ -2487,6 +2501,7 @@ static int jh_setidx(VM *vm, const SpValue *o, const SpValue *k, const SpValue *
     if (o->type == T_ARRAY) {
         SArray *a = AS_ARRAY(*o);
         if (k->type != T_INT || k->as.i < 0 || k->as.i >= a->len) return 0;
+        array_note_store(a, *v);
         a->items[k->as.i] = *v;
         return 1;
     }
@@ -2810,6 +2825,8 @@ static int do_set_index(JC *c, uint32_t pc) {
                 !x_rr(c, 0, 1, 0xc1, -1, 4, R_RCX) || !xput(c, &sh, 1) || !x_rr(c, 0, 1, 0x03, -1, R_RAX, R_RCX)) return 0;
         }
         int ok;
+        if (ve.kind == EK_REG ? !x_note_store(c, rp, (int)tag_of(ve.ty), 0, 0)
+                              : !x_note_store(c, rp, -1, ve.kind == EK_K ? R_R13 : R_R12, ve.kind == EK_K ? koff(ve.idx) : roff(c, &ve, pv))) return 0;
         if (ve.kind == EK_REG) {
             ok = x_sti(c, R_RAX, ed, (int32_t)tag_of(ve.ty)) && (reg_is_x(&ve) ? x_sd_st(c, R_RAX, ed + 8, ve.idx) : x_st(c, R_RAX, ed + 8, ve.idx));
         } else {

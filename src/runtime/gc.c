@@ -86,6 +86,16 @@ static void blacken(VM *vm, Obj *o) {
     case T_ARRAY: {
         SArray *a = (SArray *)o;
         for (int64_t i = 0; i < a->len; i++) mark_val(vm, a->items[i]);
+#ifndef NDEBUG_SP
+        /* audit of the element-type note (Obj.xt): trace code relies on it, so a stale note is a memory-safety bug */
+        if (a->h.xt != 0U)
+            for (int64_t i = 0; i < a->len; i++)
+                if (a->items[i].type != a->h.xt) {
+                    (void)fprintf(stderr, "internal error: array element-type note %u but element %lld has type %u\n",
+                                  (unsigned)a->h.xt, (long long)i, (unsigned)a->items[i].type);
+                    abort();
+                }
+#endif
         break;
     }
     case T_TABLE: {

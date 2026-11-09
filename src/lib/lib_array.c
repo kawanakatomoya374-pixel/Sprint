@@ -11,7 +11,7 @@ static int am_extend(VM *vm, int argc, SpValue *argv, SpValue *ret) {
     SArray *a = AS_ARRAY(argv[0]), *b = AS_ARRAY(argv[1]);
     int64_t n = b->len;
     array_reserve(vm, a, a->len + n);
-    for (int64_t i = 0; i < n; i++) a->items[a->len++] = b->items[i];
+    for (int64_t i = 0; i < n; i++) { array_note_push(a, b->items[i]); a->items[a->len++] = b->items[i]; }
     return 0;
 }
 static int am_insert(VM *vm, int argc, SpValue *argv, SpValue *ret) {
@@ -22,6 +22,7 @@ static int am_insert(VM *vm, int argc, SpValue *argv, SpValue *ret) {
     if (i < 0 || i > a->len) return vm_set_error(vm, E_INDEX, "insert() index out of range");
     array_reserve(vm, a, a->len + 1);
     memmove(a->items + i + 1, a->items + i, (size_t)(a->len - i) * sizeof(SpValue));
+    array_note_push(a, argv[2]);
     a->items[i] = argv[2];
     a->len++;
     return 0;

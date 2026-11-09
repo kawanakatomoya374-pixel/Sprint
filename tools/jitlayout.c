@@ -30,6 +30,7 @@ int main(void) {
     P("L_SFUNC_PROTO", offsetof(SFunc, proto));
     P("L_SFUNC_UP", offsetof(SFunc, up));
     P("L_SFUNC_NAT", offsetof(SFunc, nat));
+    P("L_OBJ_XT", offsetof(Obj, xt));
     P("L_SINST_CLS", offsetof(SInstance, cls));
     P("L_SINST_SLOTS", offsetof(SInstance, slots));
     P("L_SARRAY_LEN", offsetof(SArray, len));

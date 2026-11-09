@@ -1278,6 +1278,11 @@ ST setidx_rr                    # array(H0)[int(H1)] <- slot H2
     mov H1+8(%r12),%rcx
     cmp H3(%rax),%rcx
     jae JIT_X
+    movzbl H2(%r12),%edx                    # the array's element-type note drops to "unknown" if this value differs
+    cmp %dl,L_OBJ_XT(%rax)
+    je 1f
+    movb $0,L_OBJ_XT(%rax)
+1:
     mov H4(%rax),%rax
     shl $4,%rcx
     mov H2(%r12),%rdx
@@ -1290,6 +1295,11 @@ ST setidx_rk                    # value is the constant H2
     mov H1+8(%r12),%rcx
     cmp H3(%rax),%rcx
     jae JIT_X
+    movzbl H2(%r13),%edx
+    cmp %dl,L_OBJ_XT(%rax)
+    je 1f
+    movb $0,L_OBJ_XT(%rax)
+1:
     mov H4(%rax),%rax
     shl $4,%rcx
     mov H2(%r13),%rdx
@@ -1389,6 +1399,14 @@ ST aappend_r                    # value in slot H2
     mov H3(%rax),%rcx
     cmp H5(%rax),%rcx
     jge JIT_X
+    movzbl H2(%r12),%edx                    # element-type note: an empty array takes the value's type, otherwise a different type clears it
+    test %rcx,%rcx
+    jz 2f
+    cmp %dl,L_OBJ_XT(%rax)
+    je 1f
+    xor %edx,%edx
+2:  mov %dl,L_OBJ_XT(%rax)
+1:
     lea 1(%rcx),%rdx
     mov %rdx,H3(%rax)
     mov H4(%rax),%rax
@@ -1405,6 +1423,14 @@ ST aappend_k                    # value is the constant H2
     mov H3(%rax),%rcx
     cmp H5(%rax),%rcx
     jge JIT_X
+    movzbl H2(%r13),%edx
+    test %rcx,%rcx
+    jz 2f
+    cmp %dl,L_OBJ_XT(%rax)
+    je 1f
+    xor %edx,%edx
+2:  mov %dl,L_OBJ_XT(%rax)
+1:
     lea 1(%rcx),%rdx
     mov %rdx,H3(%rax)
     mov H4(%rax),%rax
@@ -1769,6 +1795,17 @@ ST tr_ab_tag                    # cmpq $HB0, (%r10): the element tag
 
 ST tr_ab_load                   # dst = payload: HB0 = REX.W+B(+R dst), HB1 = modrm (mod 01, reg dst, rm r10)
     .byte HB0, 0x8b, HB1, 0x08
+
+# element-type note (Obj.xt) of the array in ra: dropped to 0 unless the value being stored has type HB2. HB0 = REX(+B), HB1 = modrm of
+# cmp /7 (mod 01, rm ra), HB3 = modrm of mov /0 (mod 01, rm ra)
+ST tr_note_store
+    .byte HB0, 0x80, HB1, L_OBJ_XT, HB2
+    .byte 0x74, 5
+    .byte HB0, 0xc6, HB3, L_OBJ_XT, 0
+
+# entry guard: the element-type note of the array in ra must be HB2 (HB0 = REX(+B), HB1 = modrm of cmp /7, mod 01, rm ra)
+ST tr_xt_guard
+    .byte HB0, 0x80, HB1, L_OBJ_XT, HB2
 
 ST tr_ab_store_tag              # movq $H0, (%r10)
     .byte 0x49, 0xc7, 0x02

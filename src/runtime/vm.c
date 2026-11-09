@@ -198,6 +198,7 @@ static int set_index(VM *vm, SpValue o, SpValue k, SpValue v) {
         SArray *a = AS_ARRAY(o);
         if (k.as.i < 0 || k.as.i >= a->len)
             return vm_set_error(vm, E_INDEX, "array index %lld out of range (length %lld)", (long long)k.as.i, (long long)a->len);
+        array_note_store(a, v);
         a->items[k.as.i] = v;
         return 0;
     }

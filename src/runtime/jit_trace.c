@@ -550,6 +550,14 @@ static int ta_ab_load(TraceAsm *a, uint8_t dst) {
     p.b[1] = (uint8_t)(0x42U | ((dst & 7U) << 3));
     return ta_stencil(a, ST_tr_ab_load, &p);
 }
+static int ta_note_store(TraceAsm *a, uint8_t ra, uint8_t tag) {   /* the array's element-type note, before a store of type `tag` */
+    TracePatch p = ta_patch();
+    p.b[0] = (uint8_t)(0x40U | (ra >= 8U ? 0x01U : 0U));
+    p.b[1] = (uint8_t)(0x78U | (ra & 7U));
+    p.b[2] = tag;
+    p.b[3] = (uint8_t)(0x40U | (ra & 7U));
+    return ta_stencil(a, ST_tr_note_store, &p);
+}
 static int ta_ab_store(TraceAsm *a, uint8_t tag, uint8_t src) {
     TracePatch p = ta_patch();
     TracePatch q = ta_patch();
@@ -665,8 +673,8 @@ static int ta_emit_pending_stores(const SpTraceIR *ir, const uint8_t *regs, cons
                 !ta_field_store(a, regs[st->aux], regs[st->a], (uint32_t)st->imm, tag)) return 0;
             continue;
         }
-        if (regs[st->aux] >= 16U || !ta_store_tag(ir, st, &tag) || !ta_ab_addr(a, regs[st->a], regs[st->b]) ||
-            !ta_ab_store(a, tag, regs[st->aux])) return 0;
+        if (regs[st->aux] >= 16U || !ta_store_tag(ir, st, &tag) || !ta_note_store(a, regs[st->a], tag) ||
+            !ta_ab_addr(a, regs[st->a], regs[st->b]) || !ta_ab_store(a, tag, regs[st->aux])) return 0;
     }
     return 1;
 }
@@ -1180,9 +1188,10 @@ static int ta_emit_trace_ir(const SpTraceIR *ir, const int32_t *phi_local, unsig
             break;
         case SP_TIR_ALOAD:
             if (dst >= 16U || ra >= 16U || rb >= 16U || in->imm > 255U) goto done;
-            if (in->aux != 1U && (!ta_ab_bounds(a, ra, rb) || !ta_jcc(a, 0x83U, TA_DEOPT))) goto done;   /* aux 1: range proven at entry */
-            if (!ta_ab_addr(a, ra, rb) ||
-                !ta_ab_tag(a, (uint8_t)in->imm) || !ta_jcc(a, 0x85U, TA_DEOPT) || !ta_ab_load(a, dst)) goto done;
+            if (!(in->aux & 1U) && (!ta_ab_bounds(a, ra, rb) || !ta_jcc(a, 0x83U, TA_DEOPT))) goto done;   /* aux bit 0: range proven at entry */
+            if (!ta_ab_addr(a, ra, rb)) goto done;
+            if (!(in->aux & 2U) && (!ta_ab_tag(a, (uint8_t)in->imm) || !ta_jcc(a, 0x85U, TA_DEOPT))) goto done;   /* bit 1: the array's note settles the tag */
+            if (!ta_ab_load(a, dst)) goto done;
             break;
         case SP_TIR_FLOAD:
             if (dst >= 16U || ra >= 16U || in->imm > 255U) goto done;
@@ -1198,6 +1207,15 @@ static int ta_emit_trace_ir(const SpTraceIR *ir, const int32_t *phi_local, unsig
                     bound = 10U;
                 }
                 if (bound >= 16U || !ta_ab_bounds(a, ra, bound) || !ta_jcc(a, 0x87U, TA_DEOPT)) goto done;
+                break;
+            }
+            if (in->aux == 4U) {   /* entry: every element of the array has the type in->imm (its note) */
+                TracePatch xp = ta_patch();
+                if (ra >= 16U) goto done;
+                xp.b[0] = (uint8_t)(0x40U | (ra >= 8U ? 0x01U : 0U));
+                xp.b[1] = (uint8_t)(0x78U | (ra & 7U));
+                xp.b[2] = (uint8_t)in->imm;
+                if (!ta_stencil(a, ST_tr_xt_guard, &xp) || !ta_jcc(a, 0x85U, TA_DEOPT)) goto done;
                 break;
             }
             if (in->aux == 3U) {   /* entry: the counter is not negative */
@@ -2865,7 +2883,7 @@ walked:
     }
     for (uint32_t i = 0U; i < slot_total; i++)
         if (used[i] && !sp_tir_set_phi_backedge(ir, phi[i], current[i])) goto done;
-    if (sp_tir_hoist_loads(ir) < 0 || sp_tir_elide_bounds(ir) < 0) goto done;
+    if (sp_tir_hoist_loads(ir) < 0 || sp_tir_elide_bounds(ir) < 0 || sp_tir_elide_tags(ir) < 0) goto done;
     /* the loop label is planted at the first comparison, and only its operands live across trips: that comparison must sit at the
      * start of the iteration, with nothing but its own constants before it */
     {

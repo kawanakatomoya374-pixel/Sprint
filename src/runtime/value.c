@@ -232,6 +232,7 @@ int array_reserve(VM *vm, SArray *a, int64_t need) {
 
 int array_push(VM *vm, SArray *a, SpValue v) {
     if (a->len == a->cap) array_reserve(vm, a, a->len + 1);
+    array_note_push(a, v);
     a->items[a->len++] = v;
     return 0;
 }

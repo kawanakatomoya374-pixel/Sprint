@@ -448,14 +448,14 @@ int sp_tir_elide_bounds(SpTraceIR *ir) {
     for (size_t i = fc + 2U; i < n; i++) {
         SpTIRInst *in = &ir->inst[i];
         int invariant = 0;
-        if (in->op != SP_TIR_ALOAD || in->b != cur || in->aux == 1U) continue;
+        if (in->op != SP_TIR_ALOAD || in->b != cur || (in->aux & 1U)) continue;
         for (size_t k = 0U; k < fc && !invariant; k++) {
             const SpTIRInst *d = &ir->inst[k];
             if (d->dst != in->a) continue;
             invariant = (d->op == SP_TIR_PHI && d->b == d->dst) || d->op == SP_TIR_ALOAD;
         }
         if (!invariant) continue;
-        in->aux = 1U;
+        in->aux |= 1U;
         found++;
         {
             unsigned u;
@@ -479,6 +479,51 @@ int sp_tir_elide_bounds(SpTraceIR *ir) {
         ir->inst[fc + narr] = g;
     }
     ir->count = n + (size_t)narr + 1U;
+    return (int)found;
+}
+
+/* Element tags that the array's own note settles: in a trace that stores into no array at all, a read from a loop-invariant array
+ * needs no per-element type check once the array's note (Obj.xt) has been checked on entry. Marks such loads (aux bit 1) and
+ * inserts the entry guards (CGUARD aux 4, imm = tag) before the first loop test. Returns the number of loads relieved. */
+int sp_tir_elide_tags(SpTraceIR *ir) {
+    size_t fc = ir->count, n = ir->count, found = 0U;
+    SpTIRValue arrays[8];
+    uint8_t tags[8];
+    unsigned narr = 0U;
+    for (size_t i = 0U; i < n; i++) if (ir->inst[i].op == SP_TIR_ASTORE) return 0;
+    for (size_t i = 0U; i + 1U < n; i++) {
+        const SpTIROp o = ir->inst[i].op;
+        if (o >= SP_TIR_ICMP_EQ && o <= SP_TIR_ICMP_GE && !(ir->inst[i + 1U].op == SP_TIR_GUARD_TRUE && (ir->inst[i + 1U].imm & SP_TIR_GUARD_ENTRY))) { fc = i; break; }
+    }
+    if (fc >= n - 1U) return 0;
+    for (size_t i = fc + 2U; i < n; i++) {
+        SpTIRInst *in = &ir->inst[i];
+        int invariant = 0;
+        if (in->op != SP_TIR_ALOAD || (in->aux & 2U)) continue;
+        for (size_t k = 0U; k < fc && !invariant; k++) {
+            const SpTIRInst *d = &ir->inst[k];
+            if (d->dst != in->a) continue;
+            invariant = (d->op == SP_TIR_PHI && d->b == d->dst && d->aux == 0U) || d->op == SP_TIR_ALOAD;
+        }
+        if (!invariant) continue;
+        {
+            unsigned u;
+            for (u = 0U; u < narr && !(arrays[u] == in->a && tags[u] == (uint8_t)in->imm); u++) {}
+            if (u == narr) { if (narr == 8U) continue; arrays[narr] = in->a; tags[narr] = (uint8_t)in->imm; narr++; }
+        }
+        in->aux |= 2U;
+        found++;
+    }
+    if (found == 0U) return 0;
+    if (!tir_reserve(ir, (size_t)narr)) return -1;
+    memmove(&ir->inst[fc + narr], &ir->inst[fc], (n - fc) * sizeof ir->inst[0]);
+    for (unsigned u = 0U; u < narr; u++) {
+        SpTIRInst g;
+        memset(&g, 0, sizeof g);
+        g.op = SP_TIR_CGUARD; g.type = SP_TIR_T_REF; g.a = arrays[u]; g.aux = 4U; g.imm = tags[u];
+        ir->inst[fc + u] = g;
+    }
+    ir->count = n + narr;
     return (int)found;
 }
 
