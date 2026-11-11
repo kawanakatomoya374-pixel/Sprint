@@ -249,11 +249,13 @@ int sp_jit_snapshot_restore(const SpJitSnapshot *snapshot, const Proto *proto,
         frame->fn == NULL || frame->fn->proto != proto || frame->base != base ||
         proto == NULL || proto->code == NULL || snapshot == NULL || snapshot->map == NULL ||
         snapshot->resume_pc > proto->code_len) return 0;   /* the shape was validated when the trace was compiled */
+#ifndef NDEBUG_SP   /* audit: the exit code stored every mapped slot's tag (the release build trusts it, this loop was most of an exit's cost) */
     for (uint16_t i = 0U; i < snapshot->map->entry_count; i++) {
         const SpJitSnapshotEntry *entry = &snapshot->map->entries[i];
         if (entry->source == (uint8_t)SP_JIT_SNAPSHOT_FROM_IR &&
             base[entry->slot].type != entry->runtime_type) return 0;
     }
+#endif
     *pc_out = proto->code + snapshot->resume_pc;
     *sp_out = base + snapshot->map->slot_count;
     return 1;
