@@ -2577,7 +2577,7 @@ static int trace_build_ir_path_impl(Proto *p, const SpValue *locals, const SpVal
             case OP_GET_INDEX: case OP_SET_INDEX: case OP_TRUE: case OP_FALSE:
                 break;
             default:
-                why = "unsupported bytecode";
+                { static _Thread_local char opwhy[40]; (void)snprintf(opwhy, sizeof opwhy, "unsupported bytecode 0x%02x", (unsigned)op); why = opwhy; }
                 goto done;
             }
             pc += (uint32_t)len;

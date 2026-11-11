@@ -90,7 +90,9 @@ static void blacken(VM *vm, Obj *o) {
     switch (o->type) {
     case T_ARRAY: {
         SArray *a = (SArray *)o;
-        for (int64_t i = 0; i < a->len; i++) mark_val(vm, a->items[i]);
+        /* an array whose elements are all bools, ints or floats (the element-type note) holds no references: nothing to mark */
+        if (!(a->h.xt >= (uint8_t)T_BOOL && a->h.xt <= (uint8_t)T_FLOAT))
+            for (int64_t i = 0; i < a->len; i++) mark_val(vm, a->items[i]);
 #ifndef NDEBUG_SP
         /* audit of the element-type note (Obj.xt): trace code relies on it, so a stale note is a memory-safety bug */
         if (a->h.xt != 0U)
