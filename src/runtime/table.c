@@ -11,9 +11,15 @@ static uint64_t mix64(uint64_t x) {
     return x;
 }
 
+/* integer keys: one multiply, the high half folded into the low bits that pick the slot */
+static inline uint64_t hash_int(int64_t i) {
+    uint64_t h = (uint64_t)i * 0x9e3779b97f4a7c15ull;
+    return h ^ (h >> 32);
+}
+
 static uint64_t hash_value(SpValue k) {
     switch (k.type) {
-    case T_INT: return mix64((uint64_t)k.as.i);
+    case T_INT: return hash_int(k.as.i);
     case T_FLOAT: { uint64_t b; memcpy(&b, &k.as.f, 8); return mix64(b); }
     case T_BOOL: return k.as.b ? 0x9e3779b97f4a7c15ull : 0x7f4a7c159e3779b9ull;
     case T_STRING: return mix64(str_hash(AS_STR(k)));
@@ -58,9 +64,9 @@ static int64_t t_find(const STable *t, SpValue k, uint64_t h, int64_t *slot_out)
     uint64_t mask = (uint64_t)t->idxcap - 1;
     uint64_t i = h & mask;
     for (;;) {
-        int32_t e = t->idx[i];
+        const int32_t e = t->idx[i].e;
         if (e == -1) return -1;
-        if (e >= 0 && key_eq(t->ents[e].key, k)) {
+        if (e >= 0 && t->idx[i].tag == (uint32_t)(h >> 32) && key_eq(t->ents[e].key, k)) {
             if (slot_out) *slot_out = (int64_t)i;
             return e;
         }
@@ -79,9 +85,9 @@ static int64_t t_find_sstr(const STable *t, const SString *key, uint32_t h32,
     uint64_t mask = (uint64_t)t->idxcap - 1;
     uint64_t i = h & mask;
     for (;;) {
-        int32_t e = t->idx[i];
+        const int32_t e = t->idx[i].e;
         if (e == -1) return -1;
-        if (e >= 0) {
+        if (e >= 0 && t->idx[i].tag == (uint32_t)(h >> 32)) {
             const TEntry *te = &t->ents[e];
             if (te->key.type == T_STRING) {
                 const SString *ks = AS_STR(te->key);
@@ -97,11 +103,31 @@ static int64_t t_find_sstr(const STable *t, const SString *key, uint32_t h32,
     }
 }
 
+/* lookup of an integer key: no generic equality call */
+static inline int64_t t_find_int(const STable *t, int64_t k, uint64_t h, int64_t *slot_out) {
+    if (!t->idx) return -1;
+    const uint64_t mask = (uint64_t)t->idxcap - 1;
+    uint64_t i = h & mask;
+    for (;;) {
+        const int32_t e = t->idx[i].e;
+        if (e == -1) return -1;
+        if (e >= 0 && t->idx[i].tag == (uint32_t)(h >> 32)) {
+            const TEntry *te = &t->ents[e];
+            if (te->key.type == T_INT && te->key.as.i == k) {
+                if (slot_out) *slot_out = (int64_t)i;
+                return e;
+            }
+        }
+        i = (i + 1) & mask;
+    }
+}
+
 static void t_idx_insert_h(STable *t, int32_t e, uint64_t h) {
     uint64_t mask = (uint64_t)t->idxcap - 1;
     uint64_t i = h & mask;
-    while (t->idx[i] >= 0) i = (i + 1) & mask;
-    t->idx[i] = e;
+    while (t->idx[i].e >= 0) i = (i + 1) & mask;
+    t->idx[i].e = e;
+    t->idx[i].tag = (uint32_t)(h >> 32);
 }
 
 static void t_idx_insert(STable *t, int32_t e) {
@@ -113,18 +139,18 @@ static void t_rebuild(VM *vm, STable *t, int64_t newcap) {
     int64_t icap = 8;
     while (icap < newcap * 2) icap <<= 1;
     TEntry *ne = vm_mem(vm, NULL, 0, (size_t)newcap * sizeof(TEntry));
-    int32_t *ni = vm_mem(vm, NULL, 0, (size_t)icap * sizeof(int32_t));
+    TIdx *ni = vm_mem(vm, NULL, 0, (size_t)icap * sizeof(TIdx));
     int64_t n = 0;
     for (int64_t i = 0; i < t->nent; i++)
         if (t->ents[i].key.type != T_NIL) ne[n++] = t->ents[i];
     if (t->ents) vm_mem(vm, t->ents, (size_t)t->cap * sizeof(TEntry), 0);
-    if (t->idx) vm_mem(vm, t->idx, (size_t)t->idxcap * sizeof(int32_t), 0);
+    if (t->idx) vm_mem(vm, t->idx, (size_t)t->idxcap * sizeof(TIdx), 0);
     t->ents = ne;
     t->cap = newcap;
     t->nent = n;
     t->idx = ni;
     t->idxcap = icap;
-    for (int64_t i = 0; i < icap; i++) ni[i] = -1;
+    for (int64_t i = 0; i < icap; i++) { ni[i].e = -1; ni[i].tag = 0; }
     for (int64_t i = 0; i < n; i++) t_idx_insert(t, (int32_t)i);
 }
 
@@ -135,8 +161,14 @@ int table_reserve(VM *vm, STable *t, int64_t n) {
 }
 
 int table_get(VM *vm, STable *t, SpValue key, SpValue *out, int *found) {
-    if (norm_key(vm, &key)) return 1;
     int64_t e;
+    if (key.type == T_INT) {
+        e = t_find_int(t, key.as.i, hash_int(key.as.i), NULL);
+        if (e >= 0) { *out = t->ents[e].val; if (found) *found = 1; }
+        else { *out = v_nil(); if (found) *found = 0; }
+        return 0;
+    }
+    if (norm_key(vm, &key)) return 1;
     if (key.type == T_STRING) {
         SString *s = AS_STR(key);
         e = t_find_sstr(t, s, str_hash(s), NULL, NULL);
@@ -165,9 +197,9 @@ int table_get_str(STable *t, const char *s, size_t len, SpValue *out) {
     uint64_t mask = (uint64_t)t->idxcap - 1;
     uint64_t i = h & mask;
     for (;;) {
-        int32_t e = t->idx[i];
+        const int32_t e = t->idx[i].e;
         if (e == -1) return 0;
-        if (e >= 0) {
+        if (e >= 0 && t->idx[i].tag == (uint32_t)(h >> 32)) {
             SpValue k = t->ents[e].key;
             if (k.type == T_STRING && (AS_STR(k)->hash == h32 || !AS_STR(k)->hash) && AS_STR(k)->len == len &&
                 memcmp(AS_STR(k)->dp, s, len) == 0) {
@@ -180,11 +212,15 @@ int table_get_str(STable *t, const char *s, size_t len, SpValue *out) {
 }
 
 int table_set(VM *vm, STable *t, SpValue key, SpValue val) {
-    if (norm_key(vm, &key)) return 1;
     int64_t slot = -1;
     uint64_t h;
     int64_t e;
-    if (key.type == T_STRING) {
+    if (key.type == T_INT) {
+        h = hash_int(key.as.i);
+        e = t_find_int(t, key.as.i, h, &slot);
+    } else if (norm_key(vm, &key)) {
+        return 1;
+    } else if (key.type == T_STRING) {
         SString *s = AS_STR(key);
         e = t_find_sstr(t, s, str_hash(s), &slot, &h);
     } else {
@@ -195,7 +231,7 @@ int table_set(VM *vm, STable *t, SpValue key, SpValue val) {
         if (e >= 0) {
             t->ents[e].key = v_nil();
             t->ents[e].val = v_nil();
-            t->idx[slot] = -2;
+            t->idx[slot].e = -2;
             t->count--;
             t->version++;
         }
