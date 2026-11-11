@@ -546,7 +546,7 @@ static RunStatus RUN_LOOP_NAME(VM *vm, VMTraceCapture **capp, RunCold *ccold, in
                     cfv + 1 + cp->nlocals + cp->max_stack + 8 <= vm->stack_end && cn == cp->nrequired) {
                     TICK();
                     pc++;
-#if SP_JIT
+#if SP_JIT && !RUN_LOOP_RECORDING   /* while a loop is being recorded the callee must run in the interpreter, or its steps are missing from the trace */
                     if (__builtin_expect(cp->pure != NULL, 0)) {   /* a pure recursive integer function: native, no frames */
                         int64_t pure_r;
                         uint64_t pure_left = left;
@@ -569,7 +569,7 @@ static RunStatus RUN_LOOP_NAME(VM *vm, VMTraceCapture **capp, RunCold *ccold, in
                     nf->uev = v_nil();
                     nf->dbase = vm->ndr;
                     nf->pc = cp->code;
-#if SP_JIT
+#if SP_JIT && !RUN_LOOP_RECORDING
                     {   /* a hot function runs as compiled code, which comes back here when it returns or leaves */
                         JitUnit *ju = cp->junit;
                         if (!ju) {
@@ -1778,7 +1778,7 @@ static RunStatus RUN_LOOP_NAME(VM *vm, VMTraceCapture **capp, RunCold *ccold, in
             }
             nf->pc = p->code + entry;
             sp = nb + p->nlocals;
-#if SP_JIT
+#if SP_JIT && !RUN_LOOP_RECORDING
             if ((nf->kind == FK_NORMAL || nf->kind == FK_CTOR) && nargs == p->nparams && !p->has_rest && p->ndefaults == 0) {
                 JitUnit *ju = p->junit;     /* methods and constructors reach compiled code here */
                 if (!ju) {

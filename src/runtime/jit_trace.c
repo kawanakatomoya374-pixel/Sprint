@@ -918,10 +918,11 @@ static int ta_uses_rax_rdx(const SpTraceIR *ir, const uint8_t *regs) {
 static SpTIRValue ta_coalesce_phi(const SpTraceIR *ir, size_t i) {
     const SpTIRInst *in = &ir->inst[i];
     const SpTIRInst *phi = NULL;
-    if ((in->op != SP_TIR_IADD && in->op != SP_TIR_ISUB) || in->a == 0U || in->b == 0U || in->a == in->b || in->dst == 0U) return 0U;
+    const int fl = in->op == SP_TIR_FADD || in->op == SP_TIR_FSUB || in->op == SP_TIR_FMUL;   /* floats cannot fail: nothing to undo */
+    if ((in->op != SP_TIR_IADD && in->op != SP_TIR_ISUB && !fl) || in->a == 0U || in->b == 0U || in->a == in->b || in->dst == 0U) return 0U;
     for (size_t k = 0U; k < ir->count; k++)
         if (ir->inst[k].op == SP_TIR_PHI && ir->inst[k].dst == in->a) phi = &ir->inst[k];
-    if (phi == NULL || phi->b != in->dst || phi->type != SP_TIR_T_I64 || phi->aux != 0U || ta_is_fparam(ir, phi->a)) return 0U;
+    if (phi == NULL || phi->b != in->dst || phi->type != (fl ? SP_TIR_T_F64 : SP_TIR_T_I64) || phi->aux != 0U || ta_is_fparam(ir, phi->a)) return 0U;
     for (size_t k = 0U; k < ir->count; k++) {
         const SpTIRInst *o = &ir->inst[k];
         if (o->op == SP_TIR_PHI && o != phi && (o->a == in->a || o->b == in->a)) return 0U;
@@ -1061,7 +1062,7 @@ static int ta_alloc_regs(const SpTraceIR *ir, const int32_t *phi_local, uint8_t 
         if (in->dst == 0U || in->op == SP_TIR_PARAM || in->op == SP_TIR_PHI) continue;
         if (in->op == SP_TIR_NEWINST && in->aux == 1U) continue;   /* sunk: no code, no register */
         if (pinned[in->dst]) continue;
-        if (ta_coalesce_phi(ir, i) != 0U && regs[in->a] < 16U && pinned[in->a] && regs[in->b] < 16U) {
+        if (ta_coalesce_phi(ir, i) != 0U && pinned[in->a] && (isf[in->dst] ? ta_isx(regs[in->a]) && ta_isx(regs[in->b]) : regs[in->a] < 16U && regs[in->b] < 16U)) {
             regs[in->dst] = regs[in->a];
             pinned[in->dst] = 1U;
             continue;

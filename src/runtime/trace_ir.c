@@ -1103,13 +1103,67 @@ done:
  * always retained. PHI entry and back-edge operands are both marked live, then
  * all surviving SSA values are densely renumbered.
  */
+/* Common subexpressions: an instruction that repeats an earlier pure one (same operation, operands, type and immediates) is dropped and its
+ * result replaced by the earlier value. A failure the duplicate could have raised (overflow, a zero divisor) was already raised by the first
+ * one; comparisons are left alone (the backend wants each fused with its own guard), as are loads. `dup[i]` marks dropped instructions. */
+static int tir_cse_op(SpTIROp op) {
+    switch (op) {
+    case SP_TIR_CONST_I64: case SP_TIR_CONST_F64: case SP_TIR_IADD: case SP_TIR_ISUB: case SP_TIR_IMUL: case SP_TIR_IDIV: case SP_TIR_IMOD:
+    case SP_TIR_INEG: case SP_TIR_FADD: case SP_TIR_FSUB: case SP_TIR_FMUL: case SP_TIR_FDIV: case SP_TIR_FNEG: case SP_TIR_I2F:
+    case SP_TIR_IAND: case SP_TIR_IOR: case SP_TIR_IXOR: case SP_TIR_ISHL: case SP_TIR_ISHR:
+        return 1;
+    case SP_TIR_PARAM: case SP_TIR_CONST_BOOL: case SP_TIR_PHI: case SP_TIR_ICMP_EQ: case SP_TIR_ICMP_NE: case SP_TIR_ICMP_LT:
+    case SP_TIR_ICMP_LE: case SP_TIR_ICMP_GT: case SP_TIR_ICMP_GE: case SP_TIR_FCMP_EQ: case SP_TIR_FCMP_NE: case SP_TIR_FCMP_LT:
+    case SP_TIR_FCMP_LE: case SP_TIR_FCMP_GT: case SP_TIR_FCMP_GE: case SP_TIR_GUARD_TRUE: case SP_TIR_ALOAD: case SP_TIR_ASTORE:
+    case SP_TIR_FLOAD: case SP_TIR_FSTORE: case SP_TIR_NEWINST: case SP_TIR_SLOAD: case SP_TIR_LEAFCALL: case SP_TIR_UCELL:
+    case SP_TIR_VFIELD: case SP_TIR_CGUARD: case SP_TIR_LOOP: case SP_TIR_RETURN:
+    default:
+        return 0;
+    }
+}
+static int tir_cse_commutes(SpTIROp op) {
+    return op == SP_TIR_IADD || op == SP_TIR_IMUL || op == SP_TIR_FADD || op == SP_TIR_FMUL ||
+           op == SP_TIR_IAND || op == SP_TIR_IOR || op == SP_TIR_IXOR;
+}
+static void tir_cse(SpTraceIR *ir, uint8_t *dup, SpTIRValue *rep) {
+    /* Code before the loop label (the entry guards and what they read) runs once, and its registers are not kept across iterations: only
+     * the loop body, from the first comparison that is not an entry guard, takes part. */
+    size_t body = ir->count;
+    for (size_t i = 0U; i + 1U < ir->count && body == ir->count; i++) {
+        const SpTIROp o = ir->inst[i].op;
+        if (o >= SP_TIR_ICMP_EQ && o <= SP_TIR_FCMP_GE && !(ir->inst[i + 1U].op == SP_TIR_GUARD_TRUE && (ir->inst[i + 1U].imm & SP_TIR_GUARD_ENTRY) != 0U)) body = i;
+    }
+    for (size_t i = 0U; i < ir->count; i++) {
+        SpTIRInst *in = &ir->inst[i];
+        if (in->a != SP_TIR_NO_VALUE && rep[in->a] != SP_TIR_NO_VALUE) in->a = rep[in->a];
+        if (in->b != SP_TIR_NO_VALUE && rep[in->b] != SP_TIR_NO_VALUE && in->op != SP_TIR_PHI) in->b = rep[in->b];
+        if (i < body || !tir_cse_op(in->op) || in->op == SP_TIR_CONST_I64 || in->op == SP_TIR_CONST_F64 || in->dst == SP_TIR_NO_VALUE) continue;
+        for (size_t j = body; j < i; j++) {
+            const SpTIRInst *o = &ir->inst[j];
+            if (dup[j] != 0U || o->op != in->op || o->type != in->type || o->imm != in->imm || o->aux != in->aux || o->dst == SP_TIR_NO_VALUE) continue;
+            if ((o->a == in->a && o->b == in->b) || (tir_cse_commutes(in->op) && o->a == in->b && o->b == in->a)) {
+                dup[i] = 1U;
+                rep[in->dst] = o->dst;
+                break;
+            }
+        }
+    }
+    for (size_t i = 0U; i < ir->count; i++) {   /* uses that precede the rewriting (PHI back-edges refer forward) */
+        SpTIRInst *in = &ir->inst[i];
+        if (in->a != SP_TIR_NO_VALUE && rep[in->a] != SP_TIR_NO_VALUE) in->a = rep[in->a];
+        if (in->b != SP_TIR_NO_VALUE && rep[in->b] != SP_TIR_NO_VALUE) in->b = rep[in->b];
+        if ((in->op == SP_TIR_ASTORE || in->op == SP_TIR_FSTORE) && in->aux != SP_TIR_NO_VALUE && rep[in->aux] != SP_TIR_NO_VALUE) in->aux = rep[in->aux];
+    }
+}
+
 int sp_tir_optimize(SpTraceIR *ir, size_t *folded_count, size_t *removed_count) {
     SpTIRInst *backup = NULL;
     SpTIRInst *compact = NULL;
     SpTIRType *types_backup = NULL;
     uint8_t *live = NULL;
     uint8_t *keep = NULL;
-    SpTIRValue *remap = NULL;
+    uint8_t *dup = NULL;
+    SpTIRValue *remap = NULL, *rep = NULL;
     size_t old_count;
     uint32_t old_nvalues;
     size_t folded = 0U;
@@ -1137,12 +1191,15 @@ int sp_tir_optimize(SpTraceIR *ir, size_t *folded_count, size_t *removed_count) 
     live = (uint8_t *)calloc(value_slots, sizeof *live);
     keep = (uint8_t *)calloc(old_count, sizeof *keep);
     remap = (SpTIRValue *)calloc(value_slots, sizeof *remap);
+    rep = (SpTIRValue *)calloc(value_slots, sizeof *rep);
+    dup = (uint8_t *)calloc(old_count, sizeof *dup);
     if (backup == NULL || compact == NULL || types_backup == NULL ||
-        live == NULL || keep == NULL || remap == NULL) goto done;
+        live == NULL || keep == NULL || remap == NULL || rep == NULL || dup == NULL) goto done;
 
     memcpy(backup, ir->inst, old_count * sizeof *backup);
     memcpy(types_backup, ir->value_types, type_slots * sizeof *types_backup);
     if (!sp_tir_constant_fold(ir, &folded)) goto rollback;
+    tir_cse(ir, dup, rep);
 
     /* PHI back-edges can refer to definitions later in the instruction
      * stream. A single reverse walk can therefore miss transitive uses that
@@ -1154,6 +1211,7 @@ int sp_tir_optimize(SpTraceIR *ir, size_t *folded_count, size_t *removed_count) 
             changed = 0;
             for (size_t i = 0U; i < ir->count; i++) {
                 const SpTIRInst *in = &ir->inst[i];
+                if (dup[i] != 0U) continue;   /* a repeated computation (tir_cse): nothing uses its result any more */
                 /* Instructions that can fail (an overflow, a zero divisor, an index outside the array) stay even when their result is
                  * unused: the failure deoptimises, and the interpreter then raises the error the program must see. */
                 int observable = in->op == SP_TIR_PHI ||
@@ -1245,6 +1303,8 @@ rollback:
         ir->nvalues = old_nvalues;
     }
 done:
+    free(rep);
+    free(dup);
     free(remap);
     free(keep);
     free(live);
