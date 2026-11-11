@@ -40,6 +40,7 @@ static const char *tir_op_name(SpTIROp op) {
     case SP_TIR_FCALL1: return "fcall1";
     case SP_TIR_FSQRT: return "fsqrt";
     case SP_TIR_FABS: return "fabs";
+    case SP_TIR_ALEN: return "alen";
     case SP_TIR_FFLOOR: return "ffloor";
     case SP_TIR_IAND: return "iand";
     case SP_TIR_IOR: return "ior";
@@ -343,6 +344,17 @@ int sp_tir_emit_aload(SpTraceIR *ir, SpTIRType elem_type, uint8_t elem_tag, SpTI
     SpTIRType ta, tb;
     if (!tir_value_type(ir, array, &ta) || ta != SP_TIR_T_REF || !tir_value_type(ir, index, &tb) || tb != SP_TIR_T_I64) return 0;
     return tir_append(ir, SP_TIR_ALOAD, elem_type, array, index, 0U, (uint64_t)elem_tag, 1, out);
+}
+int sp_tir_emit_alen(SpTraceIR *ir, SpTIRValue array, SpTIRValue *out) {
+    SpTIRType ta;
+    if (!tir_value_type(ir, array, &ta) || ta != SP_TIR_T_REF) return 0;
+    return tir_append(ir, SP_TIR_ALEN, SP_TIR_T_I64, array, SP_TIR_NO_VALUE, 0U, 0U, 1, out);
+}
+int sp_tir_emit_aappend(SpTraceIR *ir, SpTIRValue array, SpTIRValue len, SpTIRValue value) {
+    SpTIRType ta, tb, tv;
+    if (!tir_value_type(ir, array, &ta) || ta != SP_TIR_T_REF || !tir_value_type(ir, len, &tb) || tb != SP_TIR_T_I64 ||
+        !tir_value_type(ir, value, &tv) || value == SP_TIR_NO_VALUE) return 0;
+    return tir_append(ir, SP_TIR_ASTORE, tv, array, len, value, 1U, 0, NULL);
 }
 int sp_tir_emit_astore(SpTraceIR *ir, SpTIRValue array, SpTIRValue index, SpTIRValue value) {
     SpTIRType ta, tb, tv;
@@ -765,6 +777,13 @@ int sp_tir_verify(const SpTraceIR *ir, char *message, size_t message_size) {
                 goto done;
             }
             break;
+        case SP_TIR_ALEN:
+            if (!tir_value_defined_before(defs, in->a, i, (size_t)ir->nvalues) ||
+                types[in->a] != SP_TIR_T_REF || expected != SP_TIR_T_I64) {
+                tir_error(message, message_size, "invalid array length operand");
+                goto done;
+            }
+            break;
         case SP_TIR_FCALL1:
         case SP_TIR_FSQRT:
         case SP_TIR_FABS:
@@ -981,7 +1000,7 @@ static int tir_i64_eval_binary(SpTIROp op, int64_t a, int64_t b, int64_t *out) {
         *out = a >> b;
         return 1;
     case SP_TIR_PARAM: case SP_TIR_CONST_I64: case SP_TIR_CONST_F64:
-    case SP_TIR_CONST_BOOL: case SP_TIR_PHI: case SP_TIR_INEG: case SP_TIR_I2F: case SP_TIR_FCALL1: case SP_TIR_FSQRT: case SP_TIR_FABS: case SP_TIR_FFLOOR:
+    case SP_TIR_CONST_BOOL: case SP_TIR_PHI: case SP_TIR_INEG: case SP_TIR_I2F: case SP_TIR_FCALL1: case SP_TIR_FSQRT: case SP_TIR_FABS: case SP_TIR_FFLOOR: case SP_TIR_ALEN:
     case SP_TIR_FADD: case SP_TIR_FSUB: case SP_TIR_FMUL: case SP_TIR_FDIV:
     case SP_TIR_FNEG: case SP_TIR_ICMP_EQ: case SP_TIR_ICMP_NE:
     case SP_TIR_ICMP_LT: case SP_TIR_ICMP_LE: case SP_TIR_ICMP_GT:
@@ -1010,7 +1029,7 @@ static int tir_i64_eval_compare(SpTIROp op, int64_t a, int64_t b, int *out) {
     case SP_TIR_FDIV: case SP_TIR_FNEG: case SP_TIR_FCMP_EQ:
     case SP_TIR_FCMP_NE: case SP_TIR_FCMP_LT: case SP_TIR_FCMP_LE:
     case SP_TIR_FCMP_GT: case SP_TIR_FCMP_GE: case SP_TIR_GUARD_TRUE:
-    case SP_TIR_ALOAD: case SP_TIR_ASTORE: case SP_TIR_FLOAD: case SP_TIR_VFIELD: case SP_TIR_SLOAD: case SP_TIR_LEAFCALL: case SP_TIR_UCELL: case SP_TIR_NEWINST: case SP_TIR_FSTORE: case SP_TIR_IAND: case SP_TIR_IOR: case SP_TIR_IXOR: case SP_TIR_ISHL: case SP_TIR_ISHR: case SP_TIR_I2F: case SP_TIR_FCALL1: case SP_TIR_FSQRT: case SP_TIR_FABS: case SP_TIR_FFLOOR: case SP_TIR_CGUARD: case SP_TIR_LOOP: case SP_TIR_RETURN:
+    case SP_TIR_ALOAD: case SP_TIR_ASTORE: case SP_TIR_FLOAD: case SP_TIR_VFIELD: case SP_TIR_SLOAD: case SP_TIR_LEAFCALL: case SP_TIR_UCELL: case SP_TIR_NEWINST: case SP_TIR_FSTORE: case SP_TIR_IAND: case SP_TIR_IOR: case SP_TIR_IXOR: case SP_TIR_ISHL: case SP_TIR_ISHR: case SP_TIR_I2F: case SP_TIR_FCALL1: case SP_TIR_FSQRT: case SP_TIR_FABS: case SP_TIR_FFLOOR: case SP_TIR_ALEN: case SP_TIR_CGUARD: case SP_TIR_LOOP: case SP_TIR_RETURN:
         return 0;
     default: return 0;
     }
@@ -1131,7 +1150,7 @@ static int tir_cse_op(SpTIROp op) {
     switch (op) {
     case SP_TIR_CONST_I64: case SP_TIR_CONST_F64: case SP_TIR_IADD: case SP_TIR_ISUB: case SP_TIR_IMUL: case SP_TIR_IDIV: case SP_TIR_IMOD:
     case SP_TIR_INEG: case SP_TIR_FADD: case SP_TIR_FSUB: case SP_TIR_FMUL: case SP_TIR_FDIV: case SP_TIR_FNEG: case SP_TIR_I2F:
-    case SP_TIR_FCALL1: case SP_TIR_FSQRT: case SP_TIR_FABS: case SP_TIR_FFLOOR: case SP_TIR_IAND: case SP_TIR_IOR: case SP_TIR_IXOR: case SP_TIR_ISHL: case SP_TIR_ISHR:
+    case SP_TIR_FCALL1: case SP_TIR_FSQRT: case SP_TIR_FABS: case SP_TIR_FFLOOR: case SP_TIR_ALEN: case SP_TIR_IAND: case SP_TIR_IOR: case SP_TIR_IXOR: case SP_TIR_ISHL: case SP_TIR_ISHR:
         return 1;
     case SP_TIR_PARAM: case SP_TIR_CONST_BOOL: case SP_TIR_PHI: case SP_TIR_ICMP_EQ: case SP_TIR_ICMP_NE: case SP_TIR_ICMP_LT:
     case SP_TIR_ICMP_LE: case SP_TIR_ICMP_GT: case SP_TIR_ICMP_GE: case SP_TIR_FCMP_EQ: case SP_TIR_FCMP_NE: case SP_TIR_FCMP_LT:
@@ -1374,7 +1393,7 @@ int sp_tir_dump(const SpTraceIR *ir, FILE *out) {
         case SP_TIR_FCMP_GT: case SP_TIR_FCMP_GE:
             if (fprintf(out, " v%" PRIu32 ", v%" PRIu32, in->a, in->b) < 0) return 0;
             break;
-        case SP_TIR_INEG: case SP_TIR_FNEG: case SP_TIR_I2F: case SP_TIR_FCALL1: case SP_TIR_FSQRT: case SP_TIR_FABS: case SP_TIR_FFLOOR: case SP_TIR_RETURN:
+        case SP_TIR_INEG: case SP_TIR_FNEG: case SP_TIR_I2F: case SP_TIR_FCALL1: case SP_TIR_FSQRT: case SP_TIR_FABS: case SP_TIR_FFLOOR: case SP_TIR_ALEN: case SP_TIR_RETURN:
             if (fprintf(out, " v%" PRIu32, in->a) < 0) return 0;
             break;
         case SP_TIR_ALOAD:

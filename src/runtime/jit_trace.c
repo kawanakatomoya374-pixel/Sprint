@@ -731,10 +731,32 @@ static int ta_store_tag(const SpTraceIR *ir, const SpTIRInst *in, uint8_t *tag) 
 }
 /* The stores of an iteration are performed after its last point that can still deoptimise (a deopt re-runs the iteration, which
  * would apply a store twice): first every bounds check, then every write. */
-static int ta_emit_pending_stores(const SpTraceIR *ir, const uint8_t *regs, const size_t *pending, size_t npending, TraceAsm *a) {
+/* arr.append(v) from a trace: argv[0] = the array, argv[1] = the payload (the type tag comes as an argument). Growing the array allocates but never collects. */
+static unsigned trace_arr_append(VM *vm, SpValue *argv, unsigned tag) {
+    SpValue v;
+    switch ((SpType)tag) {
+    case T_INT: v = v_int(argv[1].as.i); break;
+    case T_FLOAT: v = v_float(argv[1].as.f); break;
+    case T_BOOL: v = v_bool(argv[1].as.b != 0); break;
+    case T_ARRAY: v = v_obj(T_ARRAY, argv[1].as.o); break;
+    case T_NIL: case T_STRING: case T_TABLE: case T_FUNCTION: case T_CLASS: case T_INSTANCE: case T_MODULE:
+    case T_ITERATOR: case T_COROUTINE: case T_ERROR: case T_NATIVE: case T_CELL: case T_UNINIT:
+    default: return 0U;
+    }
+    (void)array_push(vm, (SArray *)argv[0].as.o, v);
+    return 1U;
+}
+static int ta_ccall(TraceAsm *a, uint64_t fn, uint32_t slot, uint32_t tag) {
+    TracePatch p = ta_patch();
+    p.h[0] = (int32_t)(slot * 16U);
+    p.h[1] = (int32_t)tag;
+    p.h[2] = (int32_t)(-(ptrdiff_t)offsetof(VM, ileft));
+    return ta_reg_imm(a, 10U, fn) && ta_stencil(a, ST_tr_ccall, &p);
+}
+static int ta_emit_pending_stores(const SpTraceIR *ir, const uint8_t *regs, const size_t *pending, size_t npending, uint32_t scratch, TraceAsm *a) {
     for (size_t k = 0U; k < npending; k++) {
         const SpTIRInst *st = &ir->inst[pending[k]];
-        if (st->op == SP_TIR_FSTORE) continue;
+        if (st->op == SP_TIR_FSTORE || st->imm == 1U) continue;
         if (regs[st->a] >= 16U || regs[st->b] >= 16U || !ta_ab_bounds(a, regs[st->a], regs[st->b]) || !ta_jcc(a, 0x83U, TA_DEOPT)) return 0;
     }
     for (size_t k = 0U; k < npending; k++) {
@@ -743,6 +765,12 @@ static int ta_emit_pending_stores(const SpTraceIR *ir, const uint8_t *regs, cons
         if (st->op == SP_TIR_FSTORE) {
             if (regs[st->a] >= 16U || (regs[st->aux] >= 16U && !ta_isx(regs[st->aux])) || !ta_store_tag(ir, st, &tag) ||
                 !ta_field_store(a, regs[st->aux], regs[st->a], (uint32_t)st->imm, tag)) return 0;
+            continue;
+        }
+        if (st->imm == 1U) {   /* an append: the array and the payload go to two scratch slots, the helper does the rest */
+            if (!ta_store_tag(ir, st, &tag) || regs[st->a] >= 16U || (regs[st->aux] >= 16U && !ta_isx(regs[st->aux])) ||
+                !ta_local_store_reg(a, scratch, regs[st->a]) || !ta_local_store_reg(a, scratch + 1U, regs[st->aux]) ||
+                !ta_ccall(a, (uint64_t)(uintptr_t)&trace_arr_append, scratch, tag) || !ta_reg_test(a, 10U) || !ta_jcc(a, 0x84U, TA_DEOPT)) return 0;
             continue;
         }
         if ((regs[st->aux] >= 16U && !ta_isx(regs[st->aux])) || !ta_store_tag(ir, st, &tag) || !ta_note_store(a, regs[st->a], tag) ||
@@ -792,7 +820,7 @@ static int ta_f64_guard_false(TraceAsm *a, SpTIROp op, unsigned target) {
     case SP_TIR_FSUB: case SP_TIR_FMUL: case SP_TIR_FDIV:
     case SP_TIR_FNEG: case SP_TIR_ICMP_EQ: case SP_TIR_ICMP_NE:
     case SP_TIR_ICMP_LT: case SP_TIR_ICMP_LE: case SP_TIR_ICMP_GT:
-    case SP_TIR_ICMP_GE: case SP_TIR_GUARD_TRUE: case SP_TIR_ALOAD: case SP_TIR_ASTORE: case SP_TIR_FLOAD: case SP_TIR_VFIELD: case SP_TIR_SLOAD: case SP_TIR_LEAFCALL: case SP_TIR_UCELL: case SP_TIR_NEWINST: case SP_TIR_FSTORE: case SP_TIR_IAND: case SP_TIR_IOR: case SP_TIR_IXOR: case SP_TIR_ISHL: case SP_TIR_ISHR: case SP_TIR_I2F: case SP_TIR_FCALL1: case SP_TIR_FSQRT: case SP_TIR_FABS: case SP_TIR_FFLOOR: case SP_TIR_CGUARD: case SP_TIR_LOOP:
+    case SP_TIR_ICMP_GE: case SP_TIR_GUARD_TRUE: case SP_TIR_ALOAD: case SP_TIR_ASTORE: case SP_TIR_FLOAD: case SP_TIR_VFIELD: case SP_TIR_SLOAD: case SP_TIR_LEAFCALL: case SP_TIR_UCELL: case SP_TIR_NEWINST: case SP_TIR_FSTORE: case SP_TIR_IAND: case SP_TIR_IOR: case SP_TIR_IXOR: case SP_TIR_ISHL: case SP_TIR_ISHR: case SP_TIR_I2F: case SP_TIR_FCALL1: case SP_TIR_FSQRT: case SP_TIR_FABS: case SP_TIR_FFLOOR: case SP_TIR_ALEN: case SP_TIR_CGUARD: case SP_TIR_LOOP:
     case SP_TIR_RETURN:
         return 0;
     default:
@@ -852,7 +880,7 @@ static uint8_t ta_cmp_cc(SpTIROp op) {
     case SP_TIR_IMOD: case SP_TIR_INEG: case SP_TIR_FADD: case SP_TIR_FSUB: case SP_TIR_FMUL:
     case SP_TIR_FDIV: case SP_TIR_FNEG: case SP_TIR_FCMP_EQ: case SP_TIR_FCMP_NE:
     case SP_TIR_FCMP_LT: case SP_TIR_FCMP_LE: case SP_TIR_FCMP_GT: case SP_TIR_FCMP_GE:
-    case SP_TIR_GUARD_TRUE: case SP_TIR_ALOAD: case SP_TIR_ASTORE: case SP_TIR_FLOAD: case SP_TIR_VFIELD: case SP_TIR_SLOAD: case SP_TIR_LEAFCALL: case SP_TIR_UCELL: case SP_TIR_NEWINST: case SP_TIR_FSTORE: case SP_TIR_IAND: case SP_TIR_IOR: case SP_TIR_IXOR: case SP_TIR_ISHL: case SP_TIR_ISHR: case SP_TIR_I2F: case SP_TIR_FCALL1: case SP_TIR_FSQRT: case SP_TIR_FABS: case SP_TIR_FFLOOR: case SP_TIR_CGUARD: case SP_TIR_LOOP: case SP_TIR_RETURN: return 0U;
+    case SP_TIR_GUARD_TRUE: case SP_TIR_ALOAD: case SP_TIR_ASTORE: case SP_TIR_FLOAD: case SP_TIR_VFIELD: case SP_TIR_SLOAD: case SP_TIR_LEAFCALL: case SP_TIR_UCELL: case SP_TIR_NEWINST: case SP_TIR_FSTORE: case SP_TIR_IAND: case SP_TIR_IOR: case SP_TIR_IXOR: case SP_TIR_ISHL: case SP_TIR_ISHR: case SP_TIR_I2F: case SP_TIR_FCALL1: case SP_TIR_FSQRT: case SP_TIR_FABS: case SP_TIR_FFLOOR: case SP_TIR_ALEN: case SP_TIR_CGUARD: case SP_TIR_LOOP: case SP_TIR_RETURN: return 0U;
     default: return 0U;
     }
 }
@@ -869,7 +897,7 @@ static uint8_t ta_cmp_false_cc(SpTIROp op) {
     case SP_TIR_IMOD: case SP_TIR_INEG: case SP_TIR_FADD: case SP_TIR_FSUB: case SP_TIR_FMUL:
     case SP_TIR_FDIV: case SP_TIR_FNEG: case SP_TIR_FCMP_EQ: case SP_TIR_FCMP_NE:
     case SP_TIR_FCMP_LT: case SP_TIR_FCMP_LE: case SP_TIR_FCMP_GT: case SP_TIR_FCMP_GE:
-    case SP_TIR_GUARD_TRUE: case SP_TIR_ALOAD: case SP_TIR_ASTORE: case SP_TIR_FLOAD: case SP_TIR_VFIELD: case SP_TIR_SLOAD: case SP_TIR_LEAFCALL: case SP_TIR_UCELL: case SP_TIR_NEWINST: case SP_TIR_FSTORE: case SP_TIR_IAND: case SP_TIR_IOR: case SP_TIR_IXOR: case SP_TIR_ISHL: case SP_TIR_ISHR: case SP_TIR_I2F: case SP_TIR_FCALL1: case SP_TIR_FSQRT: case SP_TIR_FABS: case SP_TIR_FFLOOR: case SP_TIR_CGUARD: case SP_TIR_LOOP: case SP_TIR_RETURN: return 0U;
+    case SP_TIR_GUARD_TRUE: case SP_TIR_ALOAD: case SP_TIR_ASTORE: case SP_TIR_FLOAD: case SP_TIR_VFIELD: case SP_TIR_SLOAD: case SP_TIR_LEAFCALL: case SP_TIR_UCELL: case SP_TIR_NEWINST: case SP_TIR_FSTORE: case SP_TIR_IAND: case SP_TIR_IOR: case SP_TIR_IXOR: case SP_TIR_ISHL: case SP_TIR_ISHR: case SP_TIR_I2F: case SP_TIR_FCALL1: case SP_TIR_FSQRT: case SP_TIR_FABS: case SP_TIR_FFLOOR: case SP_TIR_ALEN: case SP_TIR_CGUARD: case SP_TIR_LOOP: case SP_TIR_RETURN: return 0U;
     default: return 0U;
     }
 }
@@ -884,7 +912,7 @@ static int ta_store_to_fresh(const SpTraceIR *ir, const SpTIRInst *st) {
 }
 static int ta_has_alloc(const SpTraceIR *ir) {
     for (size_t i = 0U; i < ir->count; i++)
-        if (ir->inst[i].op == SP_TIR_NEWINST) return 1;
+        if (ir->inst[i].op == SP_TIR_NEWINST || (ir->inst[i].op == SP_TIR_ASTORE && ir->inst[i].imm == 1U)) return 1;
     return 0;
 }
 static int ta_has_div(const SpTraceIR *ir) {
@@ -1259,7 +1287,7 @@ static int ta_emit_trace_ir(const SpTraceIR *ir, const int32_t *phi_local, unsig
             break;
         }
         case SP_TIR_LOOP:
-            if (!ta_emit_pending_stores(ir, regs, pending, npending, a)) goto done;
+            if (!ta_emit_pending_stores(ir, regs, pending, npending, snapshot_set->loop_map.slot_count + nmod, a)) goto done;
             if (!ta_emit_phi_moves(ir, regs, a)) goto done;
             {
                 TracePatch patch = ta_patch();
@@ -1294,6 +1322,9 @@ static int ta_emit_trace_ir(const SpTraceIR *ir, const int32_t *phi_local, unsig
             if (!ta_isx(dst) || !ta_isx(ra) || !ta_sse_rr(a, 0x66U, 0xefU, 1U, 1U, 0) ||
                 !ta_sse_rr(a, 0x66U, 0x2eU, (uint8_t)(ra - TA_XBASE), 1U, 0) || !ta_jcc(a, 0x82U, TA_DEOPT) ||
                 !ta_sse_rr(a, 0xf2U, 0x51U, (uint8_t)(dst - TA_XBASE), (uint8_t)(ra - TA_XBASE), 0)) goto done;
+            break;
+        case SP_TIR_ALEN:
+            if (dst >= 16U || ra >= 16U || !ta_mem_load(a, dst, ra, (uint32_t)offsetof(SArray, len))) goto done;
             break;
         case SP_TIR_FABS:   /* clear the sign bit */
             if (!ta_isx(dst) || !ta_isx(ra) || !ta_reg_imm(a, 10U, UINT64_C(0x7fffffffffffffff)) || !ta_movq_xg(a, 1U, 10U) ||
@@ -1544,7 +1575,7 @@ static uint8_t trace_ir_runtime_type(const SpTraceIR *ir, SpTIRValue value) {
         case SP_TIR_CONST_F64: return (uint8_t)T_FLOAT;
         case SP_TIR_CONST_BOOL: return (uint8_t)T_BOOL;
         case SP_TIR_IADD: case SP_TIR_ISUB: case SP_TIR_IMUL: case SP_TIR_IDIV:
-        case SP_TIR_IMOD: case SP_TIR_INEG: case SP_TIR_FFLOOR: case SP_TIR_IAND: case SP_TIR_IOR: case SP_TIR_IXOR:
+        case SP_TIR_IMOD: case SP_TIR_INEG: case SP_TIR_FFLOOR: case SP_TIR_ALEN: case SP_TIR_IAND: case SP_TIR_IOR: case SP_TIR_IXOR:
         case SP_TIR_ISHL: case SP_TIR_ISHR: return (uint8_t)T_INT;
         case SP_TIR_FADD: case SP_TIR_FSUB: case SP_TIR_FMUL: case SP_TIR_FDIV:
         case SP_TIR_FNEG: case SP_TIR_I2F: case SP_TIR_FCALL1: case SP_TIR_FSQRT: case SP_TIR_FABS: return (uint8_t)T_FLOAT;
@@ -2404,6 +2435,7 @@ static int walk_dir(const TraceStep *steps, unsigned count, unsigned *cur, const
 }
 
 /* a callee with branches that is a leaf predicate (jit_pure.c) is called natively from a trace; straight-line callees are walked */
+static _Thread_local VM *g_tvm;   /* the VM of the compilation under way (builtins are read from its link table) */
 static _Thread_local int g_leaf_mode;   /* 0: branchy callees are walked (guards on the recorded path); 1: they are called as native leaf predicates */
 static int sink_leaf_ok(Proto *cp, unsigned nargs) {
     if (!g_leaf_mode) return 0;
@@ -2554,6 +2586,11 @@ static int trace_build_ir_path_impl(Proto *p, const SpValue *locals, const SpVal
             case OP_SMALLINT:
                 po->arg = (uint16_t)rd16(wc + pc + 1U);
                 break;
+            case OP_LOAD_LINK:
+                po->arg = (uint16_t)rd16(wc + pc + 1U);
+                if (g_tvm == NULL || po->arg >= (unsigned)g_tvm->prog->nlinks || g_tvm->links[po->arg].type != T_FUNCTION ||
+                    AS_FUNC(g_tvm->links[po->arg])->nat == NULL) goto done;
+                break;
             case OP_CONST:
                 po->arg = (uint16_t)rd16(wc + pc + 1U);
                 if (po->arg >= (unsigned)wp->nconsts || (wp->consts[po->arg].type != T_INT && wp->consts[po->arg].type != T_FLOAT)) goto done;
@@ -2579,7 +2616,7 @@ static int trace_build_ir_path_impl(Proto *p, const SpValue *locals, const SpVal
                 while (k < count && !(steps[k].proto == wp && steps[k].pc == pc)) k++;
                 while (k < count && steps[k].proto == wp && steps[k].pc == pc) k++;
                 if (k >= count || steps[k].pc != 0U) {
-                    if (op == OP_INVOKE && lvl == 0U && po->arg == 1U && k < count && steps[k].proto == wp && steps[k].pc == pc + clen) {
+                    if (lvl == 0U && po->arg == 1U && k < count && steps[k].proto == wp && steps[k].pc == pc + clen) {
                         po->native = 1U;   /* math.sin(x) and the like: the builder turns it into an IR call */
                         cur = k;
                         pc += clen;
@@ -2794,6 +2831,11 @@ walked:
             if (depth >= stack_capacity) goto done;
             if (po->proto->consts[po->arg].type == T_FLOAT ? !sp_tir_emit_const_f64(ir, po->proto->consts[po->arg].as.f, &r)
                                                            : !sp_tir_emit_const_i64(ir, po->proto->consts[po->arg].as.i, &r)) goto done;
+            stack[depth++] = r;
+            break;
+        case OP_LOAD_LINK:   /* a builtin function: a placeholder value that remembers which one */
+            if (depth >= stack_capacity || !sp_tir_emit_const_i64(ir, 0, &r) || r >= (uint32_t)slot_total * 2U + (uint32_t)np * 3U + 16U) goto done;
+            fhint[r] = AS_FUNC(g_tvm->links[po->arg]);
             stack[depth++] = r;
             break;
         case OP_TRUE: case OP_FALSE:
@@ -3018,6 +3060,15 @@ walked:
             if (n > 16U || depth < n + 1U || blvl >= 3U) goto done;
             for (unsigned k = n; k > 0U; k--) args[k - 1U] = stack[--depth];
             fv = stack[--depth];
+            if (po->native) {   /* len(array) */
+                const SFunc *nf = fv < (uint32_t)slot_total * 2U + (uint32_t)np * 3U + 16U ? fhint[fv] : NULL;
+                if (nf == NULL || nf->nat == NULL || n != 1U || strcmp(nf->nat->name, "len") != 0 ||
+                    ir->value_types[args[0]] != SP_TIR_T_REF || trace_ir_runtime_type(ir, args[0]) != (uint8_t)T_ARRAY) { why = "native call: not len(array)"; goto done; }
+                if (array_stored) { why = "len after an append / array write in the same iteration"; goto done; }   /* writes are deferred to the iteration's end */
+                if (!sp_tir_emit_alen(ir, args[0], &r)) goto done;
+                stack[depth++] = r;
+                break;
+            }
             if (po->leaf) {   /* a native leaf predicate: identity guard, integer arguments, one call */
                 const SFunc *lh = fv < (uint32_t)slot_total * 2U + (uint32_t)np * 3U + 16U ? fhint[fv] : NULL;
                 if (lh == NULL || ir->value_types[fv] != SP_TIR_T_REF || trace_ir_runtime_type(ir, fv) != (uint8_t)T_FUNCTION ||
@@ -3075,6 +3126,18 @@ walked:
             arg = stack[--depth];
             recv = stack[--depth];
             md = recv < (uint32_t)slot_total * 2U + (uint32_t)np * 3U + 16U ? mhint[recv] : NULL;
+            if (md == NULL && ir->value_types[recv] == SP_TIR_T_REF && trace_ir_runtime_type(ir, recv) == (uint8_t)T_ARRAY) {   /* array.append(v) */
+                const SpValue *nmv = &po->proto->consts[po->target];
+                SpTIRValue alen;
+                if (nmv->type != T_STRING || AS_STR(*nmv)->len != 6U || memcmp(AS_STR(*nmv)->dp, "append", 6U) != 0) { why = "array method not supported"; goto done; }
+                if (i + 1U >= np || path[i + 1U].op != OP_POP) { why = "append result is used"; goto done; }
+                if (trace_vobj_find(vobj, nvobj, arg) != NULL) { why = "a sunk object escapes into an array"; goto done; }
+                if (ir->value_types[arg] == SP_TIR_T_REF && trace_ir_runtime_type(ir, arg) != (uint8_t)T_ARRAY) { why = "append of a reference"; goto done; }
+                if (!sp_tir_emit_alen(ir, recv, &alen) || !sp_tir_emit_aappend(ir, recv, alen, arg) || !sp_tir_emit_const_bool(ir, 0, &r)) goto done;
+                array_stored = 1;
+                stack[depth++] = r;   /* the call's value (nil), popped by the next instruction */
+                break;
+            }
             if (md == NULL || ir->value_types[recv] != SP_TIR_T_REF || trace_ir_runtime_type(ir, recv) != (uint8_t)T_MODULE ||
                 !table_get_sstr(md->exports, AS_STR(po->proto->consts[po->target]), &fvn) || fvn.type != T_FUNCTION || AS_FUNC(fvn)->nat == NULL) {
                 why = "native call: not a module function"; goto done;
@@ -3335,6 +3398,7 @@ static int trace_build_ir_path(Proto *p, const SpValue *locals, const SpValue *m
 
 int jit_trace_compile(VM *vm, Proto *p, uint32_t header, const TraceStep *steps, unsigned count,
                       uint32_t stack_depth, int is_side, uint8_t parent_slot) {
+    g_tvm = vm;
     struct JitProto *jp;
     TraceRegion *tr = NULL;
     TraceRegion *parent = NULL;

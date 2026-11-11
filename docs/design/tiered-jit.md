@@ -104,3 +104,11 @@ Trace の deopt 出口は「反復の先頭状態を復元してインタプリ�
 - トレースが領域より後にできた場合は `jit_region_trace_ready` が古い領域を退役させ（コードは残す）、次の訪問で作り直す。
 - 以前の「内側ループがトレースで長く回るなら外側はインタプリタ」の規則は bridge 可能なとき適用しない。
 - 外側ループ 1 回あたりのトレース入口コストは約 500 命令（`jit_trace_site` 215、`sp_jit_snapshot_restore` 160）。短い内側ループでは支配的で、次の改善点。
+
+### トレースからの C 呼び出し（libm・append・len）
+- `tr_fcall1` / `tr_ccall` スタンシル: C 関数の呼び出しの前後で、プールの caller-saved 汎用レジスタ、予算カウンタ r11、xmm2〜xmm15 を全て退避する
+  （入口の rsp は 16 の倍数 + 8）。引数は xmm0（libm）か、フレーム上端のスクラッチスロット 2 つ（append: 配列とペイロード）で渡す。
+- IR: `FCALL1`（libm の double→double、aux=1 は log の正値ガード）、`FSQRT`・`FABS`・`FFLOOR`（インライン、範囲外・負・NaN は deopt）、`ALEN`、
+  append は `ASTORE imm=1`（添字は ALEN の値）。append は他の配列書き込みと同じく反復の最後まで遅延するので、同じ反復での後続の `len` / 読み出しは拒否する。
+- ウォーカーは `INVOKE` / `CALL`（引数 1 個）でステップが関数に入らなかったとき `native` として通す。ビルダーは module 変数のヒント（`mhint`）と
+  `OP_LOAD_LINK`（ビルトイン）のプレースホルダ値で呼び先を同定する。

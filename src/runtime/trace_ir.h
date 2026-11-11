@@ -22,7 +22,7 @@ typedef enum {
     SP_TIR_FCMP_EQ, SP_TIR_FCMP_NE, SP_TIR_FCMP_LT, SP_TIR_FCMP_LE,
     SP_TIR_FCMP_GT, SP_TIR_FCMP_GE, SP_TIR_GUARD_TRUE,
     SP_TIR_ALOAD,   /* dst = a[b]: a is an array reference, b an index; imm = the element tag the trace was recorded with; a failed bound or tag check deoptimises */
-    SP_TIR_ASTORE,  /* a[b] = value aux (no result); the backend performs it after the iteration's last deopt point */
+    SP_TIR_ASTORE,  /* a[b] = value aux (no result); the backend performs it after the iteration's last deopt point; imm == 1: an append (b is the array's length, the helper grows it) */
     SP_TIR_FLOAD,   /* dst = a.slot: a is an instance reference, aux the slot, imm the field tag the trace was recorded with; a tag mismatch deoptimises */
     SP_TIR_FSTORE,  /* a.slot = value aux (no result), imm = the slot; performed after the iteration's last deopt point, like ASTORE */
     SP_TIR_NEWINST, /* dst = a fresh instance of class imm (a pointer) with its default slots; never merged or reordered */
@@ -33,6 +33,7 @@ typedef enum {
     SP_TIR_IAND, SP_TIR_IOR, SP_TIR_IXOR,   /* bitwise operations on two I64 values: no failure */
     SP_TIR_ISHL, SP_TIR_ISHR,   /* a << b, a >> b (arithmetic): a count outside 0 .. 63 deoptimises (the interpreter raises or saturates) */
     SP_TIR_FCALL1,  /* dst (F64) = the C function imm (double -> double, libm) applied to a; aux == 1: an operand <= 0 or NaN deoptimises (log) */
+    SP_TIR_ALEN,    /* dst (I64) = the length of array a (it can change when the trace appends: no hoisting) */
     SP_TIR_FABS,    /* dst (F64) = |a| */
     SP_TIR_FFLOOR,  /* dst (I64) = floor(a): an operand outside +-2^62 or NaN deoptimises */
     SP_TIR_FSQRT,   /* dst (F64) = sqrt(a); a negative or NaN operand deoptimises */
@@ -70,6 +71,8 @@ int sp_tir_emit_phi(SpTraceIR *ir, SpTIRType type, SpTIRValue entry, SpTIRValue 
 int sp_tir_set_phi_backedge(SpTraceIR *ir, SpTIRValue phi, SpTIRValue backedge);
 int sp_tir_emit_binary(SpTraceIR *ir, SpTIROp op, SpTIRValue a, SpTIRValue b, SpTIRValue *out);
 int sp_tir_emit_unary(SpTraceIR *ir, SpTIROp op, SpTIRValue a, SpTIRValue *out);
+int sp_tir_emit_alen(SpTraceIR *ir, SpTIRValue array, SpTIRValue *out);
+int sp_tir_emit_aappend(SpTraceIR *ir, SpTIRValue array, SpTIRValue len, SpTIRValue value);
 int sp_tir_emit_fcall(SpTraceIR *ir, SpTIROp op, uint64_t fn, unsigned aux, SpTIRValue a, SpTIRValue *out);
 /* flags of a guard (stored in the instruction's imm): where a failed guard leaves, and which truth value it demands */
 enum { SP_TIR_GUARD_DEOPT = 1U,   /* leave through the deopt exit: restore the iteration-start state and re-run the iteration in the interpreter (default: the loop exit) */

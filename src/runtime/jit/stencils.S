@@ -1870,6 +1870,63 @@ ST tr_fcall1
     pop %rcx
     pop %rax
 
+# call a C helper `unsigned f(VM *, SpValue *args, unsigned tag)` (address in r10): rdi = the VM (from the budget cell: H2 = -offsetof(VM, ileft)), rsi = the frame
+# scratch slot at byte offset H0 from r12, edx = H1. The result (eax) is left in r10d. All caller-saved registers of the pool, the budget r11 and xmm2..15 are saved.
+ST tr_ccall
+    push %rax
+    push %rcx
+    push %rdx
+    push %rsi
+    push %rdi
+    push %r8
+    push %r9
+    push %r11
+    sub $232,%rsp
+    movups %xmm2,8(%rsp)
+    movups %xmm3,24(%rsp)
+    movups %xmm4,40(%rsp)
+    movups %xmm5,56(%rsp)
+    movups %xmm6,72(%rsp)
+    movups %xmm7,88(%rsp)
+    movups %xmm8,104(%rsp)
+    movups %xmm9,120(%rsp)
+    movups %xmm10,136(%rsp)
+    movups %xmm11,152(%rsp)
+    movups %xmm12,168(%rsp)
+    movups %xmm13,184(%rsp)
+    movups %xmm14,200(%rsp)
+    movups %xmm15,216(%rsp)
+    .byte 0x49, 0x8d, 0xbd
+    .long H2
+    .byte 0x49, 0x8d, 0xb4, 0x24
+    .long H0
+    mov $H1,%edx
+    call *%r10
+    mov %eax,%r10d
+    movups 8(%rsp),%xmm2
+    movups 24(%rsp),%xmm3
+    movups 40(%rsp),%xmm4
+    movups 56(%rsp),%xmm5
+    movups 72(%rsp),%xmm6
+    movups 88(%rsp),%xmm7
+    movups 104(%rsp),%xmm8
+    movups 120(%rsp),%xmm9
+    movups 136(%rsp),%xmm10
+    movups 152(%rsp),%xmm11
+    movups 168(%rsp),%xmm12
+    movups 184(%rsp),%xmm13
+    movups 200(%rsp),%xmm14
+    movups 216(%rsp),%xmm15
+    add $232,%rsp
+    pop %r11
+    pop %r9
+    pop %r8
+    pop %rdi
+    pop %rsi
+    pop %rdx
+    pop %rcx
+    pop %rax
+
 ST tr_f64_binop
     .byte 0xf2, 0x0f, HB0, 0xc1
 
