@@ -2274,8 +2274,35 @@ called:
     return after_call(c, pc + (uint32_t)len);
 }
 
+/* leave the region for the interpreter at the current instruction (everything on the stack is flushed to memory first) */
+static int do_exit_here(JC *c) {
+    if (c->cur_ic != 0) FAIL("exit inside an inlined call");
+    if (!flush_regs(c) || !flush_from(c, c->d0, c->dep)) return 0;
+    int x = exit_for(c, c->cur_pc, c->dep);
+    if (x < 0) FAIL("out of memory");
+    c->tk = 1;
+    c->tt = x;
+    c->xe = -1;
+    EM(ST_jmp, 0, 0, 0, 0, 0, 0);
+    return 1;
+}
+
+/* does straight-line code from pc run into a RETURN before any branch? Such a tail leaves the loop: what is in it is cold, and is left to the
+ * interpreter rather than keeping a region from being built (a call of a builtin in an error / result path) */
+static int cold_tail(const JC *c, uint32_t pc) {
+    while (pc < c->p->code_len) {
+        int op = c->code[pc], len = op_len(op);
+        if (len <= 0) return 0;
+        if (op == OP_RETURN || op == OP_RETURN_NIL) return 1;
+        if (op == OP_JUMP || op == OP_JUMP_IF_FALSE || op == OP_JUMP_IF_TRUE || op == OP_JUMP_IF_FALSE_OR_POP || op == OP_JUMP_IF_TRUE_OR_POP ||
+            op == OP_RANGE_NEXT || op == OP_FOR_NEXT) return 0;
+        pc += (uint32_t)len;
+    }
+    return 0;
+}
+
 static int do_return(JC *c, int op) {
-    if (!c->unit) FAIL("return inside a loop region");
+    if (!c->unit) return do_exit_here(c);    /* a return inside a loop region: the interpreter executes it */
     c->xe = -1;
     if (op == OP_RETURN_NIL) {
         EM(c->pin >= 0 ? ST_ret_nil_p : ST_ret_nil, 0, 0, 0, 0, 0, 0);
@@ -3528,14 +3555,20 @@ static int walk(JC *c) {
         case OP_CONCAT: ok = do_concat(c, pc); break;
         case OP_NEW_ARRAY: ok = do_newarray(c, pc); break;
         case OP_SET_INDEX: ok = do_set_index(c, pc); break;
-        case OP_INVOKE: ok = do_invoke(c, pc, len, &skip); break;
+        case OP_INVOKE:
+            if (!c->unit && c->cur_ic == 0 && cold_tail(c, pc)) { ok = do_exit_here(c); reach = 0; break; }
+            ok = do_invoke(c, pc, len, &skip);
+            break;
         case OP_GET_MEMBER: ok = do_get_member(c, pc, len, &skip); break;
         case OP_SET_MEMBER: ok = do_set_member(c, pc); break;
         case OP_RANGE_PREP: ok = do_range_prep(c, pc); break;
         case OP_RANGE_NEXT: ok = do_range_next(c, pc, &skip); break;
         case OP_FOR_NEXT: ok = do_for_next(c, pc, &skip); break;
         case OP_LOAD_LINK: ok = do_load_link(c, pc); break;
-        case OP_CALL: ok = do_call(c, pc, len, &skip); break;
+        case OP_CALL:
+            if (!c->unit && c->cur_ic == 0 && cold_tail(c, pc)) { ok = do_exit_here(c); reach = 0; break; }
+            ok = do_call(c, pc, len, &skip);
+            break;
         case OP_RETURN: case OP_RETURN_NIL: ok = do_return(c, op); reach = 0; break;
         case OP_LOAD_UPVAL: ok = do_load_upval(c, pc); break;
         case OP_STORE_UPVAL: ok = do_store_upval(c, pc); break;
@@ -3560,6 +3593,7 @@ static int walk(JC *c) {
 /* region compilation                                                  */
 /* ------------------------------------------------------------------ */
 static int op_allowed(int op, int unit) {
+    (void)unit;
     switch (op) {
     case OP_NOP: case OP_CONST: case OP_NIL: case OP_TRUE: case OP_FALSE: case OP_SMALLINT: case OP_POP: case OP_DUP:
     case OP_DUP2: case OP_LOAD_LOCAL: case OP_STORE_LOCAL: case OP_LOAD_MODULE: case OP_STORE_MODULE: case OP_ADD:
@@ -3571,7 +3605,7 @@ static int op_allowed(int op, int unit) {
     case OP_LOAD_LINK: case OP_CALL: case OP_LOAD_UPVAL: case OP_STORE_UPVAL: case OP_GET_MEMBER: case OP_SET_MEMBER:
         return 1;
     case OP_RETURN: case OP_RETURN_NIL:
-        return unit;
+        return 1;
     default:
         return 0;
     }
