@@ -172,7 +172,7 @@ static size_t obj_size(Obj *o) {
     case T_ARRAY: return sizeof(SArray) + (size_t)((SArray *)o)->cap * sizeof(SpValue);
     case T_TABLE: {
         STable *t = (STable *)o;
-        return sizeof(STable) + (size_t)t->cap * sizeof(TEntry) + (size_t)t->idxcap * sizeof(TIdx);
+        return sizeof(STable) + (size_t)t->cap * sizeof(TEntry) + (size_t)t->idxcap * sizeof(int32_t);
     }
     case T_FUNCTION: return sizeof(SFunc) + (size_t)((SFunc *)o)->nup * sizeof(SCell *);
     case T_CELL: return sizeof(SCell);

@@ -243,14 +243,13 @@ typedef struct TEntry {
     SpValue key, val; /* key.type == T_NIL means dead entry */
 } TEntry;
 
-typedef struct { int32_t e; uint32_t tag; } TIdx;   /* a slot of the table's hash index: the entry (-1 empty, -2 deleted) and the high half of its key's hash */
 typedef struct STable {
     Obj h;
     int64_t count; /* live entries */
     int64_t nent;  /* used entries incl. dead */
     int64_t cap;   /* entries capacity */
     TEntry *ents;
-    TIdx *idx;
+    int32_t *idx;
     int64_t idxcap; /* power of two or 0 */
     uint64_t version;
 } STable;

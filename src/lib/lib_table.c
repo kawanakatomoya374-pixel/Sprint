@@ -76,7 +76,7 @@ static int t_clear(VM *vm, int argc, SpValue *argv, SpValue *ret) {
     if (need_table(vm, argv[0])) return 1;
     STable *t = AS_TABLE(argv[0]);
     for (int64_t i = 0; i < t->nent; i++) { t->ents[i].key = v_nil(); t->ents[i].val = v_nil(); }
-    for (int64_t i = 0; i < t->idxcap; i++) t->idx[i].e = -1;
+    for (int64_t i = 0; i < t->idxcap; i++) t->idx[i] = -1;
     t->nent = 0;
     t->count = 0;
     t->version++;
