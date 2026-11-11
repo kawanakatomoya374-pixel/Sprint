@@ -1787,6 +1787,23 @@ ST tr_gpr_to_xmm
 ST tr_xmm_to_gpr
     .byte 0x66, HB0, 0x0f, 0x7e, HB1
 
+# SSE2 instructions on xmm registers kept by the trace (jit_trace.c ta_sse_*): HB0 = mandatory prefix (66 / f2), HB1 = REX, HB2 = opcode,
+# HB3 = modrm. rr: register to register; loc: [r12 + H0] (a frame slot, mod 10 rm 100 + SIB 24); r10: [r10 + 8] (an array element's
+# payload); base: [reg + H0] (an instance field, mod 10)
+ST tr_sse_rr
+    .byte HB0, HB1, 0x0f, HB2, HB3
+
+ST tr_sse_loc
+    .byte HB0, HB1, 0x0f, HB2, HB3, 0x24
+    .long H0
+
+ST tr_sse_r10
+    .byte HB0, HB1, 0x0f, HB2, HB3, 0x08
+
+ST tr_sse_base
+    .byte HB0, HB1, 0x0f, HB2, HB3
+    .long H0
+
 ST tr_f64_binop
     .byte 0xf2, 0x0f, HB0, 0xc1
 

@@ -36,6 +36,7 @@ static const char *tir_op_name(SpTIROp op) {
     case SP_TIR_IMUL: return "imul";
     case SP_TIR_IDIV: return "idiv";
     case SP_TIR_IMOD: return "imod";
+    case SP_TIR_I2F: return "i2f";
     case SP_TIR_IAND: return "iand";
     case SP_TIR_IOR: return "ior";
     case SP_TIR_IXOR: return "ixor";
@@ -303,6 +304,10 @@ int sp_tir_emit_binary(SpTraceIR *ir, SpTIROp op, SpTIRValue a,
 int sp_tir_emit_unary(SpTraceIR *ir, SpTIROp op, SpTIRValue a, SpTIRValue *out) {
     SpTIRType at;
     if (!tir_value_type(ir, a, &at)) return 0;
+    if (op == SP_TIR_I2F) {
+        if (at != SP_TIR_T_I64) return 0;
+        return tir_append(ir, op, SP_TIR_T_F64, a, SP_TIR_NO_VALUE, 0U, 0U, 1, out);
+    }
     if (!((op == SP_TIR_INEG && at == SP_TIR_T_I64) ||
           (op == SP_TIR_FNEG && at == SP_TIR_T_F64))) {
         return 0;
@@ -749,6 +754,13 @@ int sp_tir_verify(const SpTraceIR *ir, char *message, size_t message_size) {
                 goto done;
             }
             break;
+        case SP_TIR_I2F:
+            if (!tir_value_defined_before(defs, in->a, i, (size_t)ir->nvalues) ||
+                types[in->a] != SP_TIR_T_I64 || expected != SP_TIR_T_F64) {
+                tir_error(message, message_size, "invalid int-to-float operand");
+                goto done;
+            }
+            break;
         case SP_TIR_ICMP_EQ:
         case SP_TIR_ICMP_NE:
         case SP_TIR_ICMP_LT:
@@ -948,7 +960,7 @@ static int tir_i64_eval_binary(SpTIROp op, int64_t a, int64_t b, int64_t *out) {
         *out = a >> b;
         return 1;
     case SP_TIR_PARAM: case SP_TIR_CONST_I64: case SP_TIR_CONST_F64:
-    case SP_TIR_CONST_BOOL: case SP_TIR_PHI: case SP_TIR_INEG:
+    case SP_TIR_CONST_BOOL: case SP_TIR_PHI: case SP_TIR_INEG: case SP_TIR_I2F:
     case SP_TIR_FADD: case SP_TIR_FSUB: case SP_TIR_FMUL: case SP_TIR_FDIV:
     case SP_TIR_FNEG: case SP_TIR_ICMP_EQ: case SP_TIR_ICMP_NE:
     case SP_TIR_ICMP_LT: case SP_TIR_ICMP_LE: case SP_TIR_ICMP_GT:
@@ -977,7 +989,7 @@ static int tir_i64_eval_compare(SpTIROp op, int64_t a, int64_t b, int *out) {
     case SP_TIR_FDIV: case SP_TIR_FNEG: case SP_TIR_FCMP_EQ:
     case SP_TIR_FCMP_NE: case SP_TIR_FCMP_LT: case SP_TIR_FCMP_LE:
     case SP_TIR_FCMP_GT: case SP_TIR_FCMP_GE: case SP_TIR_GUARD_TRUE:
-    case SP_TIR_ALOAD: case SP_TIR_ASTORE: case SP_TIR_FLOAD: case SP_TIR_VFIELD: case SP_TIR_SLOAD: case SP_TIR_LEAFCALL: case SP_TIR_UCELL: case SP_TIR_NEWINST: case SP_TIR_FSTORE: case SP_TIR_IAND: case SP_TIR_IOR: case SP_TIR_IXOR: case SP_TIR_ISHL: case SP_TIR_ISHR: case SP_TIR_CGUARD: case SP_TIR_LOOP: case SP_TIR_RETURN:
+    case SP_TIR_ALOAD: case SP_TIR_ASTORE: case SP_TIR_FLOAD: case SP_TIR_VFIELD: case SP_TIR_SLOAD: case SP_TIR_LEAFCALL: case SP_TIR_UCELL: case SP_TIR_NEWINST: case SP_TIR_FSTORE: case SP_TIR_IAND: case SP_TIR_IOR: case SP_TIR_IXOR: case SP_TIR_ISHL: case SP_TIR_ISHR: case SP_TIR_I2F: case SP_TIR_CGUARD: case SP_TIR_LOOP: case SP_TIR_RETURN:
         return 0;
     default: return 0;
     }
@@ -1281,7 +1293,7 @@ int sp_tir_dump(const SpTraceIR *ir, FILE *out) {
         case SP_TIR_FCMP_GT: case SP_TIR_FCMP_GE:
             if (fprintf(out, " v%" PRIu32 ", v%" PRIu32, in->a, in->b) < 0) return 0;
             break;
-        case SP_TIR_INEG: case SP_TIR_FNEG: case SP_TIR_RETURN:
+        case SP_TIR_INEG: case SP_TIR_FNEG: case SP_TIR_I2F: case SP_TIR_RETURN:
             if (fprintf(out, " v%" PRIu32, in->a) < 0) return 0;
             break;
         case SP_TIR_ALOAD:

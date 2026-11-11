@@ -32,6 +32,7 @@ typedef enum {
     SP_TIR_VFIELD,  /* describes a sunk object: a = the virtual PHI standing for the object, b = the PHI carrying its field at byte offset aux (imm = tag); no result */
     SP_TIR_IAND, SP_TIR_IOR, SP_TIR_IXOR,   /* bitwise operations on two I64 values: no failure */
     SP_TIR_ISHL, SP_TIR_ISHR,   /* a << b, a >> b (arithmetic): a count outside 0 .. 63 deoptimises (the interpreter raises or saturates) */
+    SP_TIR_I2F,     /* dst (F64) = the I64 value a converted to double (round to nearest even, like the interpreter) */
     SP_TIR_CGUARD,  /* deoptimise unless instance a has class imm (a pointer); aux == 1: unless reference a itself equals imm; no result */
     SP_TIR_LOOP,
     SP_TIR_RETURN

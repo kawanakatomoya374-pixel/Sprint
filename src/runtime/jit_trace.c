@@ -234,6 +234,49 @@ static int ta_resolve(TraceAsm *a) {
     return 1;
 }
 
+/* ---- f64 values live in XMM registers: regs[] holds 16 + n for xmm n (xmm0 / xmm1 are scratch, the pool is xmm2 .. xmm15) ----------- */
+#define TA_XBASE 16U
+static int ta_isx(uint8_t r) { return r >= TA_XBASE && r < 32U; }
+static int ta_sse_rr(TraceAsm *a, uint8_t prefix, uint8_t op, uint8_t reg, uint8_t rm, int w) {
+    TracePatch p = ta_patch();
+    p.b[0] = prefix;
+    p.b[1] = (uint8_t)(0x40U | (w ? 8U : 0U) | (reg >= 8U ? 4U : 0U) | (rm >= 8U ? 1U : 0U));
+    p.b[2] = op;
+    p.b[3] = (uint8_t)(0xc0U | ((reg & 7U) << 3) | (rm & 7U));
+    return ta_stencil(a, ST_tr_sse_rr, &p);
+}
+static int ta_sse_loc(TraceAsm *a, uint8_t op, uint8_t x, uint32_t local) {   /* movsd xmm, [slot payload] (op 10) / movsd [slot payload], xmm (op 11) */
+    TracePatch p = ta_patch();
+    uint64_t d = (uint64_t)local * 16U + 8U;
+    if (d > INT32_MAX) return 0;
+    p.h[0] = (int32_t)d;
+    p.b[0] = 0xf2U;
+    p.b[1] = (uint8_t)(0x41U | (x >= 8U ? 4U : 0U));
+    p.b[2] = op;
+    p.b[3] = (uint8_t)(0x84U | ((x & 7U) << 3));
+    return ta_stencil(a, ST_tr_sse_loc, &p);
+}
+static int ta_sse_r10(TraceAsm *a, uint8_t op, uint8_t x) {   /* movsd xmm, [r10 + 8] / movsd [r10 + 8], xmm */
+    TracePatch p = ta_patch();
+    p.b[0] = 0xf2U;
+    p.b[1] = (uint8_t)(0x41U | (x >= 8U ? 4U : 0U));
+    p.b[2] = op;
+    p.b[3] = (uint8_t)(0x42U | ((x & 7U) << 3));
+    return ta_stencil(a, ST_tr_sse_r10, &p);
+}
+static int ta_sse_base(TraceAsm *a, uint8_t op, uint8_t x, uint8_t base, uint32_t disp) {   /* movsd xmm, [base + disp] / movsd [base + disp], xmm */
+    TracePatch p = ta_patch();
+    p.h[0] = (int32_t)disp;
+    p.b[0] = 0xf2U;
+    p.b[1] = (uint8_t)(0x40U | (x >= 8U ? 4U : 0U) | (base >= 8U ? 1U : 0U));
+    p.b[2] = op;
+    p.b[3] = (uint8_t)(0x80U | ((x & 7U) << 3) | (base & 7U));
+    return ta_stencil(a, ST_tr_sse_base, &p);
+}
+static int ta_movapd(TraceAsm *a, uint8_t dx, uint8_t sx) { return dx == sx || ta_sse_rr(a, 0x66U, 0x28U, dx, sx, 0); }
+static int ta_movq_xg(TraceAsm *a, uint8_t x, uint8_t gpr) { return ta_sse_rr(a, 0x66U, 0x6eU, x, gpr, 1); }   /* xmm = gpr */
+static int ta_movq_gx(TraceAsm *a, uint8_t gpr, uint8_t x) { return ta_sse_rr(a, 0x66U, 0x7eU, x, gpr, 1); }   /* gpr = xmm */
+static int ta_f64_compare(TraceAsm *a, uint8_t left, uint8_t right) { return ta_sse_rr(a, 0x66U, 0x2eU, (uint8_t)(left - TA_XBASE), (uint8_t)(right - TA_XBASE), 0); }
 static int ta_local_type_guard(TraceAsm *a, uint32_t local, uint8_t expected_type) {
     TracePatch p = ta_patch();
     uint64_t d = (uint64_t)local * 16U;
@@ -245,6 +288,7 @@ static int ta_local_type_guard(TraceAsm *a, uint32_t local, uint8_t expected_typ
 }
 static int ta_local_load_reg(TraceAsm *a, uint32_t local, uint8_t dst) {
     TracePatch p = ta_patch();
+    if (ta_isx(dst)) return ta_sse_loc(a, 0x10U, (uint8_t)(dst - TA_XBASE), local);
     uint64_t d = (uint64_t)local * 16U + 8U;
     if (d > INT32_MAX) return 0;
     p.h[0] = (int32_t)d;
@@ -254,6 +298,7 @@ static int ta_local_load_reg(TraceAsm *a, uint32_t local, uint8_t dst) {
 }
 static int ta_local_store_reg(TraceAsm *a, uint32_t local, uint8_t src) {
     TracePatch p = ta_patch();
+    if (ta_isx(src)) return ta_sse_loc(a, 0x11U, (uint8_t)(src - TA_XBASE), local);
     uint64_t d = (uint64_t)local * 16U + 8U;
     if (d > INT32_MAX) return 0;
     p.h[0] = (int32_t)d;
@@ -289,6 +334,9 @@ static int ta_emit_snapshot_stores(const SpTraceIR *ir, TraceAsm *a, const SpJit
 static int ta_reg_mov(TraceAsm *a, uint8_t dst, uint8_t src) {
     TracePatch p = ta_patch();
     if (dst == src) return 1;
+    if (ta_isx(dst) && ta_isx(src)) return ta_movapd(a, (uint8_t)(dst - TA_XBASE), (uint8_t)(src - TA_XBASE));
+    if (ta_isx(dst)) return ta_movq_xg(a, (uint8_t)(dst - TA_XBASE), src);
+    if (ta_isx(src)) return ta_movq_gx(a, dst, (uint8_t)(src - TA_XBASE));
     p.b[0] = (uint8_t)(0x48U | (src >= 8U ? 0x04U : 0U) | (dst >= 8U ? 0x01U : 0U));
     p.b[1] = (uint8_t)(0xc0U | ((src & 7U) << 3) | (dst & 7U));
     return ta_stencil(a, ST_tr_reg_mov, &p);
@@ -339,9 +387,12 @@ static int ta_emit_phi_moves(const SpTraceIR *ir, const uint8_t *regs, TraceAsm 
          * reads of it through the temporary before making another move. */
         size_t cycle = 0U;
         while (cycle < count && active[cycle] == 0U) cycle++;
-        if (cycle == count || !ta_reg_mov(a, 10U, dst[cycle])) return 0;
-        for (size_t j = 0U; j < count; j++)
-            if (active[j] != 0U && src[j] == dst[cycle]) src[j] = 10U;
+        {
+            const uint8_t tmp = cycle < count && ta_isx(dst[cycle]) ? (uint8_t)(TA_XBASE + 1U) : 10U;   /* xmm1 / r10 are outside the pools */
+            if (cycle == count || !ta_reg_mov(a, tmp, dst[cycle])) return 0;
+            for (size_t j = 0U; j < count; j++)
+                if (active[j] != 0U && src[j] == dst[cycle]) src[j] = tmp;
+        }
     }
     return 1;
 }
@@ -391,33 +442,6 @@ static int ta_reg_test(TraceAsm *a, uint8_t reg) {
     p.b[0] = (uint8_t)(0x48U | (reg >= 8U ? 0x05U : 0U));
     p.b[1] = (uint8_t)(0xc0U | ((reg & 7U) << 3) | (reg & 7U));
     return ta_stencil(a, ST_tr_reg_test, &p);
-}
-/* F64 payloads remain in GPRs; XMM0/XMM1 are short-lived execution temporaries. */
-static int ta_gpr_to_xmm(TraceAsm *a, uint8_t xmm, uint8_t gpr) {
-    TracePatch p = ta_patch();
-    p.b[0] = (uint8_t)(0x48U | (gpr >= 8U ? 0x01U : 0U));
-    p.b[1] = (uint8_t)(0xc0U | ((xmm & 7U) << 3) | (gpr & 7U));
-    return ta_stencil(a, ST_tr_gpr_to_xmm, &p);
-}
-static int ta_xmm_to_gpr(TraceAsm *a, uint8_t gpr, uint8_t xmm) {
-    TracePatch p = ta_patch();
-    p.b[0] = (uint8_t)(0x48U | (gpr >= 8U ? 0x01U : 0U));
-    p.b[1] = (uint8_t)(0xc0U | ((xmm & 7U) << 3) | (gpr & 7U));
-    return ta_stencil(a, ST_tr_xmm_to_gpr, &p);
-}
-static int ta_f64_binop(TraceAsm *a, uint8_t dst, uint8_t src, uint8_t opcode) {
-    TracePatch p = ta_patch();
-    p.b[0] = opcode;
-    return ta_gpr_to_xmm(a, 0U, dst) && ta_gpr_to_xmm(a, 1U, src) &&
-           ta_stencil(a, ST_tr_f64_binop, &p) && ta_xmm_to_gpr(a, dst, 0U);
-}
-static int ta_f64_neg(TraceAsm *a, uint8_t dst) {
-    return ta_reg_imm(a, 10U, UINT64_C(0x8000000000000000)) && ta_reg_binop(a, dst, 10U, 0x31U);
-}
-static int ta_f64_compare(TraceAsm *a, uint8_t left, uint8_t right) {
-    TracePatch p = ta_patch();
-    return ta_gpr_to_xmm(a, 0U, left) && ta_gpr_to_xmm(a, 1U, right) &&
-           ta_stencil(a, ST_tr_f64_cmp, &p);
 }
 static int ta_fdiv_zero_guard(TraceAsm *a) {
     TracePatch p = ta_patch();
@@ -565,6 +589,7 @@ static int ta_ab_tag(TraceAsm *a, uint8_t tag) {
 }
 static int ta_ab_load(TraceAsm *a, uint8_t dst) {
     TracePatch p = ta_patch();
+    if (ta_isx(dst)) return ta_sse_r10(a, 0x10U, (uint8_t)(dst - TA_XBASE));
     p.b[0] = (uint8_t)(0x49U | (dst >= 8U ? 0x04U : 0U));
     p.b[1] = (uint8_t)(0x42U | ((dst & 7U) << 3));
     return ta_stencil(a, ST_tr_ab_load, &p);
@@ -581,6 +606,7 @@ static int ta_ab_store(TraceAsm *a, uint8_t tag, uint8_t src) {
     TracePatch p = ta_patch();
     TracePatch q = ta_patch();
     p.h[0] = (int32_t)tag;
+    if (ta_isx(src)) return ta_stencil(a, ST_tr_ab_store_tag, &p) && ta_sse_r10(a, 0x11U, (uint8_t)(src - TA_XBASE));
     q.b[0] = (uint8_t)(0x49U | (src >= 8U ? 0x04U : 0U));
     q.b[1] = (uint8_t)(0x42U | ((src & 7U) << 3));
     return ta_stencil(a, ST_tr_ab_store_tag, &p) && ta_stencil(a, ST_tr_ab_store_val, &q);
@@ -597,6 +623,7 @@ static int ta_field_tagcmp(TraceAsm *a, uint8_t ra, uint32_t slot, uint8_t tag) 
 }
 static int ta_field_load(TraceAsm *a, uint8_t dst, uint8_t ra, uint32_t slot) {
     TracePatch p = ta_patch();
+    if (ta_isx(dst)) return ta_sse_base(a, 0x10U, (uint8_t)(dst - TA_XBASE), ra, slot + 8U);
     p.h[0] = (int32_t)(slot + 8U);
     p.b[0] = ta_rex(dst, ra); p.b[1] = (uint8_t)(0x80U | ((dst & 7U) << 3) | (ra & 7U));
     return ta_stencil(a, ST_tr_mem_load, &p);
@@ -606,6 +633,7 @@ static int ta_field_store(TraceAsm *a, uint8_t src, uint8_t ra, uint32_t slot, u
     p.h[0] = (int32_t)slot; p.h[1] = (int32_t)tag;
     p.b[0] = ta_rex(0U, ra); p.b[1] = (uint8_t)(0x80U | (ra & 7U));
     q.h[0] = (int32_t)(slot + 8U);
+    if (ta_isx(src)) return ta_stencil(a, ST_tr_mem_store_tag, &p) && ta_sse_base(a, 0x11U, (uint8_t)(src - TA_XBASE), ra, slot + 8U);
     q.b[0] = ta_rex(src, ra); q.b[1] = (uint8_t)(0x80U | ((src & 7U) << 3) | (ra & 7U));
     return ta_stencil(a, ST_tr_mem_store_tag, &p) && ta_stencil(a, ST_tr_mem_store_val, &q);
 }
@@ -638,7 +666,7 @@ static int ta_materialize(const SpTraceIR *ir, const uint8_t *regs, SpTIRValue o
     for (size_t i = 0U; i < ir->count; i++) {
         const SpTIRInst *vf = &ir->inst[i];
         if (vf->op != SP_TIR_VFIELD || vf->a != object) continue;
-        if (vf->b > ir->nvalues || regs[vf->b] >= 16U || !ta_field_store(a, regs[vf->b], 10U, vf->aux, (uint8_t)vf->imm)) return 0;
+        if (vf->b > ir->nvalues || (regs[vf->b] >= 16U && !ta_isx(regs[vf->b])) || !ta_field_store(a, regs[vf->b], 10U, vf->aux, (uint8_t)vf->imm)) return 0;
     }
     return ta_local_store_reg(a, slot, 10U);
 }
@@ -713,11 +741,11 @@ static int ta_emit_pending_stores(const SpTraceIR *ir, const uint8_t *regs, cons
         const SpTIRInst *st = &ir->inst[pending[k]];
         uint8_t tag;
         if (st->op == SP_TIR_FSTORE) {
-            if (regs[st->a] >= 16U || regs[st->aux] >= 16U || !ta_store_tag(ir, st, &tag) ||
+            if (regs[st->a] >= 16U || (regs[st->aux] >= 16U && !ta_isx(regs[st->aux])) || !ta_store_tag(ir, st, &tag) ||
                 !ta_field_store(a, regs[st->aux], regs[st->a], (uint32_t)st->imm, tag)) return 0;
             continue;
         }
-        if (regs[st->aux] >= 16U || !ta_store_tag(ir, st, &tag) || !ta_note_store(a, regs[st->a], tag) ||
+        if ((regs[st->aux] >= 16U && !ta_isx(regs[st->aux])) || !ta_store_tag(ir, st, &tag) || !ta_note_store(a, regs[st->a], tag) ||
             !ta_ab_addr(a, regs[st->a], regs[st->b]) || !ta_ab_store(a, tag, regs[st->aux])) return 0;
     }
     return 1;
@@ -764,7 +792,7 @@ static int ta_f64_guard_false(TraceAsm *a, SpTIROp op, unsigned target) {
     case SP_TIR_FSUB: case SP_TIR_FMUL: case SP_TIR_FDIV:
     case SP_TIR_FNEG: case SP_TIR_ICMP_EQ: case SP_TIR_ICMP_NE:
     case SP_TIR_ICMP_LT: case SP_TIR_ICMP_LE: case SP_TIR_ICMP_GT:
-    case SP_TIR_ICMP_GE: case SP_TIR_GUARD_TRUE: case SP_TIR_ALOAD: case SP_TIR_ASTORE: case SP_TIR_FLOAD: case SP_TIR_VFIELD: case SP_TIR_SLOAD: case SP_TIR_LEAFCALL: case SP_TIR_UCELL: case SP_TIR_NEWINST: case SP_TIR_FSTORE: case SP_TIR_IAND: case SP_TIR_IOR: case SP_TIR_IXOR: case SP_TIR_ISHL: case SP_TIR_ISHR: case SP_TIR_CGUARD: case SP_TIR_LOOP:
+    case SP_TIR_ICMP_GE: case SP_TIR_GUARD_TRUE: case SP_TIR_ALOAD: case SP_TIR_ASTORE: case SP_TIR_FLOAD: case SP_TIR_VFIELD: case SP_TIR_SLOAD: case SP_TIR_LEAFCALL: case SP_TIR_UCELL: case SP_TIR_NEWINST: case SP_TIR_FSTORE: case SP_TIR_IAND: case SP_TIR_IOR: case SP_TIR_IXOR: case SP_TIR_ISHL: case SP_TIR_ISHR: case SP_TIR_I2F: case SP_TIR_CGUARD: case SP_TIR_LOOP:
     case SP_TIR_RETURN:
         return 0;
     default:
@@ -824,7 +852,7 @@ static uint8_t ta_cmp_cc(SpTIROp op) {
     case SP_TIR_IMOD: case SP_TIR_INEG: case SP_TIR_FADD: case SP_TIR_FSUB: case SP_TIR_FMUL:
     case SP_TIR_FDIV: case SP_TIR_FNEG: case SP_TIR_FCMP_EQ: case SP_TIR_FCMP_NE:
     case SP_TIR_FCMP_LT: case SP_TIR_FCMP_LE: case SP_TIR_FCMP_GT: case SP_TIR_FCMP_GE:
-    case SP_TIR_GUARD_TRUE: case SP_TIR_ALOAD: case SP_TIR_ASTORE: case SP_TIR_FLOAD: case SP_TIR_VFIELD: case SP_TIR_SLOAD: case SP_TIR_LEAFCALL: case SP_TIR_UCELL: case SP_TIR_NEWINST: case SP_TIR_FSTORE: case SP_TIR_IAND: case SP_TIR_IOR: case SP_TIR_IXOR: case SP_TIR_ISHL: case SP_TIR_ISHR: case SP_TIR_CGUARD: case SP_TIR_LOOP: case SP_TIR_RETURN: return 0U;
+    case SP_TIR_GUARD_TRUE: case SP_TIR_ALOAD: case SP_TIR_ASTORE: case SP_TIR_FLOAD: case SP_TIR_VFIELD: case SP_TIR_SLOAD: case SP_TIR_LEAFCALL: case SP_TIR_UCELL: case SP_TIR_NEWINST: case SP_TIR_FSTORE: case SP_TIR_IAND: case SP_TIR_IOR: case SP_TIR_IXOR: case SP_TIR_ISHL: case SP_TIR_ISHR: case SP_TIR_I2F: case SP_TIR_CGUARD: case SP_TIR_LOOP: case SP_TIR_RETURN: return 0U;
     default: return 0U;
     }
 }
@@ -841,7 +869,7 @@ static uint8_t ta_cmp_false_cc(SpTIROp op) {
     case SP_TIR_IMOD: case SP_TIR_INEG: case SP_TIR_FADD: case SP_TIR_FSUB: case SP_TIR_FMUL:
     case SP_TIR_FDIV: case SP_TIR_FNEG: case SP_TIR_FCMP_EQ: case SP_TIR_FCMP_NE:
     case SP_TIR_FCMP_LT: case SP_TIR_FCMP_LE: case SP_TIR_FCMP_GT: case SP_TIR_FCMP_GE:
-    case SP_TIR_GUARD_TRUE: case SP_TIR_ALOAD: case SP_TIR_ASTORE: case SP_TIR_FLOAD: case SP_TIR_VFIELD: case SP_TIR_SLOAD: case SP_TIR_LEAFCALL: case SP_TIR_UCELL: case SP_TIR_NEWINST: case SP_TIR_FSTORE: case SP_TIR_IAND: case SP_TIR_IOR: case SP_TIR_IXOR: case SP_TIR_ISHL: case SP_TIR_ISHR: case SP_TIR_CGUARD: case SP_TIR_LOOP: case SP_TIR_RETURN: return 0U;
+    case SP_TIR_GUARD_TRUE: case SP_TIR_ALOAD: case SP_TIR_ASTORE: case SP_TIR_FLOAD: case SP_TIR_VFIELD: case SP_TIR_SLOAD: case SP_TIR_LEAFCALL: case SP_TIR_UCELL: case SP_TIR_NEWINST: case SP_TIR_FSTORE: case SP_TIR_IAND: case SP_TIR_IOR: case SP_TIR_IXOR: case SP_TIR_ISHL: case SP_TIR_ISHR: case SP_TIR_I2F: case SP_TIR_CGUARD: case SP_TIR_LOOP: case SP_TIR_RETURN: return 0U;
     default: return 0U;
     }
 }
@@ -905,14 +933,19 @@ static SpTIRValue ta_coalesce_phi(const SpTraceIR *ir, size_t i) {
     return phi->dst;
 }
 
+static const uint8_t TA_XMM_POOL[14] = {18U, 19U, 20U, 21U, 22U, 23U, 24U, 25U, 26U, 27U, 28U, 29U, 30U, 31U};   /* xmm2 .. xmm15 */
 static int ta_alloc_regs(const SpTraceIR *ir, const int32_t *phi_local, uint8_t **regs_out) {
     size_t n = (size_t)ir->nvalues + 1U;
     uint8_t *regs = (uint8_t *)malloc(n);
     uint8_t *pinned = (uint8_t *)calloc(n, 1U);
     uint32_t *last = (uint32_t *)calloc(n, sizeof *last);
-    JitRegBank bank;
+    JitRegBank bank, xbank;
+    uint8_t *isf = (uint8_t *)calloc(n, 1U);   /* the value is an f64: it lives in an xmm register */
     int ok = 0;
-    if (!regs || !pinned || !last || !phi_local || !regs_out) goto done;
+    if (!regs || !pinned || !last || !isf || !phi_local || !regs_out) goto done;
+    for (size_t i = 0U; i < ir->count; i++)
+        if (ir->inst[i].dst > 0U && ir->inst[i].dst <= ir->nvalues && ir->inst[i].type == SP_TIR_T_F64) isf[ir->inst[i].dst] = 1U;
+    jit_ra_init(&xbank, TA_XMM_POOL, sizeof TA_XMM_POOL / sizeof TA_XMM_POOL[0]);
     if (ta_has_var_shift(ir)) jit_ra_init(&bank, TA_GPR_POOL_SHIFT, sizeof TA_GPR_POOL_SHIFT / sizeof TA_GPR_POOL_SHIFT[0]);
     else if (ta_has_div(ir)) jit_ra_init(&bank, TA_GPR_POOL_DIV, sizeof TA_GPR_POOL_DIV / sizeof TA_GPR_POOL_DIV[0]);
     else jit_ra_init(&bank, JIT_TRACE_GPR_POOL, sizeof JIT_TRACE_GPR_POOL / sizeof JIT_TRACE_GPR_POOL[0]);
@@ -926,7 +959,7 @@ static int ta_alloc_regs(const SpTraceIR *ir, const int32_t *phi_local, uint8_t 
             if (in->dst == 0U || in->dst > ir->nvalues || in->a == 0U || in->a > ir->nvalues ||
                 phi_local[in->dst] == -1) goto done;
             if (in->aux == 1U) {   /* a sunk object: no register of its own; its entry reference lives only while the field loads run */
-                int pa = jit_ra_alloc(&bank, (int32_t)in->a);
+                int pa = jit_ra_alloc(isf[in->a] ? &xbank : &bank, (int32_t)in->a);
                 if (pa < 0) goto done;
                 regs[in->a] = (uint8_t)pa;
                 continue;
@@ -938,7 +971,7 @@ static int ta_alloc_regs(const SpTraceIR *ir, const int32_t *phi_local, uint8_t 
                 pinned[in->a] = 1U;
                 continue;
             }
-            picked = jit_ra_alloc(&bank, (int32_t)in->dst);
+            picked = jit_ra_alloc(isf[in->dst] ? &xbank : &bank, (int32_t)in->dst);
             if (picked < 0) goto done;
             regs[in->dst] = (uint8_t)picked;
             regs[in->a] = (uint8_t)picked;
@@ -958,7 +991,7 @@ static int ta_alloc_regs(const SpTraceIR *ir, const int32_t *phi_local, uint8_t 
             const SpTIRInst *in = &ir->inst[i];
             int picked;
             if (in->op != SP_TIR_ALOAD || in->dst == 0U || in->dst > ir->nvalues) continue;
-            picked = jit_ra_alloc(&bank, (int32_t)in->dst);
+            picked = jit_ra_alloc(isf[in->dst] ? &xbank : &bank, (int32_t)in->dst);
             if (picked < 0) goto done;
             regs[in->dst] = (uint8_t)picked;
             pinned[in->dst] = 1U;
@@ -979,7 +1012,7 @@ static int ta_alloc_regs(const SpTraceIR *ir, const int32_t *phi_local, uint8_t 
                 SpTIRValue v = values[j];
                 int picked;
                 if (v == 0U || v > ir->nvalues || pinned[v] || regs[v] == TA_MEMREG || ta_is_folded(ir, v)) continue;
-                picked = jit_ra_alloc(&bank, (int32_t)v);
+                picked = jit_ra_alloc(isf[v] ? &xbank : &bank, (int32_t)v);
                 if (picked < 0) goto done;
                 regs[v] = (uint8_t)picked;
                 pinned[v] = 1U;
@@ -1019,8 +1052,9 @@ static int ta_alloc_regs(const SpTraceIR *ir, const int32_t *phi_local, uint8_t 
         for (uint32_t v = 1U; v <= ir->nvalues; v++) {
             if (!pinned[v] && regs[v] != UINT8_MAX && last[v] < (uint32_t)i) {
                 uint8_t r = regs[v];
-                if (jit_ra_owner(&bank, (int)r) == (int32_t)v) {
-                    jit_ra_release(&bank, (int)r);
+                JitRegBank *bk = ta_isx(r) ? &xbank : &bank;
+                if (jit_ra_owner(bk, (int)r) == (int32_t)v) {
+                    jit_ra_release(bk, (int)r);
                 }
             }
         }
@@ -1042,14 +1076,17 @@ static int ta_alloc_regs(const SpTraceIR *ir, const int32_t *phi_local, uint8_t 
         if (in->dst > ir->nvalues) goto done;
         int chosen = -1;
         if (in->a > 0U && in->a <= ir->nvalues && !pinned[in->a] &&
-            regs[in->a] != UINT8_MAX && last[in->a] == (uint32_t)i) {
+            regs[in->a] != UINT8_MAX && regs[in->a] != TA_MEMREG && last[in->a] == (uint32_t)i && isf[in->a] == isf[in->dst]) {
             chosen = regs[in->a];
         } else {
-            chosen = jit_ra_alloc(&bank, (int32_t)in->dst);
+            chosen = jit_ra_alloc(isf[in->dst] ? &xbank : &bank, (int32_t)in->dst);
         }
         if (chosen < 0) goto done;
-        if (jit_ra_owner(&bank, chosen) != (int32_t)in->dst &&
-            !jit_ra_reassign(&bank, chosen, (int32_t)in->dst)) goto done;
+        {
+            JitRegBank *bk = isf[in->dst] ? &xbank : &bank;
+            if (jit_ra_owner(bk, chosen) != (int32_t)in->dst &&
+                !jit_ra_reassign(bk, chosen, (int32_t)in->dst)) goto done;
+        }
         regs[in->dst] = (uint8_t)chosen;
     }
     *regs_out = regs;
@@ -1059,6 +1096,7 @@ done:
     free(regs);
     free(pinned);
     free(last);
+    free(isf);
     return ok;
 }
 
@@ -1070,7 +1108,7 @@ static int ta_emit_module_stores(const SpTraceIR *ir, const int32_t *phi_local, 
         if (in->op != SP_TIR_PHI || in->dst > ir->nvalues || phi_local[in->dst] < 0 || (uint32_t)phi_local[in->dst] < slot0) continue;
         if (regs[in->dst] == TA_MEMREG) continue;
         if (in->aux == 1U) { if (!ta_materialize(ir, regs, in->dst, (uint32_t)phi_local[in->dst], a)) return 0; continue; }
-        if (regs[in->dst] >= 16U || !ta_local_store_reg(a, (uint32_t)phi_local[in->dst], regs[in->dst])) return 0;
+        if ((regs[in->dst] >= 16U && !ta_isx(regs[in->dst])) || !ta_local_store_reg(a, (uint32_t)phi_local[in->dst], regs[in->dst])) return 0;
     }
     return 1;
 }
@@ -1105,7 +1143,7 @@ static int ta_emit_trace_ir(const SpTraceIR *ir, const int32_t *phi_local, unsig
         case SP_TIR_PARAM:
             if (in->a != 0U) {   /* a field of a sunk object, read once at entry: a wrong class or field type leaves with no side effect */
                 const uint8_t want = in->type == SP_TIR_T_I64 ? (uint8_t)T_INT : in->type == SP_TIR_T_F64 ? (uint8_t)T_FLOAT : (uint8_t)T_BOOL;
-                if (dst >= 16U || ra >= 16U || !ta_class_guard_to(a, ra, in->imm, TA_MISS) ||
+                if ((dst >= 16U && !ta_isx(dst)) || ra >= 16U || !ta_class_guard_to(a, ra, in->imm, TA_MISS) ||
                     !ta_field_tagcmp(a, ra, in->aux, want) || !ta_jcc(a, 0x85U, TA_MISS) ||
                     !ta_field_load(a, dst, ra, in->aux)) goto done;
                 break;
@@ -1127,6 +1165,10 @@ static int ta_emit_trace_ir(const SpTraceIR *ir, const int32_t *phi_local, unsig
             break;
         case SP_TIR_CONST_I64: case SP_TIR_CONST_F64:
             if (in->op == SP_TIR_CONST_I64 && ta_is_folded(ir, in->dst)) break;   /* used as an immediate */
+            if (ta_isx(dst)) {   /* r10 is the scratch outside the pool */
+                if (!ta_reg_imm(a, 10U, in->imm) || !ta_movq_xg(a, (uint8_t)(dst - TA_XBASE), 10U)) goto done;
+                break;
+            }
             if (dst == UINT8_MAX || !ta_reg_imm(a, dst, in->imm)) goto done;
             break;
         case SP_TIR_CONST_BOOL:
@@ -1224,41 +1266,54 @@ static int ta_emit_trace_ir(const SpTraceIR *ir, const int32_t *phi_local, unsig
                     !ta_jcc(a, 0x84U, TA_BUDGET) || (ta_has_alloc(ir) && !ta_gc_check(a)) || !ta_jmp(a, TA_LOOP)) goto done;
             }
             break;
-        case SP_TIR_FADD: case SP_TIR_FSUB: case SP_TIR_FMUL: case SP_TIR_FDIV:
-            if (dst == UINT8_MAX || ra == UINT8_MAX || rb == UINT8_MAX) goto done;
+        case SP_TIR_FADD: case SP_TIR_FSUB: case SP_TIR_FMUL: case SP_TIR_FDIV: {
+            const uint8_t opc = in->op == SP_TIR_FADD ? 0x58U : in->op == SP_TIR_FSUB ? 0x5cU : in->op == SP_TIR_FMUL ? 0x59U : 0x5eU;
+            if (!ta_isx(dst) || !ta_isx(ra) || !ta_isx(rb)) goto done;
             if (in->op == SP_TIR_FDIV) {
-                /* Division by +/-0 must deopt before the VM raises its normal error. */
-                if (!ta_gpr_to_xmm(a, 1U, rb) || !ta_fdiv_zero_guard(a)) goto done;
+                /* Division by +/-0 must deopt before the VM raises its normal error (the divisor is checked in xmm1). */
+                if (!ta_movapd(a, 1U, (uint8_t)(rb - TA_XBASE)) || !ta_fdiv_zero_guard(a)) goto done;
             }
-            if (dst != ra && !ta_reg_mov(a, dst, ra)) goto done;
-            if (!ta_f64_binop(a, dst, rb,
-                    in->op == SP_TIR_FADD ? 0x58U : in->op == SP_TIR_FSUB ? 0x5cU :
-                    in->op == SP_TIR_FMUL ? 0x59U : 0x5eU)) goto done;
+            if (dst == rb && dst != ra) {
+                if (in->op == SP_TIR_FADD || in->op == SP_TIR_FMUL) {   /* commutative */
+                    if (!ta_sse_rr(a, 0xf2U, opc, (uint8_t)(dst - TA_XBASE), (uint8_t)(ra - TA_XBASE), 0)) goto done;
+                } else if (!ta_movapd(a, 0U, (uint8_t)(ra - TA_XBASE)) ||
+                           !ta_sse_rr(a, 0xf2U, opc, 0U, (uint8_t)(rb - TA_XBASE), 0) || !ta_movapd(a, (uint8_t)(dst - TA_XBASE), 0U)) goto done;
+                break;
+            }
+            if (!ta_movapd(a, (uint8_t)(dst - TA_XBASE), (uint8_t)(ra - TA_XBASE)) ||
+                !ta_sse_rr(a, 0xf2U, opc, (uint8_t)(dst - TA_XBASE), (uint8_t)(rb - TA_XBASE), 0)) goto done;
             break;
-        case SP_TIR_FNEG:
-            if (dst == UINT8_MAX || ra == UINT8_MAX ||
-                (dst != ra && !ta_reg_mov(a, dst, ra)) || !ta_f64_neg(a, dst)) goto done;
+        }
+        case SP_TIR_FNEG:   /* flip the sign bit: xor with 0x8000... built in xmm1 */
+            if (!ta_isx(dst) || !ta_isx(ra) || !ta_reg_imm(a, 10U, UINT64_C(0x8000000000000000)) || !ta_movq_xg(a, 1U, 10U) ||
+                !ta_movapd(a, (uint8_t)(dst - TA_XBASE), (uint8_t)(ra - TA_XBASE)) ||
+                !ta_sse_rr(a, 0x66U, 0x57U, (uint8_t)(dst - TA_XBASE), 1U, 0)) goto done;
+            break;
+        case SP_TIR_I2F:   /* cvtsi2sd: the whole destination register is written by the partial move first, avoiding a false dependency */
+            if (!ta_isx(dst) || ra >= 16U || ra == UINT8_MAX ||
+                !ta_sse_rr(a, 0x66U, 0x57U, (uint8_t)(dst - TA_XBASE), (uint8_t)(dst - TA_XBASE), 0) ||
+                !ta_sse_rr(a, 0xf2U, 0x2aU, (uint8_t)(dst - TA_XBASE), ra, 1)) goto done;
             break;
         case SP_TIR_FCMP_EQ: case SP_TIR_FCMP_NE: case SP_TIR_FCMP_LT:
         case SP_TIR_FCMP_LE: case SP_TIR_FCMP_GT: case SP_TIR_FCMP_GE:
             if (!a->label_set[TA_LOOP]) {
                 if (!ta_load_budget(a) || !ta_label(a, TA_LOOP)) goto done;
             }
-            if (ra == UINT8_MAX || rb == UINT8_MAX || dst != UINT8_MAX ||
+            if (!ta_isx(ra) || !ta_isx(rb) || dst != UINT8_MAX ||
                 i + 1U >= ir->count || ir->inst[i + 1U].op != SP_TIR_GUARD_TRUE ||
                 ir->inst[i + 1U].a != in->dst || (ir->inst[i + 1U].imm & SP_TIR_GUARD_INVERT) ||
                 !ta_f64_compare(a, ra, rb) ||
                 !ta_f64_guard_false(a, in->op, (ir->inst[i + 1U].imm & SP_TIR_GUARD_DEOPT) ? TA_DEOPT : TA_EXIT)) goto done;
             break;
         case SP_TIR_ALOAD:
-            if (dst >= 16U || ra >= 16U || rb >= 16U || in->imm > 255U) goto done;
+            if ((dst >= 16U && !ta_isx(dst)) || ra >= 16U || rb >= 16U || in->imm > 255U) goto done;
             if (!(in->aux & 1U) && (!ta_ab_bounds(a, ra, rb) || !ta_jcc(a, 0x83U, TA_DEOPT))) goto done;   /* aux bit 0: range proven at entry */
             if (!ta_ab_addr(a, ra, rb)) goto done;
             if (!(in->aux & 2U) && (!ta_ab_tag(a, (uint8_t)in->imm) || !ta_jcc(a, 0x85U, TA_DEOPT))) goto done;   /* bit 1: the array's note settles the tag */
             if (!ta_ab_load(a, dst)) goto done;
             break;
         case SP_TIR_FLOAD:
-            if (dst >= 16U || ra >= 16U || in->imm > 255U) goto done;
+            if ((dst >= 16U && !ta_isx(dst)) || ra >= 16U || in->imm > 255U) goto done;
             if (!ta_field_tagcmp(a, ra, in->aux, (uint8_t)in->imm) || !ta_jcc(a, 0x85U, TA_DEOPT) ||
                 !ta_field_load(a, dst, ra, in->aux)) goto done;
             break;
@@ -1311,7 +1366,7 @@ static int ta_emit_trace_ir(const SpTraceIR *ir, const int32_t *phi_local, unsig
         case SP_TIR_ASTORE: case SP_TIR_FSTORE:
             if (ta_store_to_fresh(ir, in)) {
                 uint8_t tag;
-                if (ra >= 16U || regs[in->aux] >= 16U || !ta_store_tag(ir, in, &tag) ||
+                if (ra >= 16U || (regs[in->aux] >= 16U && !ta_isx(regs[in->aux])) || !ta_store_tag(ir, in, &tag) ||
                     !ta_field_store(a, regs[in->aux], ra, (uint32_t)in->imm, tag)) goto done;
                 break;
             }
@@ -1462,7 +1517,7 @@ static uint8_t trace_ir_runtime_type(const SpTraceIR *ir, SpTIRValue value) {
         case SP_TIR_IMOD: case SP_TIR_INEG: case SP_TIR_IAND: case SP_TIR_IOR: case SP_TIR_IXOR:
         case SP_TIR_ISHL: case SP_TIR_ISHR: return (uint8_t)T_INT;
         case SP_TIR_FADD: case SP_TIR_FSUB: case SP_TIR_FMUL: case SP_TIR_FDIV:
-        case SP_TIR_FNEG: return (uint8_t)T_FLOAT;
+        case SP_TIR_FNEG: case SP_TIR_I2F: return (uint8_t)T_FLOAT;
         case SP_TIR_ICMP_EQ: case SP_TIR_ICMP_NE: case SP_TIR_ICMP_LT:
         case SP_TIR_ICMP_LE: case SP_TIR_ICMP_GT: case SP_TIR_ICMP_GE:
         case SP_TIR_FCMP_EQ: case SP_TIR_FCMP_NE: case SP_TIR_FCMP_LT:
@@ -1843,13 +1898,24 @@ static int trace_finish_ir(SpTraceIR *ir, uint32_t slot_count, int32_t **phi_loc
         if (trace_debug_env()) fprintf(stderr, "trace-jit: optimized IR verify: %s\n", verify_message);
         return 0;
     }
-    /* The TraceJIT backend keeps f64 values in general registers and moves them through XMM0/XMM1 around every operation,
-     * which measured 2x slower than the region JIT on float loops. Until f64 values are register-allocated in XMM registers
-     * (docs/design/tiered-jit.md, phase 1) such loops are left to the region JIT. SPRINT_TRACE_JIT_F64=1 lifts the gate for
-     * backend development and the trace regression tests. */
+    /* f64 values live in XMM registers (ta_alloc_regs). A trace that allocates (NEWINST) or calls a leaf function would have to save the
+     * xmm registers around the C call, which is not done yet: such traces stay with the region JIT. SPRINT_TRACE_JIT_F64=0 keeps every
+     * f64 trace out (development). */
     {
         static int f64_gate = -1;
-        if (f64_gate < 0) { const char *e = getenv("SPRINT_TRACE_JIT_F64"); f64_gate = !(e && e[0] && e[0] != '0'); }
+        if (f64_gate < 0) { const char *e = getenv("SPRINT_TRACE_JIT_F64"); f64_gate = e != NULL && e[0] == '0'; }
+        {
+            int has_f64 = 0, has_call = 0;
+            for (size_t i = 0U; i < ir->count; i++) {
+                const SpTIRInst *g = &ir->inst[i];
+                if (g->type == SP_TIR_T_F64 && g->dst != 0U) has_f64 = 1;
+                if ((g->op == SP_TIR_NEWINST && g->aux != 1U) || g->op == SP_TIR_LEAFCALL) has_call = 1;
+            }
+            if (has_f64 && has_call) {
+                if (trace_debug_env()) fprintf(stderr, "trace-jit: f64 trace with a call left to the region JIT (xmm registers are not saved around it)\n");
+                goto fail;
+            }
+        }
         if (f64_gate) {
             for (size_t i = 0U; i < ir->count; i++) {
                 const SpTIROp o = ir->inst[i].op;
@@ -2710,7 +2776,14 @@ walked:
             if (depth < 2U) goto done;
             b = stack[--depth]; a = stack[--depth];
             ta = ir->value_types[a]; tb = ir->value_types[b];
-            if (ta != tb || (ta != SP_TIR_T_I64 && ta != SP_TIR_T_F64)) { why = "mixed or non-numeric operands"; goto done; }
+            if ((ta != SP_TIR_T_I64 && ta != SP_TIR_T_F64) || (tb != SP_TIR_T_I64 && tb != SP_TIR_T_F64)) { why = "non-numeric operands"; goto done; }
+            if (ta != tb || (po->op == OP_DIV && ta == SP_TIR_T_I64)) {
+                /* an int mixed with a float (and int / int, which is a float division) is converted to double first, as the interpreter does */
+                if (po->op != OP_ADD && po->op != OP_SUB && po->op != OP_MUL && po->op != OP_DIV) { why = "mixed int/float floor division"; goto done; }
+                if (ta == SP_TIR_T_I64 && !sp_tir_emit_unary(ir, SP_TIR_I2F, a, &a)) goto done;
+                if (tb == SP_TIR_T_I64 && !sp_tir_emit_unary(ir, SP_TIR_I2F, b, &b)) goto done;
+                ta = tb = SP_TIR_T_F64;
+            }
             isf = ta == SP_TIR_T_F64;
             if (po->op == OP_DIV ? !isf : (po->op == OP_FLOOR_DIV || po->op == OP_MOD) ? isf : 0) goto done;
             if (!sp_tir_emit_binary(ir,

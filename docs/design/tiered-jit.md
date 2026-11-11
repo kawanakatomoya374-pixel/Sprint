@@ -54,7 +54,7 @@ TraceJIT を既定オンにするために、まず「オンにしただけで�
 ### フェーズ1（バックエンド）
 1. ✅ **実装済み** `IDIV` / `IMOD`: Sprint の床除算・床剰余の意味論で生成（2 のべき乗は `sar` / `and`、それ以外は `cqo; idiv` ＋符号補正、除数 0 と `INT64_MIN / -1` は deopt 出口）。
 2. ✅ **実装済み** `GUARD_TRUE` の `imm` フラグで出口と極性を選べるようにする（`SP_TIR_GUARD_DEOPT` / `SP_TIR_GUARD_INVERT`）: 0 = ループ出口（従来）、1 = deopt（反復先頭の状態へ復元してヘッダからインタプリタで再実行）。スナップショットは既存の DEOPT 記述子を再利用。
-3. f64 を XMM レジスタに割当て（`ta_alloc_regs` に XMM プール。PHI は固定割当て、exit stencil の FROM_IR 復元も XMM 対応）。完了後に f64 ゲート（§3）を外す。
+3. ✅ **実装済み** f64 を XMM レジスタに割当て（`ta_alloc_regs` に XMM プール。PHI は固定割当て、exit stencil の FROM_IR 復元も XMM 対応）。完了後に f64 ゲート（§3）を外す。
    実装の要点: 除数が 0 / -1 なら deopt、2 のべき乗定数は `sar` / `and`（除算なし）、その他の小さな定数は逆数乗算（領域 JIT と同じ `jit_magic_of`）、変数除数は両オペランドが 32bit に収まる非負数なら 32bit `div`、それ以外は `idiv` ＋床補正。`rax`/`rdx` はプール末尾に置き、実際に使われたときだけ push/pop。実測（関数内ループ、Trace オン/オフ）: 定数 `%8`・`//4` のループ 0.39s 対 0.60〜0.68s（**1.6倍速**）、変数除数 0.75s 対 1.22s（**1.65倍速**）、`% 1000003` は 1.26s 対 1.15〜1.23s（同等）。
    併せて修正した不具合: 例外を捕捉した後、`cold.ev` が残るため版切替えの条件が偽になり続け、以降のループが一切記録されなかった。`cold` 状態を版の切替え時に丸ごと引き継ぐ方式に変え、切替えの条件自体をなくした（`RunCold`）。
 4. 検証: 既存の IR 単体テスト（`trace_ir.c` 末尾の不変条件テスト）に IDIV/IMOD/新ガードを追加、`jitfuzz*.py` に生成パターンを追加。`trace_cmp.sh` で整数・float ループが領域 JIT 以上であること。
@@ -85,3 +85,11 @@ Trace の deopt 出口は「反復の先頭状態を復元してインタプリ�
 ## 5. 作業ルール
 - 各フェーズで `make test` / `test-jit` / `test-trace-jit` / `test-san` / `test-embed` / `strict-clang` / `analyze` を全て通す。
 - 利得は `tools/bench/trace_cmp.sh`（Trace オン/オフ）と `tools/bench/cmp.sh`（LuaJIT/V8/C 比較）の数値で示す。数値が出ないものは既定にしない。
+
+### f64 の XMM 割り当て（実装メモ）
+- `regs[v]` は GPR なら 0..15、f64 は `16 + n`（xmm n、プールは xmm2〜xmm15。xmm0/xmm1 と r10 はスクラッチ）。`ta_isx()` で判定する。
+  配列・フィールド・フレームスロットとの境界は `movsd` を直接出す（`tr_sse_rr/loc/r10/base` の汎用スタンシル）。
+- IR に `I2F` を追加。ビルダーは int と float の混在 `+ - * /` と int / int を `I2F` + float 演算にする（床除算・剰余は従来どおり拒否）。
+- f64 を持つトレースが `NEWINST`（sink されないもの）や `LEAFCALL` を含むときは、C 呼び出しの前後で xmm を退避していないため従来どおり領域 JIT に任せる。
+  `SPRINT_TRACE_JIT_F64=0` で f64 トレースを全面的に無効化できる（開発用）。
+- 単純な float ループ（1 億回）: トレース 0.37s、領域 JIT 0.54s、LuaJIT 0.35s。
