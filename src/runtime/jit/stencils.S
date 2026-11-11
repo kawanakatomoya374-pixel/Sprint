@@ -1819,6 +1819,57 @@ ST tr_sse_base
     .byte HB0, HB1, 0x0f, HB2, HB3
     .long H0
 
+# call a C function of one double (xmm0) whose address is in r10; the result comes back in xmm0. Everything the C code may clobber is saved:
+# the caller-saved general registers of the pool, the budget counter r11 and xmm2 .. xmm15 (rsp is 8 mod 16 on entry, 16-byte aligned at the call)
+ST tr_fcall1
+    push %rax
+    push %rcx
+    push %rdx
+    push %rsi
+    push %rdi
+    push %r8
+    push %r9
+    push %r11
+    sub $232,%rsp
+    movups %xmm2,8(%rsp)
+    movups %xmm3,24(%rsp)
+    movups %xmm4,40(%rsp)
+    movups %xmm5,56(%rsp)
+    movups %xmm6,72(%rsp)
+    movups %xmm7,88(%rsp)
+    movups %xmm8,104(%rsp)
+    movups %xmm9,120(%rsp)
+    movups %xmm10,136(%rsp)
+    movups %xmm11,152(%rsp)
+    movups %xmm12,168(%rsp)
+    movups %xmm13,184(%rsp)
+    movups %xmm14,200(%rsp)
+    movups %xmm15,216(%rsp)
+    call *%r10
+    movups 8(%rsp),%xmm2
+    movups 24(%rsp),%xmm3
+    movups 40(%rsp),%xmm4
+    movups 56(%rsp),%xmm5
+    movups 72(%rsp),%xmm6
+    movups 88(%rsp),%xmm7
+    movups 104(%rsp),%xmm8
+    movups 120(%rsp),%xmm9
+    movups 136(%rsp),%xmm10
+    movups 152(%rsp),%xmm11
+    movups 168(%rsp),%xmm12
+    movups 184(%rsp),%xmm13
+    movups 200(%rsp),%xmm14
+    movups 216(%rsp),%xmm15
+    add $232,%rsp
+    pop %r11
+    pop %r9
+    pop %r8
+    pop %rdi
+    pop %rsi
+    pop %rdx
+    pop %rcx
+    pop %rax
+
 ST tr_f64_binop
     .byte 0xf2, 0x0f, HB0, 0xc1
 

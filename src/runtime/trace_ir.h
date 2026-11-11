@@ -32,6 +32,10 @@ typedef enum {
     SP_TIR_VFIELD,  /* describes a sunk object: a = the virtual PHI standing for the object, b = the PHI carrying its field at byte offset aux (imm = tag); no result */
     SP_TIR_IAND, SP_TIR_IOR, SP_TIR_IXOR,   /* bitwise operations on two I64 values: no failure */
     SP_TIR_ISHL, SP_TIR_ISHR,   /* a << b, a >> b (arithmetic): a count outside 0 .. 63 deoptimises (the interpreter raises or saturates) */
+    SP_TIR_FCALL1,  /* dst (F64) = the C function imm (double -> double, libm) applied to a; aux == 1: an operand <= 0 or NaN deoptimises (log) */
+    SP_TIR_FABS,    /* dst (F64) = |a| */
+    SP_TIR_FFLOOR,  /* dst (I64) = floor(a): an operand outside +-2^62 or NaN deoptimises */
+    SP_TIR_FSQRT,   /* dst (F64) = sqrt(a); a negative or NaN operand deoptimises */
     SP_TIR_I2F,     /* dst (F64) = the I64 value a converted to double (round to nearest even, like the interpreter) */
     SP_TIR_CGUARD,  /* deoptimise unless instance a has class imm (a pointer); aux == 1: unless reference a itself equals imm; no result */
     SP_TIR_LOOP,
@@ -66,6 +70,7 @@ int sp_tir_emit_phi(SpTraceIR *ir, SpTIRType type, SpTIRValue entry, SpTIRValue 
 int sp_tir_set_phi_backedge(SpTraceIR *ir, SpTIRValue phi, SpTIRValue backedge);
 int sp_tir_emit_binary(SpTraceIR *ir, SpTIROp op, SpTIRValue a, SpTIRValue b, SpTIRValue *out);
 int sp_tir_emit_unary(SpTraceIR *ir, SpTIROp op, SpTIRValue a, SpTIRValue *out);
+int sp_tir_emit_fcall(SpTraceIR *ir, SpTIROp op, uint64_t fn, unsigned aux, SpTIRValue a, SpTIRValue *out);
 /* flags of a guard (stored in the instruction's imm): where a failed guard leaves, and which truth value it demands */
 enum { SP_TIR_GUARD_DEOPT = 1U,   /* leave through the deopt exit: restore the iteration-start state and re-run the iteration in the interpreter (default: the loop exit) */
        SP_TIR_GUARD_INVERT = 2U,  /* the guard holds when the condition is FALSE (integer comparisons only in the native backend) */
