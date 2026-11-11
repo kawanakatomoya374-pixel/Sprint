@@ -3417,6 +3417,7 @@ int jit_trace_compile(VM *vm, Proto *p, uint32_t header, const TraceStep *steps,
                       is_side ? " (alternate entry signature)" : "");
         (void)sp_tir_dump(&ir, stderr);
     }
+    if (!is_side) jit_region_trace_ready(vm, p, header);   /* a region compiled earlier around this loop is rebuilt to call the trace */
     ok = 1;
 done:
     if (!ok) {
@@ -3443,6 +3444,15 @@ uint64_t jit_trace_inner_ticks(const Proto *p, uint32_t header, uint32_t here) {
     for (const TraceRegion *tr = jp->traces; tr != NULL; tr = tr->next)
         if (!tr->is_side && !tr->dead && tr->entry != NULL && tr->header > header && tr->header < here) total += tr->ticks + 1U;
     return total;
+}
+
+/* does the loop whose header is at `header` have a trace that is ready to run? (the region JIT calls it from an enclosing loop) */
+int jit_trace_has(const Proto *p, uint32_t header) {
+    const struct JitProto *jp = p->jit;
+    if (jp == NULL) return 0;
+    for (const TraceRegion *tr = jp->traces; tr != NULL; tr = tr->next)
+        if (!tr->is_side && !tr->is_variant && !tr->dead && tr->entry != NULL && tr->header == header) return 1;
+    return 0;
 }
 
 /* the chain of path variants of a loop: head (the trace that was recorded first) -> v1 -> v2 -> ... */

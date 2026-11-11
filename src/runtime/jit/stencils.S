@@ -1608,6 +1608,21 @@ ST hconcat                      # slot H0 <- HQ(vm, the H2 slots from slot H1): 
     test %eax,%eax
     jz JIT_X
 
+# A traced inner loop called from the region: HQ(vm, frame base, H0 = the loop header's pc, H1 = operand stack depth, H2 = the pc the loop leaves at)
+# runs jit_trace_site. 0: no trace ran (fall into the loop's own code); 1: the trace ran and left at the loop's exit (JIT_T, the label after
+# the loop); 2: it ran and the frame is already set for the interpreter (JIT_X, the exit whose pc is the "frame is set" mark)
+ST htrace
+    mov %rbx,%rdi
+    mov %r12,%rsi
+    mov $H0,%edx
+    mov $H1,%ecx
+    mov $H2,%r8d
+    movabs $HQ,%rax
+    call *%rax
+    cmp $1,%eax
+    je JIT_T
+    ja JIT_X
+
 ST hnat                         # slot H0 <- HQ2(vm, the H2 args from slot H1) through the helper HQ: a pure native; H3 = stack top for the collector, H4 = expected result tag (0xff: any)
     lea H3(%r12),%rax
     mov %rax,L_VM_SP(%rbx)

@@ -92,6 +92,9 @@ typedef struct JRegion {
     int state;
     int cnt;
     uint64_t dticks;         /* inner-trace iterations seen at the last deferral decision */
+    uint32_t end;            /* loop regions: pc after the back edge */
+    int nbridged;            /* traced inner loops this region calls: [k][0] = header, [k][1] = exit */
+    uint32_t bridged[4][2];
     int d0;
     int (*fn)(VM *, SpValue *, const SpValue *, Frame *);
     void *mem;
@@ -271,6 +274,8 @@ typedef struct {
     uint8_t rstep[256];                  /* per range-loop state slot: 1/2 = the step is a constant > 0 / < 0, 3 = not constant (set by RANGE_PREP); 0 = no RANGE_PREP seen in the region */
     uint8_t eg[256];                     /* range slots whose step is checked against egv[] when the region is entered */
     int32_t egv[256];
+    int nbridge;                         /* traced inner loops this region calls the trace of (see bridge_scan) */
+    struct { uint32_t hdr, exit; } bridge[4];
     int changed;
     const char *why;
     char whybuf[48];
@@ -3268,11 +3273,58 @@ static int do_cmp_value(JC *c, int cop, uint32_t pc, int inv) {
     return 1;
 }
 
+/* ---- a traced loop inside the region: at its back edge the region calls its trace --------------------------------------------------
+ * The TraceJIT keeps values in registers across the loop's iterations, which the region's slot-based code cannot. At the loop's back edge
+ * (where the interpreter calls jit_trace_site too, so the state is the one the trace expects) the stencil htrace runs the trace: when it
+ * ran to the loop's exit the region goes on at the label after the loop; when it left anywhere but the header the frame is already set and
+ * the region leaves (the "frame set" exit). When no trace ran, or it left at the header, the loop's own native code goes on. */
+static int jh_trace(VM *vm, SpValue *base, uint32_t hdr_pc, uint32_t depth, uint32_t exit_pc) {
+    Frame *fr = &vm->frames[vm->nframes - 1];
+    Proto *p = fr->fn->proto;
+    SpValue *sp = base + p->nlocals + depth;
+    vm->sp = sp;
+    if (!jit_trace_site(vm, p, p->code + hdr_pc, base, sp, NULL)) { if (vm->jit_dbg > 2) (void)fprintf(stderr, "jit: bridge @%u: trace did not run\n", hdr_pc); return 0; }
+    if (vm->jit_dbg > 2) (void)fprintf(stderr, "jit: bridge @%u: trace left at %u (want %u)\n", hdr_pc, (unsigned)(fr->pc - p->code), exit_pc);
+    if ((uint32_t)(fr->pc - p->code) == exit_pc) return 1;
+    return (uint32_t)(fr->pc - p->code) == hdr_pc ? 0 : 2;   /* at the header the frame is the start of an iteration: the loop's own code goes on from there */
+}
+
+/* the outermost loops inside [hdr, end) that have a trace and a single exit label right after their back edge */
+static int bridge_scan(const Proto *p, const uint8_t *code, uint32_t hdr, uint32_t end, uint32_t (*out)[2], int cap) {
+    int n = 0;
+    uint32_t covered = 0;
+    for (uint32_t pc = hdr; pc < end;) {
+        int op = code[pc], len = op_len(op);
+        if (len <= 0) return 0;
+        if (op == OP_JUMP) {
+            int32_t off = rd32s(code + pc + 1);
+            uint32_t tpc = pc + 5 + (uint32_t)off;
+            if (off < 0 && tpc > hdr && tpc >= covered && pc + 5 < end && jit_trace_has(p, tpc)) {
+                if (n < cap) { out[n][0] = tpc; out[n][1] = pc + 5; n++; }
+                covered = pc + 5;
+            }
+        }
+        pc += (uint32_t)len;
+    }
+    return n;
+}
+
 static int do_jump(JC *c, uint32_t pc) {
     int32_t off = rd32s(c->code + pc + 1);
     uint32_t tpc = pc + 5 + (uint32_t)off;
     if (!flush_from(c, c->d0, c->dep)) return 0;
     int inside = tpc >= c->hdr && tpc < c->end && c->lmap[tpc - c->hdr] >= 0;
+    if (off < 0 && inside && c->cur_ic == 0 && !c->unit) {
+        for (int bi = 0; bi < c->nbridge; bi++) {
+            if (c->bridge[bi].hdr != tpc || c->bridge[bi].exit <= pc || c->lmap[c->bridge[bi].exit - c->hdr] < 0) continue;
+            int bx = exit_for(c, UINT32_MAX, c->dep);
+            if (bx < 0 || !set_target(c, c->bridge[bi].exit, pc, 0)) FAIL("traced inner loop");
+            c->xe = bx;
+            EM(ST_htrace, (int32_t)tpc, c->dep, (int32_t)c->bridge[bi].exit, 0, 0, (uint64_t)(uintptr_t)jh_trace);
+            c->rax_off = -1; c->xmm_off = -1; c->skip1 = 0; c->skipx = 0;
+            break;
+        }
+    }
     if (off < 0 && inside) {
         int x = exit_for(c, pc, c->dep);
         if (x < 0) FAIL("out of memory");
@@ -3589,10 +3641,16 @@ static int compile_region(VM *vm, Proto *p, JRegion *r, SFunc *fn, SpValue *base
         if (end == 0) { c->why = "no back edge"; goto done; }
     }
     c->end = end;
+    r->end = end;
     /* an inner loop that the TraceJIT already runs stays with it: a region around both would swallow the trace */
     if (p->trace_any && !c->unit) {
+        uint32_t br[4][2];
+        const int nb = bridge_scan(p, c->code, c->hdr, end, br, 4);
         const uint64_t t = jit_trace_inner_ticks(p, c->hdr, end);
-        if (t != 0U) {
+        c->nbridge = nb;
+        for (int bi = 0; bi < nb; bi++) { c->bridge[bi].hdr = br[bi][0]; c->bridge[bi].exit = br[bi][1]; r->bridged[bi][0] = br[bi][0]; r->bridged[bi][1] = br[bi][1]; }
+        r->nbridged = nb;
+        if (t != 0U && nb == 0) {
             const uint64_t delta = t - r->dticks;
             r->dticks = t;
             /* decided per window of outer iterations: an inner loop that runs long stays a trace, the outer loop stays interpreted */
@@ -3672,7 +3730,7 @@ static int compile_region(VM *vm, Proto *p, JRegion *r, SFunc *fn, SpValue *base
             q += (uint32_t)l;
         }
     }
-    { const char *np = getenv("SPRINT_JIT_PIN"); c->pin = np && np[0] == '0' ? -1 : pick_pin(c); }
+    { const char *np = getenv("SPRINT_JIT_PIN"); c->pin = (np && np[0] == '0') || c->nbridge > 0 ? -1 : pick_pin(c); }
     for (int round = 0;; round++) {
         if (round > 16) { c->why = "no fixpoint"; goto done; }
         c->changed = 0;
@@ -3835,6 +3893,7 @@ done:
 static void jit_finish(VM *vm, int id) {
     const JRegion *x = vm->jit_cur;
     const JExit *e = &x->exits[id];
+    if (e->pc == UINT32_MAX) return;      /* a traced inner loop left the frame set for the interpreter (jh_trace) */
     Frame *f = &vm->frames[vm->nframes - 1];
     Proto *fp = f->fn->proto;
     if (vm->jit_dbg > 1) {
@@ -3868,6 +3927,24 @@ static void jit_finish(VM *vm, int id) {
     }
     f->pc = fp->code + e->pc;
     vm->sp = f->base + fp->nlocals + e->depth;
+}
+
+/* A trace for the loop at `header` is ready. A region compiled earlier around that loop did not call it (there was none): retire the
+ * region (its code stays valid for activations that are running it) so that the next visit compiles a new one that does. */
+void jit_region_trace_ready(VM *vm, Proto *p, uint32_t header) {
+    struct JitProto *jp = p->jit;
+    if (!jp) return;
+    for (int i = 0; i < jp->n; i++) {
+        JRegion *r = jp->r[i];
+        int covered = 0;
+        if (r->state != JS_OK || r->unit || r->hdr == UINT32_MAX || header <= r->hdr || header >= r->end) continue;
+        for (int k = 0; k < r->nbridged; k++) if (r->bridged[k][0] <= header && header < r->bridged[k][1]) covered = 1;
+        if (covered) continue;
+        r->hdr = UINT32_MAX;                  /* retired: no lookup finds it again, it is freed with the proto */
+        r->state = JS_FAIL;
+        if (p->jhot > 1) p->jhot = 1;
+        if (vm->jit_dbg) (void)fprintf(stderr, "jit: region #%d retired (a trace for @%u is ready)\n", i, header);
+    }
 }
 
 struct JitProto *jit_proto(Proto *p) {
