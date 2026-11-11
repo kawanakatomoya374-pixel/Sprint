@@ -847,6 +847,57 @@ IARITH add, add
 IARITH sub, sub
 IARITH mul, imul
 
+# bitwise operations on ints (no overflow possible) and shifts: a count outside 0 .. 63 leaves to the interpreter (error / saturation)
+.macro IBIT nm, insn
+    ST ib\nm\()_rr
+    mov H1+8(%r12),%rax
+    \insn H2+8(%r12),%rax
+    movq $T_INT,H0(%r12)
+    mov %rax,H0+8(%r12)
+    ST ib\nm\()_rk
+    mov H1+8(%r12),%rax
+    \insn H2+8(%r13),%rax
+    movq $T_INT,H0(%r12)
+    mov %rax,H0+8(%r12)
+    ST ib\nm\()_kr
+    mov H1+8(%r13),%rax
+    \insn H2+8(%r12),%rax
+    movq $T_INT,H0(%r12)
+    mov %rax,H0+8(%r12)
+.endm
+IBIT and, and
+IBIT or, or
+IBIT xor, xor
+
+.macro ISHIFT nm, insn
+    ST ib\nm\()_rr
+    mov H1+8(%r12),%rax
+    mov H2+8(%r12),%rcx
+    cmp $63,%rcx
+    ja JIT_X
+    \insn %cl,%rax
+    movq $T_INT,H0(%r12)
+    mov %rax,H0+8(%r12)
+    ST ib\nm\()_rk
+    mov H1+8(%r12),%rax
+    mov H2+8(%r13),%rcx
+    cmp $63,%rcx
+    ja JIT_X
+    \insn %cl,%rax
+    movq $T_INT,H0(%r12)
+    mov %rax,H0+8(%r12)
+    ST ib\nm\()_kr
+    mov H1+8(%r13),%rax
+    mov H2+8(%r12),%rcx
+    cmp $63,%rcx
+    ja JIT_X
+    \insn %cl,%rax
+    movq $T_INT,H0(%r12)
+    mov %rax,H0+8(%r12)
+.endm
+ISHIFT shl, shl
+ISHIFT sar, sar
+
 # floor division and modulo: divisor 0 and -1 leave to the interpreter (error / overflow cases)
 .macro IDIVMOD nm, ld_a, ra, ld_b, rb, fa, fb
     ST i\nm\()_\fa\fb
@@ -1063,6 +1114,11 @@ ST ineg
     mov H1+8(%r12),%rax
     neg %rax
     jo JIT_X
+    movq $T_INT,H0(%r12)
+    mov %rax,H0+8(%r12)
+ST ibnot
+    mov H1+8(%r12),%rax
+    not %rax
     movq $T_INT,H0(%r12)
     mov %rax,H0+8(%r12)
 ST fneg

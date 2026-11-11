@@ -30,6 +30,8 @@ typedef enum {
     SP_TIR_LEAFCALL,/* dst = a call of the leaf predicate imm (a function pointer) with arguments a (and b when aux == 2); a failed call deoptimises; the type is I64 or BOOL */
     SP_TIR_UCELL,   /* dst = the upvalue cell idx (aux) of closure a (a REF to a cell); a is loop-invariant */
     SP_TIR_VFIELD,  /* describes a sunk object: a = the virtual PHI standing for the object, b = the PHI carrying its field at byte offset aux (imm = tag); no result */
+    SP_TIR_IAND, SP_TIR_IOR, SP_TIR_IXOR,   /* bitwise operations on two I64 values: no failure */
+    SP_TIR_ISHL, SP_TIR_ISHR,   /* a << b, a >> b (arithmetic): a count outside 0 .. 63 deoptimises (the interpreter raises or saturates) */
     SP_TIR_CGUARD,  /* deoptimise unless instance a has class imm (a pointer); aux == 1: unless reference a itself equals imm; no result */
     SP_TIR_LOOP,
     SP_TIR_RETURN

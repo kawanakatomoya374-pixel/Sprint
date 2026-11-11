@@ -429,12 +429,22 @@ static int ta_div_guard(TraceAsm *a) {
     p.target = TA_DEOPT;
     return ta_stencil(a, ST_tr_div_guard, &p);
 }
-static int ta_sar_imm(TraceAsm *a, uint8_t reg, uint8_t count) {
+/* shift `reg` by an immediate: ext 4 = shl, 7 = sar */
+static int ta_shift_imm(TraceAsm *a, uint8_t reg, uint8_t ext, uint8_t count) {
     TracePatch p = ta_patch();
     p.b[0] = (uint8_t)(0x48U | (reg >= 8U ? 0x01U : 0U));
-    p.b[1] = (uint8_t)(0xf8U | (reg & 7U));
+    p.b[1] = (uint8_t)(0xc0U | ((unsigned)ext << 3) | (reg & 7U));
     p.b[2] = count;
     return ta_stencil(a, ST_tr_sar_imm, &p);
+}
+static int ta_sar_imm(TraceAsm *a, uint8_t reg, uint8_t count) { return ta_shift_imm(a, reg, 7U, count); }
+/* r10 <<= cl (ext 4) or r10 >>= cl arithmetic (ext 7), through the generic three-byte register stencil */
+static int ta_r10_shift_cl(TraceAsm *a, uint8_t ext) {
+    TracePatch p = ta_patch();
+    p.b[0] = 0x49U;
+    p.b[1] = 0xd3U;
+    p.b[2] = (uint8_t)(0xc0U | ((unsigned)ext << 3) | 2U);
+    return ta_stencil(a, ST_tr_reg_binop, &p);
 }
 /* the value of an integer constant defined in this trace, for strength-reducing divisions by a constant */
 static int ta_const_i64(const SpTraceIR *ir, SpTIRValue v, int64_t *out) {
@@ -468,6 +478,8 @@ static int ta_is_folded(const SpTraceIR *ir, SpTIRValue v) {
     for (size_t i = 0U; i < ir->count; i++) {
         const SpTIRInst *in = &ir->inst[i];
         const int arith = in->op == SP_TIR_IADD || in->op == SP_TIR_ISUB || in->op == SP_TIR_IMUL ||
+                          in->op == SP_TIR_IAND || in->op == SP_TIR_IOR || in->op == SP_TIR_IXOR ||
+                          in->op == SP_TIR_ISHL || in->op == SP_TIR_ISHR ||
                           (in->op >= SP_TIR_ICMP_EQ && in->op <= SP_TIR_ICMP_GE);
         if (in->op == SP_TIR_PHI) { if (in->b == v || in->a == v) return 0; continue; }
         if (in->a == v || ((in->op == SP_TIR_ASTORE || in->op == SP_TIR_FSTORE) && in->aux == v)) return 0;
@@ -752,7 +764,7 @@ static int ta_f64_guard_false(TraceAsm *a, SpTIROp op, unsigned target) {
     case SP_TIR_FSUB: case SP_TIR_FMUL: case SP_TIR_FDIV:
     case SP_TIR_FNEG: case SP_TIR_ICMP_EQ: case SP_TIR_ICMP_NE:
     case SP_TIR_ICMP_LT: case SP_TIR_ICMP_LE: case SP_TIR_ICMP_GT:
-    case SP_TIR_ICMP_GE: case SP_TIR_GUARD_TRUE: case SP_TIR_ALOAD: case SP_TIR_ASTORE: case SP_TIR_FLOAD: case SP_TIR_VFIELD: case SP_TIR_SLOAD: case SP_TIR_LEAFCALL: case SP_TIR_UCELL: case SP_TIR_NEWINST: case SP_TIR_FSTORE: case SP_TIR_CGUARD: case SP_TIR_LOOP:
+    case SP_TIR_ICMP_GE: case SP_TIR_GUARD_TRUE: case SP_TIR_ALOAD: case SP_TIR_ASTORE: case SP_TIR_FLOAD: case SP_TIR_VFIELD: case SP_TIR_SLOAD: case SP_TIR_LEAFCALL: case SP_TIR_UCELL: case SP_TIR_NEWINST: case SP_TIR_FSTORE: case SP_TIR_IAND: case SP_TIR_IOR: case SP_TIR_IXOR: case SP_TIR_ISHL: case SP_TIR_ISHR: case SP_TIR_CGUARD: case SP_TIR_LOOP:
     case SP_TIR_RETURN:
         return 0;
     default:
@@ -812,7 +824,7 @@ static uint8_t ta_cmp_cc(SpTIROp op) {
     case SP_TIR_IMOD: case SP_TIR_INEG: case SP_TIR_FADD: case SP_TIR_FSUB: case SP_TIR_FMUL:
     case SP_TIR_FDIV: case SP_TIR_FNEG: case SP_TIR_FCMP_EQ: case SP_TIR_FCMP_NE:
     case SP_TIR_FCMP_LT: case SP_TIR_FCMP_LE: case SP_TIR_FCMP_GT: case SP_TIR_FCMP_GE:
-    case SP_TIR_GUARD_TRUE: case SP_TIR_ALOAD: case SP_TIR_ASTORE: case SP_TIR_FLOAD: case SP_TIR_VFIELD: case SP_TIR_SLOAD: case SP_TIR_LEAFCALL: case SP_TIR_UCELL: case SP_TIR_NEWINST: case SP_TIR_FSTORE: case SP_TIR_CGUARD: case SP_TIR_LOOP: case SP_TIR_RETURN: return 0U;
+    case SP_TIR_GUARD_TRUE: case SP_TIR_ALOAD: case SP_TIR_ASTORE: case SP_TIR_FLOAD: case SP_TIR_VFIELD: case SP_TIR_SLOAD: case SP_TIR_LEAFCALL: case SP_TIR_UCELL: case SP_TIR_NEWINST: case SP_TIR_FSTORE: case SP_TIR_IAND: case SP_TIR_IOR: case SP_TIR_IXOR: case SP_TIR_ISHL: case SP_TIR_ISHR: case SP_TIR_CGUARD: case SP_TIR_LOOP: case SP_TIR_RETURN: return 0U;
     default: return 0U;
     }
 }
@@ -829,7 +841,7 @@ static uint8_t ta_cmp_false_cc(SpTIROp op) {
     case SP_TIR_IMOD: case SP_TIR_INEG: case SP_TIR_FADD: case SP_TIR_FSUB: case SP_TIR_FMUL:
     case SP_TIR_FDIV: case SP_TIR_FNEG: case SP_TIR_FCMP_EQ: case SP_TIR_FCMP_NE:
     case SP_TIR_FCMP_LT: case SP_TIR_FCMP_LE: case SP_TIR_FCMP_GT: case SP_TIR_FCMP_GE:
-    case SP_TIR_GUARD_TRUE: case SP_TIR_ALOAD: case SP_TIR_ASTORE: case SP_TIR_FLOAD: case SP_TIR_VFIELD: case SP_TIR_SLOAD: case SP_TIR_LEAFCALL: case SP_TIR_UCELL: case SP_TIR_NEWINST: case SP_TIR_FSTORE: case SP_TIR_CGUARD: case SP_TIR_LOOP: case SP_TIR_RETURN: return 0U;
+    case SP_TIR_GUARD_TRUE: case SP_TIR_ALOAD: case SP_TIR_ASTORE: case SP_TIR_FLOAD: case SP_TIR_VFIELD: case SP_TIR_SLOAD: case SP_TIR_LEAFCALL: case SP_TIR_UCELL: case SP_TIR_NEWINST: case SP_TIR_FSTORE: case SP_TIR_IAND: case SP_TIR_IOR: case SP_TIR_IXOR: case SP_TIR_ISHL: case SP_TIR_ISHR: case SP_TIR_CGUARD: case SP_TIR_LOOP: case SP_TIR_RETURN: return 0U;
     default: return 0U;
     }
 }
@@ -850,6 +862,19 @@ static int ta_has_alloc(const SpTraceIR *ir) {
 static int ta_has_div(const SpTraceIR *ir) {
     for (size_t i = 0U; i < ir->count; i++)
         if (ir->inst[i].op == SP_TIR_IDIV || ir->inst[i].op == SP_TIR_IMOD) return 1;
+    return 0;
+}
+/* a trace with a shift by a variable count needs rcx for the count: the pool leaves it out (rax and rdx stay last, for divisions) */
+static const uint8_t TA_GPR_POOL_SHIFT[10] = {3U, 6U, 7U, 8U, 9U, 14U, 15U, 5U, 0U, 2U};
+static int ta_has_var_shift(const SpTraceIR *ir) {
+    for (size_t i = 0U; i < ir->count; i++) {
+        const SpTIRInst *in = &ir->inst[i];
+        if (in->op != SP_TIR_ISHL && in->op != SP_TIR_ISHR) continue;
+        int is_const = 0;
+        for (size_t k = 0U; k < ir->count; k++)
+            if (ir->inst[k].dst == in->b && ir->inst[k].op == SP_TIR_CONST_I64) is_const = 1;
+        if (!is_const) return 1;
+    }
     return 0;
 }
 static const uint8_t TA_GPR_POOL_DIV[11] = {1U, 3U, 6U, 7U, 8U, 9U, 14U, 15U, 5U, 0U, 2U};
@@ -888,7 +913,8 @@ static int ta_alloc_regs(const SpTraceIR *ir, const int32_t *phi_local, uint8_t 
     JitRegBank bank;
     int ok = 0;
     if (!regs || !pinned || !last || !phi_local || !regs_out) goto done;
-    if (ta_has_div(ir)) jit_ra_init(&bank, TA_GPR_POOL_DIV, sizeof TA_GPR_POOL_DIV / sizeof TA_GPR_POOL_DIV[0]);
+    if (ta_has_var_shift(ir)) jit_ra_init(&bank, TA_GPR_POOL_SHIFT, sizeof TA_GPR_POOL_SHIFT / sizeof TA_GPR_POOL_SHIFT[0]);
+    else if (ta_has_div(ir)) jit_ra_init(&bank, TA_GPR_POOL_DIV, sizeof TA_GPR_POOL_DIV / sizeof TA_GPR_POOL_DIV[0]);
     else jit_ra_init(&bank, JIT_TRACE_GPR_POOL, sizeof JIT_TRACE_GPR_POOL / sizeof JIT_TRACE_GPR_POOL[0]);
     memset(regs, UINT8_MAX, n);
 
@@ -1292,6 +1318,34 @@ static int ta_emit_trace_ir(const SpTraceIR *ir, const int32_t *phi_local, unsig
             if (npending >= sizeof pending / sizeof pending[0]) goto done;
             pending[npending++] = i;
             break;
+        case SP_TIR_IAND: case SP_TIR_IOR: case SP_TIR_IXOR: {
+            const uint8_t opc = in->op == SP_TIR_IAND ? 0x21U : in->op == SP_TIR_IOR ? 0x09U : 0x31U;
+            const uint8_t ext = in->op == SP_TIR_IAND ? 4U : in->op == SP_TIR_IOR ? 1U : 6U;
+            if (dst == UINT8_MAX || ra == UINT8_MAX || ra == TA_MEMREG) goto done;
+            if (rb == UINT8_MAX && ta_is_folded(ir, in->b)) {
+                int64_t kb = 0;
+                if (!ta_const_i64(ir, in->b, &kb) || !ta_reg_mov(a, dst, ra) || !ta_alu_imm(a, dst, ext, (int32_t)kb)) goto done;
+                break;
+            }
+            if (rb == UINT8_MAX || rb == TA_MEMREG) goto done;
+            if (dst == rb && dst != ra) { if (!ta_reg_binop(a, dst, ra, opc)) goto done; break; }   /* commutative */
+            if (!ta_reg_mov(a, dst, ra) || !ta_reg_binop(a, dst, rb, opc)) goto done;
+            break;
+        }
+        case SP_TIR_ISHL: case SP_TIR_ISHR: {
+            const uint8_t ext = in->op == SP_TIR_ISHL ? 4U : 7U;
+            int64_t kb = 0;
+            if (dst == UINT8_MAX || ra == UINT8_MAX || ra == TA_MEMREG) goto done;
+            if (ta_const_i64(ir, in->b, &kb)) {
+                if (kb < 0 || kb > 63 || !ta_reg_mov(a, dst, ra) || !ta_shift_imm(a, dst, ext, (uint8_t)kb)) goto done;
+                break;
+            }
+            if (rb == UINT8_MAX || rb == TA_MEMREG) goto done;
+            /* a count outside 0 .. 63 deoptimises; otherwise r10 = a shifted by cl (rcx is not allocatable here) */
+            if (!ta_alu_imm(a, rb, 7U, 63) || !ta_jcc(a, 0x87U, TA_DEOPT) ||
+                !ta_reg_mov(a, 10U, ra) || !ta_reg_mov(a, 1U, rb) || !ta_r10_shift_cl(a, ext) || !ta_reg_mov(a, dst, 10U)) goto done;
+            break;
+        }
         case SP_TIR_IDIV: case SP_TIR_IMOD:
             /* floor division / modulo; a zero or -1 divisor deoptimises (the interpreter raises the error, and handles
              * INT64_MIN / -1 without the idiv trap). rax and rdx belong to the division (see ta_has_div). */
@@ -1405,7 +1459,8 @@ static uint8_t trace_ir_runtime_type(const SpTraceIR *ir, SpTIRValue value) {
         case SP_TIR_CONST_F64: return (uint8_t)T_FLOAT;
         case SP_TIR_CONST_BOOL: return (uint8_t)T_BOOL;
         case SP_TIR_IADD: case SP_TIR_ISUB: case SP_TIR_IMUL: case SP_TIR_IDIV:
-        case SP_TIR_IMOD: case SP_TIR_INEG: return (uint8_t)T_INT;
+        case SP_TIR_IMOD: case SP_TIR_INEG: case SP_TIR_IAND: case SP_TIR_IOR: case SP_TIR_IXOR:
+        case SP_TIR_ISHL: case SP_TIR_ISHR: return (uint8_t)T_INT;
         case SP_TIR_FADD: case SP_TIR_FSUB: case SP_TIR_FMUL: case SP_TIR_FDIV:
         case SP_TIR_FNEG: return (uint8_t)T_FLOAT;
         case SP_TIR_ICMP_EQ: case SP_TIR_ICMP_NE: case SP_TIR_ICMP_LT:
@@ -2450,6 +2505,7 @@ static int trace_build_ir_path_impl(Proto *p, const SpValue *locals, const SpVal
                 continue;
             case OP_NOP: case OP_POP: case OP_DUP: case OP_DUP2:
             case OP_ADD: case OP_SUB: case OP_MUL: case OP_DIV: case OP_FLOOR_DIV: case OP_MOD: case OP_NEG:
+            case OP_BAND: case OP_BOR: case OP_BXOR: case OP_BNOT: case OP_SHL: case OP_SHR:
             case OP_EQ: case OP_NE: case OP_LT: case OP_LE: case OP_GT: case OP_GE:
             case OP_GET_INDEX: case OP_SET_INDEX: case OP_TRUE: case OP_FALSE:
                 break;
@@ -2662,6 +2718,24 @@ walked:
                     po->op == OP_SUB ? (isf ? SP_TIR_FSUB : SP_TIR_ISUB) :
                     po->op == OP_MUL ? (isf ? SP_TIR_FMUL : SP_TIR_IMUL) :
                     po->op == OP_DIV ? SP_TIR_FDIV : po->op == OP_FLOOR_DIV ? SP_TIR_IDIV : SP_TIR_IMOD, a, b, &r)) goto done;
+            stack[depth++] = r;
+            break;
+        }
+        case OP_BAND: case OP_BOR: case OP_BXOR: case OP_SHL: case OP_SHR:
+            if (depth < 2U) goto done;
+            b = stack[--depth]; a = stack[--depth];
+            if (ir->value_types[a] != SP_TIR_T_I64 || ir->value_types[b] != SP_TIR_T_I64) { why = "bit operation on a non-integer"; goto done; }
+            if (!sp_tir_emit_binary(ir,
+                    po->op == OP_BAND ? SP_TIR_IAND : po->op == OP_BOR ? SP_TIR_IOR : po->op == OP_BXOR ? SP_TIR_IXOR :
+                    po->op == OP_SHL ? SP_TIR_ISHL : SP_TIR_ISHR, a, b, &r)) goto done;
+            stack[depth++] = r;
+            break;
+        case OP_BNOT: {
+            SpTIRValue ones;
+            if (depth == 0U) goto done;
+            a = stack[--depth];
+            if (ir->value_types[a] != SP_TIR_T_I64 || !sp_tir_emit_const_i64(ir, -1, &ones) ||
+                !sp_tir_emit_binary(ir, SP_TIR_IXOR, a, ones, &r)) goto done;
             stack[depth++] = r;
             break;
         }

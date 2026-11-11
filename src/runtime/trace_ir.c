@@ -36,6 +36,11 @@ static const char *tir_op_name(SpTIROp op) {
     case SP_TIR_IMUL: return "imul";
     case SP_TIR_IDIV: return "idiv";
     case SP_TIR_IMOD: return "imod";
+    case SP_TIR_IAND: return "iand";
+    case SP_TIR_IOR: return "ior";
+    case SP_TIR_IXOR: return "ixor";
+    case SP_TIR_ISHL: return "ishl";
+    case SP_TIR_ISHR: return "ishr";
     case SP_TIR_INEG: return "ineg";
     case SP_TIR_FADD: return "fadd";
     case SP_TIR_FSUB: return "fsub";
@@ -259,7 +264,8 @@ int sp_tir_set_phi_backedge(SpTraceIR *ir, SpTIRValue phi, SpTIRValue backedge) 
 
 static int tir_is_integer_binary(SpTIROp op) {
     return op == SP_TIR_IADD || op == SP_TIR_ISUB || op == SP_TIR_IMUL ||
-           op == SP_TIR_IDIV || op == SP_TIR_IMOD;
+           op == SP_TIR_IDIV || op == SP_TIR_IMOD ||
+           op == SP_TIR_IAND || op == SP_TIR_IOR || op == SP_TIR_IXOR || op == SP_TIR_ISHL || op == SP_TIR_ISHR;
 }
 
 static int tir_is_float_binary(SpTIROp op) {
@@ -708,6 +714,7 @@ int sp_tir_verify(const SpTraceIR *ir, char *message, size_t message_size) {
         case SP_TIR_IMUL:
         case SP_TIR_IDIV:
         case SP_TIR_IMOD:
+        case SP_TIR_IAND: case SP_TIR_IOR: case SP_TIR_IXOR: case SP_TIR_ISHL: case SP_TIR_ISHR:
             if (!tir_value_defined_before(defs, in->a, i, (size_t)ir->nvalues) ||
                 !tir_value_defined_before(defs, in->b, i, (size_t)ir->nvalues) ||
                 types[in->a] != SP_TIR_T_I64 || types[in->b] != SP_TIR_T_I64 ||
@@ -929,6 +936,17 @@ static int tir_i64_eval_binary(SpTIROp op, int64_t a, int64_t b, int64_t *out) {
         *out = a % b;
         if (*out != 0 && ((*out < 0) != (b < 0))) *out += b;
         return 1;
+    case SP_TIR_IAND: *out = a & b; return 1;
+    case SP_TIR_IOR: *out = a | b; return 1;
+    case SP_TIR_IXOR: *out = a ^ b; return 1;
+    case SP_TIR_ISHL:
+        if (b < 0 || b > 63) return 0;
+        *out = (int64_t)((uint64_t)a << b);
+        return 1;
+    case SP_TIR_ISHR:
+        if (b < 0 || b > 63) return 0;
+        *out = a >> b;
+        return 1;
     case SP_TIR_PARAM: case SP_TIR_CONST_I64: case SP_TIR_CONST_F64:
     case SP_TIR_CONST_BOOL: case SP_TIR_PHI: case SP_TIR_INEG:
     case SP_TIR_FADD: case SP_TIR_FSUB: case SP_TIR_FMUL: case SP_TIR_FDIV:
@@ -959,7 +977,7 @@ static int tir_i64_eval_compare(SpTIROp op, int64_t a, int64_t b, int *out) {
     case SP_TIR_FDIV: case SP_TIR_FNEG: case SP_TIR_FCMP_EQ:
     case SP_TIR_FCMP_NE: case SP_TIR_FCMP_LT: case SP_TIR_FCMP_LE:
     case SP_TIR_FCMP_GT: case SP_TIR_FCMP_GE: case SP_TIR_GUARD_TRUE:
-    case SP_TIR_ALOAD: case SP_TIR_ASTORE: case SP_TIR_FLOAD: case SP_TIR_VFIELD: case SP_TIR_SLOAD: case SP_TIR_LEAFCALL: case SP_TIR_UCELL: case SP_TIR_NEWINST: case SP_TIR_FSTORE: case SP_TIR_CGUARD: case SP_TIR_LOOP: case SP_TIR_RETURN:
+    case SP_TIR_ALOAD: case SP_TIR_ASTORE: case SP_TIR_FLOAD: case SP_TIR_VFIELD: case SP_TIR_SLOAD: case SP_TIR_LEAFCALL: case SP_TIR_UCELL: case SP_TIR_NEWINST: case SP_TIR_FSTORE: case SP_TIR_IAND: case SP_TIR_IOR: case SP_TIR_IXOR: case SP_TIR_ISHL: case SP_TIR_ISHR: case SP_TIR_CGUARD: case SP_TIR_LOOP: case SP_TIR_RETURN:
         return 0;
     default: return 0;
     }
@@ -1132,6 +1150,7 @@ int sp_tir_optimize(SpTraceIR *ir, size_t *folded_count, size_t *removed_count) 
                                 in->op == SP_TIR_SLOAD || in->op == SP_TIR_LEAFCALL ||
                                 in->op == SP_TIR_IADD || in->op == SP_TIR_ISUB || in->op == SP_TIR_IMUL || in->op == SP_TIR_INEG ||
                                 in->op == SP_TIR_IDIV || in->op == SP_TIR_IMOD || in->op == SP_TIR_FDIV ||
+                                in->op == SP_TIR_ISHL || in->op == SP_TIR_ISHR ||
                                 in->op == SP_TIR_LOOP || in->op == SP_TIR_RETURN;
                 int value_needed = in->dst != SP_TIR_NO_VALUE && live[in->dst] != 0U;
                 if (observable || value_needed) {
@@ -1254,6 +1273,7 @@ int sp_tir_dump(const SpTraceIR *ir, FILE *out) {
                         tir_type_name(in->type), in->a, in->b) < 0) return 0;
             break;
         case SP_TIR_IADD: case SP_TIR_ISUB: case SP_TIR_IMUL: case SP_TIR_IDIV: case SP_TIR_IMOD:
+        case SP_TIR_IAND: case SP_TIR_IOR: case SP_TIR_IXOR: case SP_TIR_ISHL: case SP_TIR_ISHR:
         case SP_TIR_FADD: case SP_TIR_FSUB: case SP_TIR_FMUL: case SP_TIR_FDIV:
         case SP_TIR_ICMP_EQ: case SP_TIR_ICMP_NE: case SP_TIR_ICMP_LT: case SP_TIR_ICMP_LE:
         case SP_TIR_ICMP_GT: case SP_TIR_ICMP_GE:

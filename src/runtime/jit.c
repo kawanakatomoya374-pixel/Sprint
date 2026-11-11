@@ -748,6 +748,8 @@ static const int ST_FA[4][3][3] = {F9(add), F9(sub), F9(mul), F9(div)};
 #define F9N(n) {F3N(n, ff), F3N(n, fi), F3N(n, if)}
 static const int ST_FAN[4][3][3] = {F9N(add), F9N(sub), F9N(mul), F9N(div)};
 static const int ST_IAN[3][3] = {{ST_iadd_rr_n, ST_iadd_rk_n, ST_iadd_kr_n}, {ST_isub_rr_n, ST_isub_rk_n, ST_isub_kr_n}, {ST_imul_rr_n, ST_imul_rk_n, ST_imul_kr_n}};
+static const int ST_IB[5][3] = {{ST_iband_rr, ST_iband_rk, ST_iband_kr}, {ST_ibor_rr, ST_ibor_rk, ST_ibor_kr}, {ST_ibxor_rr, ST_ibxor_rk, ST_ibxor_kr},
+                                {ST_ibshl_rr, ST_ibshl_rk, ST_ibshl_kr}, {ST_ibsar_rr, ST_ibsar_rk, ST_ibsar_kr}};
 static const int ST_IA[3][3] = {{ST_iadd_rr, ST_iadd_rk, ST_iadd_kr}, {ST_isub_rr, ST_isub_rk, ST_isub_kr}, {ST_imul_rr, ST_imul_rk, ST_imul_kr}};
 #define IB(k) {{ST_ibr_##k##_t_rr, ST_ibr_##k##_t_rk}, {ST_ibr_##k##_f_rr, ST_ibr_##k##_f_rk}}
 static const int ST_IBR[6][2][2] = {IB(lt), IB(le), IB(gt), IB(ge), IB(eq), IB(ne)};
@@ -913,6 +915,49 @@ static int pin_is_positive_unit_range(const JC *c) {
         pc += (uint32_t)len;
     }
     return writes > 0;
+}
+
+/* & | ^ << >> on two ints: the result is in rax like the integer + - *, no overflow; a shift count outside 0 .. 63 exits */
+static int do_bitop(JC *c, int op, uint32_t pc, int len, uint32_t *skip) {
+    int pb = c->dep - 1, pa = c->dep - 2;
+    if (pa < c->d0) FAIL("stack underflow");
+    if (!num_types(c, pa, pb)) FAIL("non-numeric operands");
+    Ent *a = &c->st[pa], *b = &c->st[pb];
+    if (a->ty != TY_INT || b->ty != TY_INT) FAIL("bit operation on a non-integer");
+    if (!flush_regs(c)) return 0;
+    a = &c->st[pa]; b = &c->st[pb];
+    if (a->kind == EK_K && b->kind == EK_K) {
+        if (!flush_from(c, pa, pa + 1)) return 0;
+    }
+    int dl;
+    c->pin_fuse = 1;
+    int fok = fuse_store(c, pc + (uint32_t)len, pa, &dl);
+    c->pin_fuse = 0;
+    if (!fok) return 0;
+    int32_t dst = dl >= 0 ? LOFF(c, dl) : soff(c, pa);
+    int form = form_of(a, b);
+    int32_t oa = a->kind == EK_K ? koff(a->idx) : roff(c, a, pa);
+    int32_t ob = b->kind == EK_K ? koff(b->idx) : roff(c, b, pb);
+    c->xe = gexit(c);
+    if (c->xe < 0) FAIL("out of memory");
+    if (form != 2 && (a->kind == EK_LOC || a->kind == EK_MEM) && oa == c->rax_off) c->skip1 = 1;
+    else if (form != 2 && a->kind == EK_LOC && a->idx == c->pin) {
+        EM(ST_ldrax_p, 0, 0, 0, 0, 0, 0);
+        c->skip1 = 1;
+    }
+    EM(ST_IB[op == OP_BAND ? 0 : op == OP_BOR ? 1 : op == OP_BXOR ? 2 : op == OP_SHL ? 3 : 4][form], dst, oa, ob, 0, 0, 0);
+    c->rax_off = dst;
+    if (dl >= 0 && dl == c->pin) { EM(ST_strax_p, 0, 0, 0, 0, 0, 0); c->rax_off = dst; }
+    c->dep -= 2;
+    if (dl >= 0) {
+        c->vt[dl] = (uint8_t)(0x80 | TY_INT);
+        *skip = 3;
+    } else {
+        Ent *r = push(c, EK_MEM, TY_INT, 0);
+        if (!r) return 0;
+        r->ppc = pc;
+    }
+    return 1;
 }
 
 static int do_arith(JC *c, int op, uint32_t pc, int len, uint32_t *skip) {
@@ -1870,6 +1915,7 @@ static int reg_aware(int op);
 static int do_dup(JC *c, int n, uint32_t pc);
 static int do_store_local(JC *c, uint32_t pc);
 static int do_neg(JC *c, uint32_t pc, int len, uint32_t *skip);
+static int do_bnot(JC *c, uint32_t pc, int len, uint32_t *skip);
 static int do_load_upval(JC *c, uint32_t pc);
 static int do_store_upval(JC *c, uint32_t pc);
 
@@ -2023,7 +2069,11 @@ static int inl_body(JC *c, const Proto *kp, const uint8_t *kcode, int argc, int 
         case OP_ADD: case OP_SUB: case OP_MUL: case OP_DIV: case OP_FLOOR_DIV: case OP_MOD:
             r = do_arith(c, op, pc, len, &skip);
             break;
+        case OP_BAND: case OP_BOR: case OP_BXOR: case OP_SHL: case OP_SHR:
+            r = do_bitop(c, op, pc, len, &skip);
+            break;
         case OP_NEG: r = do_neg(c, pc, len, &skip); break;
+        case OP_BNOT: r = do_bnot(c, pc, len, &skip); break;
         case OP_GET_MEMBER: r = do_get_member(c, pc, len, &skip); break;
         case OP_SET_MEMBER: r = do_set_member(c, pc); break;
         case OP_GET_INDEX: r = do_get_index(c, pc, len, &skip); break;
@@ -2979,6 +3029,33 @@ static int do_load_module(JC *c, uint32_t pc) {
     return 1;
 }
 
+static int do_bnot(JC *c, uint32_t pc, int len, uint32_t *skip) {
+    int p = c->dep - 1;
+    if (p < c->d0) FAIL("stack underflow");
+    Ent *a = &c->st[p];
+    if (a->ty == TY_UNK) {
+        int w = hint_ty(a->hint);
+        if (w != TY_INT || !need(c, p, w)) FAIL("bitwise-not operand");
+    }
+    if (a->ty != TY_INT) FAIL("bitwise-not operand");
+    if (a->kind == EK_K && !materialize(c, p)) return 0;
+    int dl;
+    if (!fuse_store(c, pc + (uint32_t)len, p, &dl)) return 0;
+    int32_t dst = dl >= 0 ? LOFF(c, dl) : soff(c, p);
+    c->xe = gexit(c);
+    if (c->xe < 0) FAIL("out of memory");
+    EM(ST_ibnot, dst, roff(c, a, p), 0, 0, 0, 0);
+    c->dep--;
+    if (dl >= 0) {
+        c->vt[dl] = (uint8_t)(0x80 | TY_INT);
+        *skip = 3;
+    } else {
+        Ent *r = push(c, EK_MEM, TY_INT, 0);
+        if (!r) return 0;
+        r->ppc = pc;
+    }
+    return 1;
+}
 static int do_neg(JC *c, uint32_t pc, int len, uint32_t *skip) {
     int p = c->dep - 1;
     if (p < c->d0) FAIL("stack underflow");
@@ -3350,7 +3427,11 @@ static int walk(JC *c) {
         case OP_ADD: case OP_SUB: case OP_MUL: case OP_DIV: case OP_FLOOR_DIV: case OP_MOD:
             ok = do_arith(c, op, pc, len, &skip);
             break;
+        case OP_BAND: case OP_BOR: case OP_BXOR: case OP_SHL: case OP_SHR:
+            ok = do_bitop(c, op, pc, len, &skip);
+            break;
         case OP_NEG: ok = do_neg(c, pc, len, &skip); break;
+        case OP_BNOT: ok = do_bnot(c, pc, len, &skip); break;
         case OP_EQ: case OP_NE: case OP_LT: case OP_LE: case OP_GT: case OP_GE: {
             uint32_t npc = pc + 1;
             int inv = 0, jop;
@@ -3430,7 +3511,8 @@ static int op_allowed(int op, int unit) {
     switch (op) {
     case OP_NOP: case OP_CONST: case OP_NIL: case OP_TRUE: case OP_FALSE: case OP_SMALLINT: case OP_POP: case OP_DUP:
     case OP_DUP2: case OP_LOAD_LOCAL: case OP_STORE_LOCAL: case OP_LOAD_MODULE: case OP_STORE_MODULE: case OP_ADD:
-    case OP_SUB: case OP_MUL: case OP_DIV: case OP_FLOOR_DIV: case OP_MOD: case OP_NEG: case OP_EQ: case OP_NE:
+    case OP_SUB: case OP_MUL: case OP_DIV: case OP_FLOOR_DIV: case OP_MOD: case OP_NEG: case OP_BNOT: case OP_EQ: case OP_NE:
+    case OP_BAND: case OP_BOR: case OP_BXOR: case OP_SHL: case OP_SHR:
     case OP_LT: case OP_LE: case OP_GT: case OP_GE: case OP_JUMP: case OP_JUMP_IF_FALSE: case OP_JUMP_IF_TRUE:
     case OP_JUMP_IF_FALSE_OR_POP: case OP_JUMP_IF_TRUE_OR_POP: case OP_NOT:
     case OP_GET_INDEX: case OP_SET_INDEX: case OP_INVOKE: case OP_RANGE_PREP: case OP_RANGE_NEXT: case OP_FOR_NEXT: case OP_CONCAT: case OP_NEW_ARRAY:

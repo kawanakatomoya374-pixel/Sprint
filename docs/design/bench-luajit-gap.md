@@ -31,3 +31,10 @@
 4. **表(table)の操作と `for k, v in t`**: hashint・knuc。
 5. 外側ループの後方ジャンプ・"no sinkable object" で内側ループの連鎖が切れる(fannkuch・heapsort)。
 6. coroutine の `yield` は未対応(coro)。
+
+## 対応状況
+
+- **ビット演算(済)**: トレース IR に IAND/IOR/IXOR/ISHL/ISHR を追加(`~` は XOR -1)。変数の shift は rcx を割り当てプールから外し、
+  count が 0..63 の外なら deopt する(インタプリタが飽和・ValueError を処理)。領域 JIT にも専用スタンシルを追加。
+  nsievebit 25.3→2.6、bitops 8.6→1.1、base64 3.9→1.7、fft 3.5→2.4。テスト: `tests/cases/jit/jit_bitops.sp`、
+  ファズ(`tools/jitfuzz_trace.py`)にビット演算を追加。

@@ -14,7 +14,14 @@ def gen(rng, fl):
             return rng.choice(ints + ["i", str(rng.choice([0, 1, 2, 3, 7, 8, 16, 100, -1, -3, 641, 1000003]))])
         if r < 0.45:   # an array read; the index is reduced to the array's length, except now and then (an IndexError)
             return "arr[%s]" % (("(%s) %% 8" % iexpr(d + 1)) if rng.random() < 0.95 else iexpr(d + 1))
-        op = rng.choice(["+", "-", "*", "//", "%", "+", "-"])
+        op = rng.choice(["+", "-", "*", "//", "%", "+", "-", "&", "|", "^", "<<", ">>", "~"])
+        if op in ("&", "|", "^"):
+            return "(%s %s %s)" % (iexpr(d + 1), op, iexpr(d + 1))
+        if op == "~":
+            return "(~%s)" % iexpr(d + 1)
+        if op in ("<<", ">>"):   # a count in 0 .. 63 almost always; now and then anything (saturation, a negative count -> ValueError)
+            cnt = rng.choice(["1", "3", "13", "31", "62", "63", "(%s & 31)" % iexpr(d + 1), "(%s %% 70)" % iexpr(d + 1)]) if rng.random() < 0.9 else iexpr(d + 1)
+            return "(%s %s %s)" % ("(%s %% 1000003)" % iexpr(d + 1) if op == "<<" else iexpr(d + 1), op, cnt)
         if op in ("//", "%"):
             if rng.random() < 0.75:
                 return "(%s %s %s)" % (iexpr(d + 1), op, rng.choice(["2", "3", "7", "8", "16", "5", "641", "1000", "-3", "-8"]))
