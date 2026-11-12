@@ -196,7 +196,7 @@ static void free_obj(VM *vm, Obj *o) {
     case T_TABLE: free(((STable *)o)->ents); free(((STable *)o)->idx); break;
     case T_FUNCTION: free(((SFunc *)o)->up); break;
     case T_CLASS: free(((SClass *)o)->dflt); break;
-    case T_COROUTINE: free(((SCoroutine *)o)->block); break;
+    case T_COROUTINE: co_block_free(((SCoroutine *)o)->block, ((SCoroutine *)o)->block_size); break;
     case T_NATIVE: {
         SNativeObj *no = (SNativeObj *)o;
         if (no->cls->release) no->cls->release(no->data);
@@ -312,7 +312,7 @@ void vm_free(VM *vm) {
         case T_TABLE: free(((STable *)o)->ents); free(((STable *)o)->idx); break;
         case T_FUNCTION: free(((SFunc *)o)->up); break;
         case T_CLASS: free(((SClass *)o)->dflt); break;
-        case T_COROUTINE: free(((SCoroutine *)o)->block); break;
+        case T_COROUTINE: co_block_free(((SCoroutine *)o)->block, ((SCoroutine *)o)->block_size); break;
         case T_NATIVE: {
             SNativeObj *no = (SNativeObj *)o;
             if (no->cls->release) no->cls->release(no->data);

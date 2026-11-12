@@ -1,5 +1,6 @@
 /* Values, objects, strings, arrays, equality and ordering. */
 #include "value_int.h"
+#include <sys/mman.h>
 
 /* ---------------------------------------------------------------- */
 /* error names                                                       */
@@ -307,6 +308,29 @@ SIterator *vm_new_iterator(VM *vm, const IterClass *cls, SpValue held, int64_t a
     return it;
 }
 
+/* A coroutine's stack block is zero-filled and mostly unused: a big one comes straight from the kernel (zero pages that cost nothing until touched)
+ * instead of being memset, so a coroutine only occupies the memory it really uses. Accounting (max_heap_bytes) still counts the whole block. */
+#define CO_MAP_MIN 32768U
+static char *co_block_alloc(VM *vm, size_t sz) {
+    char *blk;
+    if (sz < CO_MAP_MIN) {
+        blk = vm_mem(vm, NULL, 0, sz);
+        memset(blk, 0, sz);
+        return blk;
+    }
+    if (vm->bytes + sz > vm->lim.max_heap_bytes)
+        vm_fatal(vm, RS_MEMORY, "heap limit exceeded (%llu bytes)", (unsigned long long)vm->lim.max_heap_bytes);
+    void *m = mmap(NULL, sz, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (m == MAP_FAILED) vm_fatal(vm, RS_MEMORY, "out of memory");
+    vm->bytes += sz;
+    return (char *)m;
+}
+void co_block_free(char *blk, size_t sz) {
+    if (blk == NULL) return;
+    if (sz < CO_MAP_MIN) free(blk);
+    else (void)munmap(blk, sz);
+}
+
 SCoroutine *vm_new_coroutine(VM *vm, SFunc *fn, int64_t slots) {
     int64_t nf = slots / 8 > 16 ? slots / 8 : 16;
     int64_t nh = slots / 16 > 16 ? slots / 16 : 16;
@@ -316,8 +340,7 @@ SCoroutine *vm_new_coroutine(VM *vm, SFunc *fn, int64_t slots) {
                 (size_t)nd * sizeof(DeferRec) + (size_t)nv * sizeof(SpValue);
     SCoroutine *co = new_obj(vm, sizeof *co, T_COROUTINE, 1);
     co->fn = fn;
-    char *blk = vm_mem(vm, NULL, 0, sz);
-    memset(blk, 0, sz);
+    char *blk = co_block_alloc(vm, sz);
     co->block = blk;
     co->block_size = sz;
     ExecState *s = &co->st;
@@ -342,7 +365,8 @@ SCoroutine *vm_new_coroutine(VM *vm, SFunc *fn, int64_t slots) {
 
 void vm_co_release(VM *vm, SCoroutine *co) {
     if (co->block) {
-        vm_mem(vm, co->block, co->block_size, 0);
+        co_block_free(co->block, co->block_size);
+        vm->bytes -= co->block_size;
         co->block = NULL;
         co->block_size = 0;
     }

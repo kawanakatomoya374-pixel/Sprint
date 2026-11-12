@@ -783,6 +783,7 @@ static inline int array_inline(const SArray *a) { return a->h.icap != 0U && a->i
 static inline void array_note_push(SArray *a, SpValue v) { a->h.xt = (uint8_t)((a->len == 0 || a->h.xt == v.type) ? v.type : 0U); }
 static inline void array_note_store(SArray *a, SpValue v) { if (a->h.xt != v.type) a->h.xt = 0U; }
 int array_push(VM *vm, SArray *a, SpValue v);
+void co_block_free(char *blk, size_t sz);   /* a coroutine's stack block (value.c) */
 int array_reserve(VM *vm, SArray *a, int64_t need);
 SFunc *vm_new_closure_obj(VM *vm, Proto *p, int nup);
 SError *vm_new_error_obj(VM *vm);
