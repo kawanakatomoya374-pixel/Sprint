@@ -171,7 +171,7 @@ static void blacken(VM *vm, Obj *o) {
 static size_t obj_size(Obj *o) {
     switch (o->type) {
     case T_STRING: return ((SString *)o)->dp != ((SString *)o)->idata ? offsetof(SString, idata) : offsetof(SString, idata) + ((SString *)o)->len + 1;
-    case T_ARRAY: return sizeof(SArray) + (size_t)((SArray *)o)->cap * sizeof(SpValue);
+    case T_ARRAY: return sizeof(SArray) + (size_t)((SArray *)o)->h.icap * sizeof(SpValue) + (array_inline((SArray *)o) ? 0U : (size_t)((SArray *)o)->cap * sizeof(SpValue));
     case T_TABLE: {
         STable *t = (STable *)o;
         return sizeof(STable) + (size_t)t->cap * sizeof(TEntry) + (size_t)t->idxcap * sizeof(int32_t);
@@ -192,7 +192,7 @@ static size_t obj_size(Obj *o) {
 static void free_obj(VM *vm, Obj *o) {
     size_t sz = obj_size(o);
     switch (o->type) {
-    case T_ARRAY: free(((SArray *)o)->items); break;
+    case T_ARRAY: if (!array_inline((SArray *)o)) free(((SArray *)o)->items); break;
     case T_TABLE: free(((STable *)o)->ents); free(((STable *)o)->idx); break;
     case T_FUNCTION: free(((SFunc *)o)->up); break;
     case T_CLASS: free(((SClass *)o)->dflt); break;
@@ -308,7 +308,7 @@ void vm_free(VM *vm) {
     while (o) {
         Obj *n = o->next;
         switch (o->type) {
-        case T_ARRAY: free(((SArray *)o)->items); break;
+        case T_ARRAY: if (!array_inline((SArray *)o)) free(((SArray *)o)->items); break;
         case T_TABLE: free(((STable *)o)->ents); free(((STable *)o)->idx); break;
         case T_FUNCTION: free(((SFunc *)o)->up); break;
         case T_CLASS: free(((SClass *)o)->dflt); break;

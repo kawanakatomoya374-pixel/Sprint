@@ -197,7 +197,8 @@ static void keys_sort(int64_t *a, int64_t n) {
 
 /* give an array's storage back at once (the temporaries of sort would otherwise stay until the next collection) */
 static void arr_release(VM *vm, SArray *x) {
-    x->items = vm_mem(vm, x->items, (size_t)x->cap * sizeof(SpValue), 0);
+    if (array_inline(x)) x->items = NULL;   /* the elements live in the object block: nothing to give back */
+    else x->items = vm_mem(vm, x->items, (size_t)x->cap * sizeof(SpValue), 0);
     x->cap = 0;
     x->len = 0;
 }

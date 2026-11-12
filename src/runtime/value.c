@@ -131,7 +131,7 @@ void *new_obj(VM *vm, size_t size, int type, int with_id) { return new_obj_z(vm,
 static size_t obj_hdr_size(const Obj *o) {
     switch (o->type) {
     case T_STRING: return ((const SString *)o)->dp != ((const SString *)o)->idata ? offsetof(SString, idata) : offsetof(SString, idata) + ((const SString *)o)->len + 1;
-    case T_ARRAY: return sizeof(SArray);
+    case T_ARRAY: return sizeof(SArray) + (size_t)((const SArray *)o)->h.icap * sizeof(SpValue);
     case T_TABLE: return sizeof(STable);
     case T_FUNCTION: return sizeof(SFunc);
     case T_CELL: return sizeof(SCell);
@@ -218,7 +218,15 @@ SpValue vm_perm_string(VM *vm, const char *s, size_t len) {
 /* ---------------------------------------------------------------- */
 SArray *vm_new_array(VM *vm, int64_t cap) {
     if ((uint64_t)cap > vm->lim.max_array_length) vm_fatal(vm, RS_MEMORY, "array length limit exceeded");
-    SArray *a = new_obj(vm, sizeof *a, T_ARRAY, 1);
+    SArray *a;
+    if (cap > 0 && cap <= 4) {   /* a small array keeps its elements in the same block: one allocation, no pointer chase */
+        a = new_obj(vm, sizeof *a + (size_t)cap * sizeof(SpValue), T_ARRAY, 1);
+        a->h.icap = (uint8_t)cap;
+        a->items = (SpValue *)(void *)(a + 1);
+        a->cap = cap;
+        return a;
+    }
+    a = new_obj(vm, sizeof *a, T_ARRAY, 1);
     if (cap > 0) {
         a->items = vm_mem(vm, NULL, 0, (size_t)cap * sizeof(SpValue));
         a->cap = cap;
@@ -231,7 +239,13 @@ int array_reserve(VM *vm, SArray *a, int64_t need) {
     if ((uint64_t)need > vm->lim.max_array_length) vm_fatal(vm, RS_MEMORY, "array length limit exceeded");
     int64_t nc = a->cap ? a->cap + a->cap / 2 : 4;
     if (nc < need) nc = need;
-    a->items = vm_mem(vm, a->items, (size_t)a->cap * sizeof(SpValue), (size_t)nc * sizeof(SpValue));
+    if (array_inline(a)) {   /* leaving the object block: the block keeps its (now unused) element space */
+        SpValue *ni = vm_mem(vm, NULL, 0, (size_t)nc * sizeof(SpValue));
+        if (a->len > 0) memcpy(ni, a->items, (size_t)a->len * sizeof(SpValue));
+        a->items = ni;
+    } else {
+        a->items = vm_mem(vm, a->items, (size_t)a->cap * sizeof(SpValue), (size_t)nc * sizeof(SpValue));
+    }
     a->cap = nc;
     return 0;
 }
