@@ -440,7 +440,7 @@ static RunStatus RUN_LOOP_NAME(VM *vm, VMTraceCapture **capp, RunCold *ccold, in
             if (sp[-2].type == T_ARRAY && sp[-1].type == T_INT) {
                 const SArray *ga = AS_ARRAY(sp[-2]);
                 int64_t gi = sp[-1].as.i;
-                if (gi >= 0 && gi < ga->len) { sp--; sp[-1] = ga->items[gi]; NEXT(); }
+                if (gi >= 0 && gi < ga->len) { sp--; sp[-1] = array_get(ga, gi); NEXT(); }
             } else if (sp[-2].type == T_NATIVE && typed_peek(sp[-2], sp[-1], &r)) {
                 sp--;
                 sp[-1] = r;
@@ -455,7 +455,7 @@ static RunStatus RUN_LOOP_NAME(VM *vm, VMTraceCapture **capp, RunCold *ccold, in
             if (sp[-3].type == T_ARRAY && sp[-2].type == T_INT) {
                 SArray *sa = AS_ARRAY(sp[-3]);
                 int64_t si = sp[-2].as.i;
-                if (si >= 0 && si < sa->len) { array_note_store(sa, sp[-1]); sa->items[si] = sp[-1]; sp -= 3; NEXT(); }
+                if (si >= 0 && si < sa->len) { array_set(vm, sa, si, sp[-1]); sp -= 3; NEXT(); }
             } else if (sp[-3].type == T_NATIVE && typed_poke(sp[-3], sp[-2], sp[-1])) {
                 sp -= 3;
                 NEXT();
@@ -493,8 +493,7 @@ static RunStatus RUN_LOOP_NAME(VM *vm, VMTraceCapture **capp, RunCold *ccold, in
             unsigned n = U16();
             GCP();
             SArray *a = vm_new_array(vm, (int64_t)n);
-            for (unsigned i = 0; i < n; i++) a->items[i] = sp[-(int)n + (int)i];
-            a->len = (int64_t)n;
+            for (unsigned i = 0; i < n; i++) (void)array_push(vm, a, sp[-(int)n + (int)i]);
             sp -= n;
             PUSH(v_obj(T_ARRAY, a));
             break;
@@ -623,7 +622,7 @@ static RunStatus RUN_LOOP_NAME(VM *vm, VMTraceCapture **capp, RunCold *ccold, in
                 sp--;
                 if (nargs + a->len > 255) { (void)vm_set_error(vm, E_TYPE, "too many arguments (limit 255)"); RAISE(); }
                 if (sp + a->len + 8 > vm->stack_end) vm_fatal(vm, RS_MEMORY, "operand stack overflow");
-                for (int64_t i = 0; i < a->len; i++) PUSH(a->items[i]);
+                for (int64_t i = 0; i < a->len; i++) PUSH(array_get(a, i));
                 nargs += (int)a->len;
             }
             if (mname) {
@@ -644,8 +643,7 @@ static RunStatus RUN_LOOP_NAME(VM *vm, VMTraceCapture **capp, RunCold *ccold, in
                     memcmp(mname->dp, "append", 6) == 0 && AS_ARRAY(recv)->len < AS_ARRAY(recv)->cap) {
                     /* array.append without growth: no allocation, no GC point */
                     SArray *aa = AS_ARRAY(recv);
-                    array_note_push(aa, ov[1]);
-                    aa->items[aa->len++] = ov[1];
+                    (void)array_push(vm, aa, ov[1]);
                     sp = ov;
                     PUSH(v_nil());
                     break;
@@ -776,7 +774,7 @@ static RunStatus RUN_LOOP_NAME(VM *vm, VMTraceCapture **capp, RunCold *ccold, in
                 if (cur >= a->len) { pc += off; break; }
                 base[s + 1] = v_int(cur + 1);
                 if (n == 2) PUSH(v_int(cur));
-                PUSH(a->items[cur]);
+                PUSH(array_get(a, cur));
             } else if (it.type == T_NATIVE) {   /* a typed array (OP_FOR_PREP admits no other native) */
                 int64_t cur = base[s + 1].as.i;
                 if (base[s + 1].type != T_INT || cur < 0) { (void)vm_set_error(vm, E_RUNTIME, "corrupt bytecode: bad loop state"); RAISE(); }
@@ -1594,7 +1592,7 @@ static RunStatus RUN_LOOP_NAME(VM *vm, VMTraceCapture **capp, RunCold *ccold, in
             SpValue qa = sp[-1], qb = base[rd16(ipc + 1)];
             if (qa.type == T_ARRAY && qb.type == T_INT) {
                 const SArray *arr = AS_ARRAY(qa);
-                if (qb.as.i >= 0 && qb.as.i < arr->len) { sp[-1] = arr->items[qb.as.i]; pc = ipc + 4; NEXT(); }
+                if (qb.as.i >= 0 && qb.as.i < arr->len) { sp[-1] = array_get(arr, qb.as.i); pc = ipc + 4; NEXT(); }
             }
             goto q_deopt;
         }
@@ -1604,12 +1602,10 @@ static RunStatus RUN_LOOP_NAME(VM *vm, VMTraceCapture **capp, RunCold *ccold, in
                 SArray *arr = AS_ARRAY(qa);
                 if (qb.as.i >= 0 && qb.as.i < arr->len) {
                     if (ipc[0] == OP_Q_SETIDX_LLL) {
-                        array_note_store(arr, base[rd16(ipc + 7)]);
-                        arr->items[qb.as.i] = base[rd16(ipc + 7)];
+                        array_set(vm, arr, qb.as.i, base[rd16(ipc + 7)]);
                         pc = ipc + 10;
                     } else {
-                        array_note_store(arr, v_bool(ipc[6] == OP_TRUE));
-                        arr->items[qb.as.i] = v_bool(ipc[6] == OP_TRUE);
+                        array_set(vm, arr, qb.as.i, v_bool(ipc[6] == OP_TRUE));
                         pc = ipc + 8;
                     }
                     break;
@@ -1621,7 +1617,7 @@ static RunStatus RUN_LOOP_NAME(VM *vm, VMTraceCapture **capp, RunCold *ccold, in
             SpValue qa = base[rd16(ipc + 1)], qb = base[rd16(ipc + 4)];
             if (qa.type == T_ARRAY && qb.type == T_INT) {
                 const SArray *arr = AS_ARRAY(qa);
-                if (qb.as.i >= 0 && qb.as.i < arr->len) { PUSH(arr->items[qb.as.i]); pc = ipc + 7; NEXT(); }
+                if (qb.as.i >= 0 && qb.as.i < arr->len) { PUSH(array_get(arr, qb.as.i)); pc = ipc + 7; NEXT(); }
             } else if (qa.type == T_NATIVE) {
                 SpValue qr;
                 if (typed_peek(qa, qb, &qr)) { PUSH(qr); pc = ipc + 7; NEXT(); }
@@ -1757,8 +1753,7 @@ static RunStatus RUN_LOOP_NAME(VM *vm, VMTraceCapture **capp, RunCold *ccold, in
                 GCP();
                 vm->pend_obj = v_nil();
                 SArray *ra = vm_new_array(vm, extra);
-                for (int i = 0; i < extra; i++) ra->items[i] = nb[p->nparams + i];
-                ra->len = extra;
+                for (int i = 0; i < extra; i++) (void)array_push(vm, ra, nb[p->nparams + i]);
                 for (int i = filled; i < p->nlocals; i++) nb[i] = v_nil();
                 nb[p->nparams] = v_obj(T_ARRAY, ra);
             } else {

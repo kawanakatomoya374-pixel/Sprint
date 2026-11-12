@@ -35,7 +35,7 @@ int main(void) {
     P("L_SINST_SLOTS", offsetof(SInstance, slots));
     P("L_SARRAY_LEN", offsetof(SArray, len));
     P("L_SARRAY_CAP", offsetof(SArray, cap));
-    P("L_SARRAY_ITEMS", offsetof(SArray, items));
+    P("L_SARRAY_ITEMS", offsetof(SArray, data));
     P("L_SSTR_LEN", offsetof(SString, len));
     P("L_SSTR_DP", offsetof(SString, dp));
     P("L_CELL_V", offsetof(SCell, v));

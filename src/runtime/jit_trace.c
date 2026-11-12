@@ -594,6 +594,50 @@ static int ta_ab_load(TraceAsm *a, uint8_t dst) {
     p.b[1] = (uint8_t)(0x42U | ((dst & 7U) << 3));
     return ta_stencil(a, ST_tr_ab_load, &p);
 }
+/* packed arrays (see SArray): bool / int / float elements are 8-byte payloads and the array's note is their type */
+static int ta_pk_addr(TraceAsm *a, uint8_t ra, uint8_t rb) {
+    TracePatch p = ta_patch();
+    p.b[0] = (uint8_t)(0x49U | (rb >= 8U ? 0x04U : 0U));
+    p.b[1] = (uint8_t)(0xc0U | ((rb & 7U) << 3) | 2U);
+    p.b[2] = (uint8_t)(0x4cU | (ra >= 8U ? 0x01U : 0U));
+    p.b[3] = (uint8_t)(0x90U | (ra & 7U));
+    return ta_stencil(a, ST_tr_pk_addr, &p);
+}
+static int ta_pk_load(TraceAsm *a, uint8_t dst) {   /* dst = the payload at [r10] */
+    TracePatch p = ta_patch();
+    if (ta_isx(dst)) {
+        p.b[0] = 0xf2U; p.b[1] = (uint8_t)(0x41U | (dst - TA_XBASE >= 8U ? 4U : 0U)); p.b[2] = 0x10U; p.b[3] = (uint8_t)(0x02U | (((dst - TA_XBASE) & 7U) << 3));
+        return ta_stencil(a, ST_tr_sse_r10_0, &p);
+    }
+    p.b[0] = (uint8_t)(0x49U | (dst >= 8U ? 0x04U : 0U));
+    p.b[1] = (uint8_t)(0x02U | ((dst & 7U) << 3));
+    return ta_stencil(a, ST_tr_pk_load, &p);
+}
+static int ta_pk_store(TraceAsm *a, uint8_t src) {   /* [r10] = the payload in src */
+    TracePatch p = ta_patch();
+    if (ta_isx(src)) {
+        p.b[0] = 0xf2U; p.b[1] = (uint8_t)(0x41U | (src - TA_XBASE >= 8U ? 4U : 0U)); p.b[2] = 0x11U; p.b[3] = (uint8_t)(0x02U | (((src - TA_XBASE) & 7U) << 3));
+        return ta_stencil(a, ST_tr_sse_r10_0, &p);
+    }
+    p.b[0] = (uint8_t)(0x49U | (src >= 8U ? 0x04U : 0U));
+    p.b[1] = (uint8_t)(0x02U | ((src & 7U) << 3));
+    return ta_stencil(a, ST_tr_pk_store, &p);
+}
+/* leave (deoptimise) when the array in ra is packed / when its note is not `tag` */
+static int ta_xt_notpacked(TraceAsm *a, uint8_t ra) {
+    TracePatch p = ta_patch();
+    p.b[0] = (uint8_t)(0x44U | (ra >= 8U ? 0x01U : 0U));
+    p.b[1] = (uint8_t)(0x50U | (ra & 7U));   /* mod 01, reg r10 (010), rm ra */
+    p.target = TA_DEOPT;
+    return ta_stencil(a, ST_tr_xt_notpacked, &p);
+}
+static int ta_xt_is(TraceAsm *a, uint8_t ra, uint8_t tag) {
+    TracePatch xp = ta_patch();
+    xp.b[0] = (uint8_t)(0x40U | (ra >= 8U ? 0x01U : 0U));
+    xp.b[1] = (uint8_t)(0x78U | (ra & 7U));
+    xp.b[2] = tag;
+    return ta_stencil(a, ST_tr_xt_guard, &xp) && ta_jcc(a, 0x85U, TA_DEOPT);
+}
 static int ta_note_store(TraceAsm *a, uint8_t ra, uint8_t tag) {   /* the array's element-type note, before a store of type `tag` */
     TracePatch p = ta_patch();
     p.b[0] = (uint8_t)(0x40U | (ra >= 8U ? 0x01U : 0U));
@@ -756,8 +800,11 @@ static int ta_ccall(TraceAsm *a, uint64_t fn, uint32_t slot, uint32_t tag) {
 static int ta_emit_pending_stores(const SpTraceIR *ir, const uint8_t *regs, const size_t *pending, size_t npending, uint32_t scratch, TraceAsm *a) {
     for (size_t k = 0U; k < npending; k++) {
         const SpTIRInst *st = &ir->inst[pending[k]];
+        uint8_t tg;
         if (st->op == SP_TIR_FSTORE || st->imm == 1U) continue;
         if (regs[st->a] >= 16U || regs[st->b] >= 16U || !ta_ab_bounds(a, regs[st->a], regs[st->b]) || !ta_jcc(a, 0x83U, TA_DEOPT)) return 0;
+        /* the layout checks also precede every store: a deoptimisation after one of them would apply it twice */
+        if (st->imm == 2U ? !ta_store_tag(ir, st, &tg) || !ta_xt_is(a, regs[st->a], tg) : !ta_xt_notpacked(a, regs[st->a])) return 0;
     }
     for (size_t k = 0U; k < npending; k++) {
         const SpTIRInst *st = &ir->inst[pending[k]];
@@ -775,7 +822,7 @@ static int ta_emit_pending_stores(const SpTraceIR *ir, const uint8_t *regs, cons
                 size_t at;
                 fp.h[0] = (int32_t)((scratch + 1U) * 16U);
                 fp.h[1] = (int32_t)tag;
-                if (!ta_reg_mov(a, 10U, regs[st->a]) || !ta_stencil(a, ST_tr_append_fast, &fp) || !ta_reg_test(a, 10U) ||
+                if (!ta_reg_mov(a, 10U, regs[st->a]) || !ta_stencil(a, (tag >= (uint8_t)T_BOOL && tag <= (uint8_t)T_FLOAT) ? ST_tr_append_fast_pk : ST_tr_append_fast, &fp) || !ta_reg_test(a, 10U) ||
                     a->len + 6U > sizeof a->bytes) return 0;
                 a->bytes[a->len] = 0x0fU; a->bytes[a->len + 1U] = 0x85U;   /* jnz over the helper call */
                 at = a->len + 2U;
@@ -784,6 +831,10 @@ static int ta_emit_pending_stores(const SpTraceIR *ir, const uint8_t *regs, cons
                 if (!ta_ccall(a, (uint64_t)(uintptr_t)&trace_arr_append, scratch, tag)) return 0;
                 { const int32_t d = (int32_t)(a->len - (at + 4U)); memcpy(&a->bytes[at], &d, sizeof d); }
             }
+            continue;
+        }
+        if (st->imm == 2U) {   /* a packed array holding this type: store the payload */
+            if ((regs[st->aux] >= 16U && !ta_isx(regs[st->aux])) || !ta_pk_addr(a, regs[st->a], regs[st->b]) || !ta_pk_store(a, regs[st->aux])) return 0;
             continue;
         }
         if ((regs[st->aux] >= 16U && !ta_isx(regs[st->aux])) || !ta_store_tag(ir, st, &tag) || !ta_note_store(a, regs[st->a], tag) ||
@@ -1382,6 +1433,12 @@ static int ta_emit_trace_ir(const SpTraceIR *ir, const int32_t *phi_local, unsig
         case SP_TIR_ALOAD:
             if ((dst >= 16U && !ta_isx(dst)) || ra >= 16U || rb >= 16U || in->imm > 255U) goto done;
             if (!(in->aux & 1U) && (!ta_ab_bounds(a, ra, rb) || !ta_jcc(a, 0x83U, TA_DEOPT))) goto done;   /* aux bit 0: range proven at entry */
+            if (in->aux & 4U) {   /* a packed array: the note is the element type (bit 1: settled on entry), the payload is all there is */
+                if (!(in->aux & 2U) && !ta_xt_is(a, ra, (uint8_t)in->imm)) goto done;
+                if (!ta_pk_addr(a, ra, rb) || !ta_pk_load(a, dst)) goto done;
+                break;
+            }
+            if (!(in->aux & 2U) && !ta_xt_notpacked(a, ra)) goto done;   /* a boxed array must not have become packed (bit 1: its note is a reference type) */
             if (!ta_ab_addr(a, ra, rb)) goto done;
             if (!(in->aux & 2U) && (!ta_ab_tag(a, (uint8_t)in->imm) || !ta_jcc(a, 0x85U, TA_DEOPT))) goto done;   /* bit 1: the array's note settles the tag */
             if (!ta_ab_load(a, dst)) goto done;
@@ -2945,7 +3002,7 @@ walked:
             if (ir->value_types[a] != SP_TIR_T_REF || trace_ir_runtime_type(ir, a) != (uint8_t)T_ARRAY ||
                 ir->value_types[b] != SP_TIR_T_I64 || h == NULL || h->len <= 0) { why = "array read: unknown array or index type"; goto done; }
             if (array_stored) { why = "array read after a write in the same iteration"; goto done; }
-            e0 = h->items[0];
+            e0 = array_get(h, 0);
             switch (e0.type) {
             case T_INT: ety = SP_TIR_T_I64; break;
             case T_FLOAT: ety = SP_TIR_T_F64; break;
@@ -2958,6 +3015,7 @@ walked:
             }
             etag = (uint8_t)e0.type;
             if (!sp_tir_emit_aload(ir, ety, etag, a, b, &r)) goto done;
+            if (array_packed(h)) ir->inst[ir->count - 1U].aux |= 4U;   /* the sample is a packed array: payload loads guarded by its note */
             if (e0.type == T_ARRAY && r < (uint32_t)slot_total * 2U + (uint32_t)np * 3U + 16U) vhint[r] = AS_ARRAY(e0);
             stack[depth++] = r;
             break;
@@ -3219,7 +3277,17 @@ walked:
                 ir->value_types[b] != SP_TIR_T_I64) { why = "array write: array or index type"; goto done; }
             if (ir->value_types[v] == SP_TIR_T_REF && trace_ir_runtime_type(ir, v) == UINT8_MAX) goto done;
             if (trace_vobj_find(vobj, nvobj, v) != NULL) { why = "a sunk object escapes into an array"; goto done; }
-            if (!sp_tir_emit_astore(ir, a, b, v)) goto done;
+            {
+                const SArray *sh = (a <= ir->nvalues + 0U && a < (uint32_t)slot_total * 2U + (uint32_t)np * 3U + 16U) ? vhint[a] : NULL;
+                if (sh == NULL) { why = "array write: unknown array layout"; goto done; }
+                if (!sp_tir_emit_astore(ir, a, b, v)) goto done;
+                if (array_packed(sh)) {
+                    const SpTIRType vt2 = ir->value_types[v];
+                    const uint8_t vtag = vt2 == SP_TIR_T_I64 ? (uint8_t)T_INT : vt2 == SP_TIR_T_F64 ? (uint8_t)T_FLOAT : vt2 == SP_TIR_T_BOOL ? (uint8_t)T_BOOL : 0U;
+                    if (vtag != sh->h.xt) { why = "array write: a packed array takes only its own element type"; goto done; }
+                    ir->inst[ir->count - 1U].imm = 2U;
+                }
+            }
             array_stored = 1;
             break;
         }

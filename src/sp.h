@@ -234,10 +234,13 @@ typedef struct SString {
     char idata[];
 } SString;
 
+/* Elements are stored boxed (16-byte SpValues) unless the element-type note Obj.xt is T_BOOL, T_INT or T_FLOAT: then every element has that
+ * type and only its 8-byte payload is stored ("packed", half the memory). The layout therefore follows xt; it changes only through the
+ * functions below (array_push / array_put / array_unpack), never by writing xt directly. cap counts elements of the current layout. */
 typedef struct SArray {
     Obj h;
     int64_t len, cap;
-    SpValue *items;
+    void *data;
 } SArray;
 
 typedef struct TEntry {
@@ -779,10 +782,26 @@ SArray *vm_new_array(VM *vm, int64_t cap);
  * each element's tag. Every write of an element into an array that may carry a note goes through one of these (or an equivalent
  * stencil); building an array by raw stores leaves the note at 0 (unknown). */
 /* the elements still live in the object's own block (SArray + icap values) rather than in a separately allocated buffer */
-static inline int array_inline(const SArray *a) { return a->h.icap != 0U && a->items == (const SpValue *)(const void *)(a + 1); }
-static inline void array_note_push(SArray *a, SpValue v) { a->h.xt = (uint8_t)((a->len == 0 || a->h.xt == v.type) ? v.type : 0U); }
-static inline void array_note_store(SArray *a, SpValue v) { if (a->h.xt != v.type) a->h.xt = 0U; }
+static inline int array_inline(const SArray *a) { return a->h.icap != 0U && a->data == (const void *)(a + 1); }
+#ifndef SP_PACKED_ARRAYS
+#define SP_PACKED_ARRAYS 1   /* 1: bool / int / float arrays store 8-byte payloads (see SArray) */
+#endif
+static inline int array_packed(const SArray *a) { return SP_PACKED_ARRAYS && (unsigned)((unsigned)a->h.xt - 1U) < 3U; }
+static inline size_t array_esize(const SArray *a) { return array_packed(a) ? sizeof(int64_t) : sizeof(SpValue); }
+static inline SpValue *array_boxed(const SArray *a) { return (SpValue *)a->data; }   /* only while !array_packed(a) */
+static inline SpValue array_get(const SArray *a, int64_t i) {
+    if (array_packed(a)) { SpValue v; v.w = a->h.xt; v.as.i = ((const int64_t *)a->data)[i]; return v; }
+    return ((const SpValue *)a->data)[i];
+}
+void array_put(VM *vm, SArray *a, int64_t i, SpValue v);      /* 0 <= i < len: stores, changing the layout if the type no longer fits */
+static inline void array_set(VM *vm, SArray *a, int64_t i, SpValue v) {
+    if (array_packed(a) && a->h.xt == v.type) ((int64_t *)a->data)[i] = a->h.xt == (uint8_t)T_BOOL ? (int64_t)(v.as.b != 0) : v.as.i;
+    else array_put(vm, a, i, v);
+}
+void array_unpack(VM *vm, SArray *a);                         /* boxed layout, xt = 0 */
 int array_push(VM *vm, SArray *a, SpValue v);
+SArray *array_from(VM *vm, const SpValue *vals, int64_t n);
+SArray *array_slice(VM *vm, const SArray *a, int64_t s, int64_t e);   /* a[s..e) with the same layout */   /* a new array holding vals[0..n) */
 void co_block_free(char *blk, size_t sz);   /* a coroutine's stack block (value.c) */
 int array_reserve(VM *vm, SArray *a, int64_t need);
 SFunc *vm_new_closure_obj(VM *vm, Proto *p, int nup);

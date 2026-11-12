@@ -173,7 +173,7 @@ static int get_index(VM *vm, SpValue o, SpValue k, SpValue *out) {
         SArray *a = AS_ARRAY(o);
         if (k.as.i < 0 || k.as.i >= a->len)
             return vm_set_error(vm, E_INDEX, "array index %lld out of range (length %lld)", (long long)k.as.i, (long long)a->len);
-        *out = a->items[k.as.i];
+        *out = array_get(a, k.as.i);
         return 0;
     }
     case T_STRING: {
@@ -199,8 +199,7 @@ static int set_index(VM *vm, SpValue o, SpValue k, SpValue v) {
         SArray *a = AS_ARRAY(o);
         if (k.as.i < 0 || k.as.i >= a->len)
             return vm_set_error(vm, E_INDEX, "array index %lld out of range (length %lld)", (long long)k.as.i, (long long)a->len);
-        array_note_store(a, v);
-        a->items[k.as.i] = v;
+        array_set(vm, a, k.as.i, v);
         return 0;
     }
     case T_TABLE: return table_set(vm, AS_TABLE(o), k, v);
@@ -549,8 +548,7 @@ int vm_call(VM *vm, SpValue fnv, int argc, const SpValue *argv, SpValue *ret) {
     if (p->has_rest) {
         int extra = argc > p->nparams ? argc - p->nparams : 0;
         SArray *ra = vm_new_array(vm, extra);
-        for (int i = 0; i < extra; i++) ra->items[i] = nb[p->nparams + i];
-        ra->len = extra;
+        for (int i = 0; i < extra; i++) (void)array_push(vm, ra, nb[p->nparams + i]);
         nb[p->nparams] = v_obj(T_ARRAY, ra);
     }
     Frame *nf = &vm->frames[vm->nframes++];

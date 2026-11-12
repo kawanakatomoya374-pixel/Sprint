@@ -11,7 +11,7 @@ static int am_extend(VM *vm, int argc, SpValue *argv, SpValue *ret) {
     SArray *a = AS_ARRAY(argv[0]), *b = AS_ARRAY(argv[1]);
     int64_t n = b->len;
     array_reserve(vm, a, a->len + n);
-    for (int64_t i = 0; i < n; i++) { array_note_push(a, b->items[i]); a->items[a->len++] = b->items[i]; }
+    for (int64_t i = 0; i < n; i++) (void)array_push(vm, a, array_get(b, i));   /* n was read first: a.extend(a) adds the old elements once */
     return 0;
 }
 static int am_insert(VM *vm, int argc, SpValue *argv, SpValue *ret) {
@@ -20,18 +20,21 @@ static int am_insert(VM *vm, int argc, SpValue *argv, SpValue *ret) {
     if (need_int(vm, argv[1], "index", &i)) return 1;
     SArray *a = AS_ARRAY(argv[0]);
     if (i < 0 || i > a->len) return vm_set_error(vm, E_INDEX, "insert() index out of range");
-    array_reserve(vm, a, a->len + 1);
-    memmove(a->items + i + 1, a->items + i, (size_t)(a->len - i) * sizeof(SpValue));
-    array_note_push(a, argv[2]);
-    a->items[i] = argv[2];
-    a->len++;
+    (void)array_push(vm, a, argv[2]);   /* the new element at the end settles type, layout and room ... */
+    {   /* ... then it moves to its place */
+        const size_t es = array_esize(a);
+        char *d = (char *)a->data;
+        memmove(d + (size_t)(i + 1) * es, d + (size_t)i * es, (size_t)(a->len - 1 - i) * es);
+        array_set(vm, a, i, argv[2]);
+    }
     return 0;
 }
 static int am_pop(VM *vm, int argc, SpValue *argv, SpValue *ret) {
     (void)argc;
     SArray *a = AS_ARRAY(argv[0]);
     if (a->len == 0) return vm_set_error(vm, E_INDEX, "pop() from an empty array");
-    *ret = a->items[--a->len];
+    *ret = array_get(a, a->len - 1);
+    a->len--;
     return 0;
 }
 static int am_remove_at(VM *vm, int argc, SpValue *argv, SpValue *ret) {
@@ -40,8 +43,8 @@ static int am_remove_at(VM *vm, int argc, SpValue *argv, SpValue *ret) {
     if (need_int(vm, argv[1], "index", &i)) return 1;
     SArray *a = AS_ARRAY(argv[0]);
     if (i < 0 || i >= a->len) return vm_set_error(vm, E_INDEX, "remove_at() index out of range");
-    *ret = a->items[i];
-    memmove(a->items + i, a->items + i + 1, (size_t)(a->len - i - 1) * sizeof(SpValue));
+    *ret = array_get(a, i);
+    memmove((char *)a->data + (size_t)i * array_esize(a), (char *)a->data + (size_t)(i + 1) * array_esize(a), (size_t)(a->len - i - 1) * array_esize(a));
     a->len--;
     return 0;
 }
@@ -62,24 +65,20 @@ static int am_slice(VM *vm, int argc, SpValue *argv, SpValue *ret) {
     if (argc > 2 && need_int(vm, argv[2], "end", &e)) return 1;
     if (s < 0 || e < 0 || s > a->len || e > a->len) return vm_set_error(vm, E_INDEX, "slice out of range for array of length %lld", (long long)a->len);
     if (s > e) return vm_set_error(vm, E_VALUE, "slice start is after end");
-    SArray *r = vm_new_array(vm, e - s);
-    for (int64_t i = s; i < e; i++) r->items[r->len++] = a->items[i];
-    *ret = v_obj(T_ARRAY, r);
+    *ret = v_obj(T_ARRAY, array_slice(vm, a, s, e));
     return 0;
 }
 static int am_copy(VM *vm, int argc, SpValue *argv, SpValue *ret) {
     (void)argc;
     SArray *a = AS_ARRAY(argv[0]);
-    SArray *r = vm_new_array(vm, a->len);
-    for (int64_t i = 0; i < a->len; i++) r->items[r->len++] = a->items[i];
-    *ret = v_obj(T_ARRAY, r);
+    *ret = v_obj(T_ARRAY, array_slice(vm, a, 0, a->len));
     return 0;
 }
 static int am_index_of(VM *vm, int argc, SpValue *argv, SpValue *ret) {
     (void)vm; (void)argc;
     SArray *a = AS_ARRAY(argv[0]);
     *ret = v_int(-1);
-    for (int64_t i = 0; i < a->len; i++) if (value_eq(a->items[i], argv[1])) { *ret = v_int(i); break; }
+    for (int64_t i = 0; i < a->len; i++) if (value_eq(array_get(a, i), argv[1])) { *ret = v_int(i); break; }
     return 0;
 }
 static int am_contains(VM *vm, int argc, SpValue *argv, SpValue *ret) {
@@ -102,7 +101,9 @@ int n_in(VM *vm, int argc, SpValue *argv, SpValue *ret) {
 static int am_reverse(VM *vm, int argc, SpValue *argv, SpValue *ret) {
     (void)vm; (void)argc; (void)ret;
     SArray *a = AS_ARRAY(argv[0]);
-    for (int64_t i = 0, j = a->len - 1; i < j; i++, j--) { SpValue t = a->items[i]; a->items[i] = a->items[j]; a->items[j] = t; }
+    const size_t es = array_esize(a);
+    char *d = (char *)a->data, tmp[sizeof(SpValue)];
+    for (int64_t i = 0, j = a->len - 1; i < j; i++, j--) { memcpy(tmp, d + (size_t)i * es, es); memcpy(d + (size_t)i * es, d + (size_t)j * es, es); memcpy(d + (size_t)j * es, tmp, es); }
     return 0;
 }
 static int am_join(VM *vm, int argc, SpValue *argv, SpValue *ret) {
@@ -197,8 +198,8 @@ static void keys_sort(int64_t *a, int64_t n) {
 
 /* give an array's storage back at once (the temporaries of sort would otherwise stay until the next collection) */
 static void arr_release(VM *vm, SArray *x) {
-    if (array_inline(x)) x->items = NULL;   /* the elements live in the object block: nothing to give back */
-    else x->items = vm_mem(vm, x->items, (size_t)x->cap * sizeof(SpValue), 0);
+    if (array_inline(x)) x->data = NULL;   /* the elements live in the object block: nothing to give back */
+    else x->data = vm_mem(vm, x->data, (size_t)x->cap * array_esize(x), 0);
     x->cap = 0;
     x->len = 0;
 }
@@ -215,12 +216,13 @@ static int am_sort(VM *vm, int argc, SpValue *argv, SpValue *ret) {
     if (n < 2) return 0;
     if (cmp.type == T_NIL) {
         int64_t i = 0;
-        while (i < n && a->items[i].type == T_INT) i++;
+        if (array_packed(a) && a->h.xt == (uint8_t)T_INT) { keys_sort((int64_t *)a->data, n); return 0; }   /* packed ints: sorted where they are */
+        while (i < n && array_get(a, i).type == T_INT) i++;
         if (i == n) {
             int64_t *keys = vm_mem(vm, NULL, 0, (size_t)n * sizeof *keys);
-            for (i = 0; i < n; i++) keys[i] = a->items[i].as.i;
+            for (i = 0; i < n; i++) keys[i] = array_get(a, i).as.i;
             keys_sort(keys, n);
-            for (i = 0; i < n; i++) a->items[i] = v_int(keys[i]);
+            for (i = 0; i < n; i++) array_set(vm, a, i, v_int(keys[i]));
             (void)vm_mem(vm, keys, (size_t)n * sizeof *keys, 0);
             return 0;
         }
@@ -233,12 +235,12 @@ static int am_sort(VM *vm, int argc, SpValue *argv, SpValue *ret) {
     base[nroot++] = v_obj(T_ARRAY, work);
     base[nroot++] = v_obj(T_ARRAY, scratch);
     vm->sp = base + nroot;
-    for (int64_t i = 0; i < n; i++) work->items[i] = a->items[i];
-    if (user) for (int64_t i = 0; i < n; i++) snap->items[i] = a->items[i];
+    for (int64_t i = 0; i < n; i++) array_boxed(work)[i] = array_get(a, i);
+    if (user) for (int64_t i = 0; i < n; i++) array_boxed(snap)[i] = array_get(a, i);
     if (user) snap->len = n;
     work->len = scratch->len = n;
     int err = 0;
-    SpValue *src = work->items, *dst = scratch->items;
+    SpValue *src = array_boxed(work), *dst = array_boxed(scratch);
     for (int64_t w = 1; w < n && !err; w *= 2) {
         for (int64_t lo = 0; lo < n && !err; lo += 2 * w) {
             int64_t mid = lo + w < n ? lo + w : n, hi = lo + 2 * w < n ? lo + 2 * w : n;
@@ -258,9 +260,9 @@ static int am_sort(VM *vm, int argc, SpValue *argv, SpValue *ret) {
     if (err) return 1;
     int changed = a->len != n;
     for (int64_t i = 0; user && !changed && i < n; i++)
-        if (!sp_same(a->items[i], snap->items[i])) changed = 1;
+        if (!sp_same(array_get(a, i), array_boxed(snap)[i])) changed = 1;
     if (changed) return vm_set_error(vm, E_RUNTIME, "array was modified during sort()");
-    for (int64_t i = 0; i < n; i++) a->items[i] = src[i];
+    for (int64_t i = 0; i < n; i++) array_set(vm, a, i, src[i]);
     arr_release(vm, work);
     arr_release(vm, scratch);
     if (user) arr_release(vm, snap);
@@ -293,7 +295,7 @@ static int hof(VM *vm, SpValue *argv, SpValue *ret, int mode) {
     if (mode == H_ALL) *ret = v_bool(1);
     int err = 0;
     for (int64_t i = 0; i < a->len && !err; i++) {
-        SpValue item = a->items[i], args[2], r;
+        SpValue item = array_get(a, i), args[2], r;
         int n = 1;
         args[0] = item;
         if (mode == H_REDUCE) { args[0] = acc; args[1] = item; n = 2; }

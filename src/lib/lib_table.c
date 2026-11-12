@@ -16,7 +16,7 @@ static int t_keys(VM *vm, int argc, SpValue *argv, SpValue *ret) {
     SArray *a = vm_new_array(vm, t->count);
     SpValue k;
     int64_t c = 0;
-    while ((c = table_next(t, c, &k, NULL)) >= 0) a->items[a->len++] = k;
+    while ((c = table_next(t, c, &k, NULL)) >= 0) (void)array_push(vm, a, k);
     *ret = v_obj(T_ARRAY, a);
     return 0;
 }
@@ -27,7 +27,7 @@ static int t_values(VM *vm, int argc, SpValue *argv, SpValue *ret) {
     SArray *a = vm_new_array(vm, t->count);
     SpValue v;
     int64_t c = 0;
-    while ((c = table_next(t, c, NULL, &v)) >= 0) a->items[a->len++] = v;
+    while ((c = table_next(t, c, NULL, &v)) >= 0) (void)array_push(vm, a, v);
     *ret = v_obj(T_ARRAY, a);
     return 0;
 }
@@ -40,10 +40,9 @@ static int t_items(VM *vm, int argc, SpValue *argv, SpValue *ret) {
     int64_t c = 0;
     while ((c = table_next(t, c, &k, &v)) >= 0) {
         SArray *pair = vm_new_array(vm, 2);
-        pair->items[0] = k;
-        pair->items[1] = v;
-        pair->len = 2;
-        a->items[a->len++] = v_obj(T_ARRAY, pair);
+        (void)array_push(vm, pair, k);
+        (void)array_push(vm, pair, v);
+        (void)array_push(vm, a, v_obj(T_ARRAY, pair));
     }
     *ret = v_obj(T_ARRAY, a);
     return 0;

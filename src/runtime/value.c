@@ -223,16 +223,41 @@ SArray *vm_new_array(VM *vm, int64_t cap) {
     if (cap > 0 && cap <= 4) {   /* a small array keeps its elements in the same block: one allocation, no pointer chase */
         a = new_obj(vm, sizeof *a + (size_t)cap * sizeof(SpValue), T_ARRAY, 1);
         a->h.icap = (uint8_t)cap;
-        a->items = (SpValue *)(void *)(a + 1);
+        a->data = (void *)(a + 1);
         a->cap = cap;
         return a;
     }
     a = new_obj(vm, sizeof *a, T_ARRAY, 1);
     if (cap > 0) {
-        a->items = vm_mem(vm, NULL, 0, (size_t)cap * sizeof(SpValue));
+        a->data = vm_mem(vm, NULL, 0, (size_t)cap * sizeof(SpValue));
         a->cap = cap;
     }
     return a;
+}
+
+/* change the element size of the buffer (to packed or boxed) for `len` live elements; the array's xt is set by the caller afterwards */
+static void array_relayout(VM *vm, SArray *a, int to_packed) {
+    const size_t from = array_packed(a) ? sizeof(int64_t) : sizeof(SpValue), to = to_packed ? sizeof(int64_t) : sizeof(SpValue);
+    if (from == to) return;
+    if (a->data == NULL) return;
+    if (!array_inline(a)) a->data = vm_mem(vm, a->data, (size_t)a->cap * from, (size_t)a->cap * (to > from ? to : from));   /* room for the bigger one while converting */
+    if (to_packed) {
+        const SpValue *src = (const SpValue *)a->data;
+        int64_t *dst = (int64_t *)a->data;
+        for (int64_t i = 0; i < a->len; i++) dst[i] = src[i].as.i;   /* ascending: dst[i] is at or before src[i] */
+        if (!array_inline(a)) a->data = vm_mem(vm, a->data, (size_t)a->cap * sizeof(SpValue), (size_t)a->cap * sizeof(int64_t));
+    } else {
+        const int64_t *src = (const int64_t *)a->data;
+        SpValue *dst = (SpValue *)a->data;
+        const uint8_t t = a->h.xt;
+        for (int64_t i = a->len - 1; i >= 0; i--) { const int64_t p = src[i]; dst[i].w = t; dst[i].as.i = p; }   /* descending: dst[i] lies at or after src[i] */
+    }
+}
+
+void array_unpack(VM *vm, SArray *a) {
+    if (!array_packed(a)) { a->h.xt = 0U; return; }
+    array_relayout(vm, a, 0);
+    a->h.xt = 0U;
 }
 
 int array_reserve(VM *vm, SArray *a, int64_t need) {
@@ -240,22 +265,65 @@ int array_reserve(VM *vm, SArray *a, int64_t need) {
     if ((uint64_t)need > vm->lim.max_array_length) vm_fatal(vm, RS_MEMORY, "array length limit exceeded");
     int64_t nc = a->cap ? a->cap + a->cap / 2 : 4;
     if (nc < need) nc = need;
+    const size_t es = array_esize(a);
     if (array_inline(a)) {   /* leaving the object block: the block keeps its (now unused) element space */
-        SpValue *ni = vm_mem(vm, NULL, 0, (size_t)nc * sizeof(SpValue));
-        if (a->len > 0) memcpy(ni, a->items, (size_t)a->len * sizeof(SpValue));
-        a->items = ni;
+        void *ni = vm_mem(vm, NULL, 0, (size_t)nc * es);
+        if (a->len > 0) memcpy(ni, a->data, (size_t)a->len * es);
+        a->data = ni;
     } else {
-        a->items = vm_mem(vm, a->items, (size_t)a->cap * sizeof(SpValue), (size_t)nc * sizeof(SpValue));
+        a->data = vm_mem(vm, a->data, (size_t)a->cap * es, (size_t)nc * es);
     }
     a->cap = nc;
     return 0;
 }
 
+/* the type note and layout after an element of type `t` joins the array (len is the length before it) */
+static void array_adopt_type(VM *vm, SArray *a, uint8_t t) {
+    if (a->len == 0) {
+        const int want = SP_PACKED_ARRAYS && t >= (uint8_t)T_BOOL && t <= (uint8_t)T_FLOAT;
+        if (want != array_packed(a)) array_relayout(vm, a, want);
+        a->h.xt = t;
+    } else if (a->h.xt != t) {
+        if (array_packed(a)) array_unpack(vm, a);
+        a->h.xt = 0U;
+    }
+}
+
 int array_push(VM *vm, SArray *a, SpValue v) {
+    if (a->len == 0 || a->h.xt != v.type) array_adopt_type(vm, a, (uint8_t)v.type);
     if (a->len == a->cap) array_reserve(vm, a, a->len + 1);
-    array_note_push(a, v);
-    a->items[a->len++] = v;
+    if (array_packed(a)) ((int64_t *)a->data)[a->len] = v.type == T_BOOL ? (int64_t)(v.as.b != 0) : v.as.i;
+    else ((SpValue *)a->data)[a->len] = v;
+    a->len++;
     return 0;
+}
+
+void array_put(VM *vm, SArray *a, int64_t i, SpValue v) {
+    if (a->h.xt != v.type) {
+        if (array_packed(a)) array_unpack(vm, a);
+        a->h.xt = 0U;
+    }
+    if (array_packed(a)) ((int64_t *)a->data)[i] = v.type == T_BOOL ? (int64_t)(v.as.b != 0) : v.as.i;
+    else ((SpValue *)a->data)[i] = v;
+}
+
+/* a copy of a[s..e) that keeps the layout and the type note */
+SArray *array_slice(VM *vm, const SArray *a, int64_t s, int64_t e) {
+    const int64_t n = e - s;
+    SArray *r = vm_new_array(vm, n);
+    if (n <= 0) return r;
+    if (array_packed(a)) { array_relayout(vm, r, 1); r->h.xt = a->h.xt; }
+    else r->h.xt = a->h.xt;
+    const size_t es = array_esize(a);
+    memcpy(r->data, (const char *)a->data + (size_t)s * es, (size_t)n * es);
+    r->len = n;
+    return r;
+}
+
+SArray *array_from(VM *vm, const SpValue *vals, int64_t n) {
+    SArray *a = vm_new_array(vm, n);
+    for (int64_t i = 0; i < n; i++) array_push(vm, a, vals[i]);
+    return a;
 }
 
 

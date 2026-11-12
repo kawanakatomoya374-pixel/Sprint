@@ -1358,11 +1358,17 @@ ST getidx_rr                    # slot H0 <- array(H1)[int(H2)]; out of range ->
     mov H2+8(%r12),%rcx
     cmp H3(%rax),%rcx
     jae JIT_X
+    movzbl L_OBJ_XT(%rax),%edx              # packed array (note T_BOOL / T_INT / T_FLOAT): 8-byte payloads, the note is the type
+    lea -1(%rdx),%esi
     mov H4(%rax),%rax
+    cmp $2,%esi
+    jbe 1f
     shl $4,%rcx
     mov (%rax,%rcx),%rdx
     mov 8(%rax,%rcx),%rsi
-    mov %rdx,H0(%r12)
+    jmp 2f
+1:  mov (%rax,%rcx,8),%rsi
+2:  mov %rdx,H0(%r12)
     mov %rsi,H0+8(%r12)
 
 ST getidx_rk                    # index is the constant H2
@@ -1370,30 +1376,50 @@ ST getidx_rk                    # index is the constant H2
     mov H2+8(%r13),%rcx
     cmp H3(%rax),%rcx
     jae JIT_X
+    movzbl L_OBJ_XT(%rax),%edx              # packed array (note T_BOOL / T_INT / T_FLOAT): 8-byte payloads, the note is the type
+    lea -1(%rdx),%esi
     mov H4(%rax),%rax
+    cmp $2,%esi
+    jbe 1f
     shl $4,%rcx
     mov (%rax,%rcx),%rdx
     mov 8(%rax,%rcx),%rsi
-    mov %rdx,H0(%r12)
+    jmp 2f
+1:  mov (%rax,%rcx,8),%rsi
+2:  mov %rdx,H0(%r12)
     mov %rsi,H0+8(%r12)
-
 
 ST setidx_rr                    # array(H0)[int(H1)] <- slot H2
     mov H0+8(%r12),%rax
     mov H1+8(%r12),%rcx
     cmp H3(%rax),%rcx
     jae JIT_X
-    movzbl H2(%r12),%edx                    # the array's element-type note drops to "unknown" if this value differs
-    cmp %dl,L_OBJ_XT(%rax)
+    movzbl H2(%r12),%edx
+    movzbl L_OBJ_XT(%rax),%r8d
+    lea -1(%r8),%esi
+    cmp $2,%esi
+    jbe 3f
+    cmp %dl,%r8b                            # a boxed array: its element-type note drops to "unknown" if this value differs
     je 1f
     movb $0,L_OBJ_XT(%rax)
-1:
-    mov H4(%rax),%rax
+1:  mov H4(%rax),%rax
     shl $4,%rcx
     mov H2(%r12),%rdx
     mov H2+8(%r12),%rsi
     mov %rdx,(%rax,%rcx)
     mov %rsi,8(%rax,%rcx)
+    jmp 9f
+3:  cmp %dl,%r8b                            # a packed array: only a value of its own type fits, anything else is the interpreter's (it unpacks)
+    jne JIT_X
+    mov H4(%rax),%rax
+    mov H2+8(%r12),%rsi
+    cmp $T_BOOL,%dl
+    jne 4f
+    xor %esi,%esi
+    cmpl $0,H2+8(%r12)
+    setne %sil
+4:  mov %rsi,(%rax,%rcx,8)
+9:
 
 ST setidx_rk                    # value is the constant H2
     mov H0+8(%r12),%rax
@@ -1401,16 +1427,31 @@ ST setidx_rk                    # value is the constant H2
     cmp H3(%rax),%rcx
     jae JIT_X
     movzbl H2(%r13),%edx
-    cmp %dl,L_OBJ_XT(%rax)
+    movzbl L_OBJ_XT(%rax),%r8d
+    lea -1(%r8),%esi
+    cmp $2,%esi
+    jbe 3f
+    cmp %dl,%r8b                            # a boxed array: its element-type note drops to "unknown" if this value differs
     je 1f
     movb $0,L_OBJ_XT(%rax)
-1:
-    mov H4(%rax),%rax
+1:  mov H4(%rax),%rax
     shl $4,%rcx
     mov H2(%r13),%rdx
     mov H2+8(%r13),%rsi
     mov %rdx,(%rax,%rcx)
     mov %rsi,8(%rax,%rcx)
+    jmp 9f
+3:  cmp %dl,%r8b                            # a packed array: only a value of its own type fits, anything else is the interpreter's (it unpacks)
+    jne JIT_X
+    mov H4(%rax),%rax
+    mov H2+8(%r13),%rsi
+    cmp $T_BOOL,%dl
+    jne 4f
+    xor %esi,%esi
+    cmpl $0,H2+8(%r13)
+    setne %sil
+4:  mov %rsi,(%rax,%rcx,8)
+9:
 
 ST alen                         # slot H0 <- len(array(H1))
     mov H1+8(%r12),%rax
@@ -1475,11 +1516,17 @@ ST arr_next
     jge JIT_T
     lea 1(%rcx),%rdx
     mov %rdx,H1+24(%r12)
+    movzbl L_OBJ_XT(%rax),%edx
+    lea -1(%rdx),%esi
     mov H4(%rax),%rax
+    cmp $2,%esi
+    jbe 1f
     shl $4,%rcx
     mov (%rax,%rcx),%rdx
     mov 8(%rax,%rcx),%rsi
-    mov %rdx,H0(%r12)
+    jmp 2f
+1:  mov (%rax,%rcx,8),%rsi
+2:  mov %rdx,H0(%r12)
     mov %rsi,H0+8(%r12)
 
 ST arr_next2
@@ -1491,28 +1538,40 @@ ST arr_next2
     mov %rdx,H1+24(%r12)
     movq $T_INT,H0(%r12)
     mov %rcx,H0+8(%r12)
+    movzbl L_OBJ_XT(%rax),%edx
+    lea -1(%rdx),%esi
     mov H4(%rax),%rax
+    cmp $2,%esi
+    jbe 1f
     shl $4,%rcx
     mov (%rax,%rcx),%rdx
     mov 8(%rax,%rcx),%rsi
-    mov %rdx,H0+16(%r12)
+    jmp 2f
+1:  mov (%rax,%rcx,8),%rsi
+2:  mov %rdx,H0+16(%r12)
     mov %rsi,H0+24(%r12)
 
-# array.append(v) without growth (H3 = len, H4 = items, H5 = cap offsets); the result is nil, written to slot H0
 ST aappend_r                    # value in slot H2
     mov H1+8(%r12),%rax
     mov H3(%rax),%rcx
     cmp H5(%rax),%rcx
     jge JIT_X
-    movzbl H2(%r12),%edx                    # element-type note: an empty array takes the value's type, otherwise a different type clears it
-    test %rcx,%rcx
-    jz 2f
-    cmp %dl,L_OBJ_XT(%rax)
+    movzbl H2(%r12),%edx
+    movzbl L_OBJ_XT(%rax),%esi
+    lea -1(%rsi),%r8d
+    cmp $2,%r8d
+    jbe 5f
+    test %rcx,%rcx                          # a boxed array: an empty one takes the value's type (a numeric value would switch it to packed storage: the interpreter's job)
+    jnz 6f
+    lea -1(%rdx),%r8d
+    cmp $2,%r8d
+    jbe JIT_X
+    mov %dl,L_OBJ_XT(%rax)
+    jmp 1f
+6:  cmp %dl,%sil
     je 1f
-    xor %edx,%edx
-2:  mov %dl,L_OBJ_XT(%rax)
-1:
-    lea 1(%rcx),%rdx
+    movb $0,L_OBJ_XT(%rax)
+1:  lea 1(%rcx),%rdx
     mov %rdx,H3(%rax)
     mov H4(%rax),%rax
     shl $4,%rcx
@@ -1520,7 +1579,27 @@ ST aappend_r                    # value in slot H2
     mov H2+8(%r12),%rsi
     mov %rdx,(%rax,%rcx)
     mov %rsi,8(%rax,%rcx)
-    movq $0,H0(%r12)
+    jmp 9f
+5:  test %rcx,%rcx                          # a packed array: only a numeric value of its own type (the note is set when it is empty)
+    jz 7f
+    cmp %dl,%sil
+    jne JIT_X
+    jmp 8f
+7:  lea -1(%rdx),%r8d
+    cmp $2,%r8d
+    ja JIT_X
+    mov %dl,L_OBJ_XT(%rax)
+8:  lea 1(%rcx),%r9
+    mov %r9,H3(%rax)
+    mov H4(%rax),%rax
+    mov H2+8(%r12),%rsi
+    cmp $T_BOOL,%dl
+    jne 4f
+    xor %esi,%esi
+    cmpl $0,H2+8(%r12)
+    setne %sil
+4:  mov %rsi,(%rax,%rcx,8)
+9:  movq $0,H0(%r12)
     movq $0,H0+8(%r12)
 
 ST aappend_k                    # value is the constant H2
@@ -1529,14 +1608,21 @@ ST aappend_k                    # value is the constant H2
     cmp H5(%rax),%rcx
     jge JIT_X
     movzbl H2(%r13),%edx
-    test %rcx,%rcx
-    jz 2f
-    cmp %dl,L_OBJ_XT(%rax)
+    movzbl L_OBJ_XT(%rax),%esi
+    lea -1(%rsi),%r8d
+    cmp $2,%r8d
+    jbe 5f
+    test %rcx,%rcx                          # a boxed array: an empty one takes the value's type (a numeric value would switch it to packed storage: the interpreter's job)
+    jnz 6f
+    lea -1(%rdx),%r8d
+    cmp $2,%r8d
+    jbe JIT_X
+    mov %dl,L_OBJ_XT(%rax)
+    jmp 1f
+6:  cmp %dl,%sil
     je 1f
-    xor %edx,%edx
-2:  mov %dl,L_OBJ_XT(%rax)
-1:
-    lea 1(%rcx),%rdx
+    movb $0,L_OBJ_XT(%rax)
+1:  lea 1(%rcx),%rdx
     mov %rdx,H3(%rax)
     mov H4(%rax),%rax
     shl $4,%rcx
@@ -1544,10 +1630,29 @@ ST aappend_k                    # value is the constant H2
     mov H2+8(%r13),%rsi
     mov %rdx,(%rax,%rcx)
     mov %rsi,8(%rax,%rcx)
-    movq $0,H0(%r12)
+    jmp 9f
+5:  test %rcx,%rcx                          # a packed array: only a numeric value of its own type (the note is set when it is empty)
+    jz 7f
+    cmp %dl,%sil
+    jne JIT_X
+    jmp 8f
+7:  lea -1(%rdx),%r8d
+    cmp $2,%r8d
+    ja JIT_X
+    mov %dl,L_OBJ_XT(%rax)
+8:  lea 1(%rcx),%r9
+    mov %r9,H3(%rax)
+    mov H4(%rax),%rax
+    mov H2+8(%r13),%rsi
+    cmp $T_BOOL,%dl
+    jne 4f
+    xor %esi,%esi
+    cmpl $0,H2+8(%r13)
+    setne %sil
+4:  mov %rsi,(%rax,%rcx,8)
+9:  movq $0,H0(%r12)
     movq $0,H0+8(%r12)
 
-# a libm function of one float: slot H0 <- HQ(float slot H1)
 ST fcall1
     movsd H1+8(%r12),%xmm0
     movabs $HQ,%rax
@@ -1927,6 +2032,51 @@ ST tr_ccall
     pop %rcx
     pop %rax
 
+# ---- packed arrays in traces (see SArray): 8-byte payloads, the element type is the array's note
+ST tr_pk_addr                   # r10 = &items[rb] (8-byte elements)
+    .byte HB0, 0x89, HB1        # mov r10, rb
+    .byte 0x49, 0xc1, 0xe2, 0x03
+    .byte HB2, 0x03, HB3        # add r10, [ra + items]
+    .long L_SARRAY_ITEMS
+
+ST tr_pk_load                   # dst = [r10]: HB0 = REX.W+B(+R dst), HB1 = modrm (mod 00, reg dst, rm r10)
+    .byte HB0, 0x8b, HB1
+
+ST tr_pk_store                  # [r10] = src: HB0 = REX.W+B(+R src), HB1 = modrm (mod 00, reg src, rm r10)
+    .byte HB0, 0x89, HB1
+
+ST tr_sse_r10_0                 # movsd xmm, [r10] / movsd [r10], xmm: HB0 = f2, HB1 = REX, HB2 = opcode, HB3 = modrm (mod 00)
+    .byte HB0, HB1, 0x0f, HB2, HB3
+
+ST tr_xt_notpacked              # leave (JIT_T) when the array in ra is packed (its note is 1..3): HB0 = REX (+R r10, +B ra), HB1 = modrm (mod 01, reg r10, rm ra)
+    .byte HB0, 0x0f, 0xb6, HB1, L_OBJ_XT
+    dec %r10d
+    cmp $2,%r10d
+    jbe JIT_T
+
+# arr.append from a trace when the array is packed and holds this type: r10 = the array, payload in the frame scratch slot at byte offset H0, H1 = the tag
+ST tr_append_fast_pk
+    push %rax
+    push %rcx
+    mov L_SARRAY_LEN(%r10),%rcx
+    cmp L_SARRAY_CAP(%r10),%rcx
+    jge 9f
+    cmpb $H1,L_OBJ_XT(%r10)
+    jne 9f
+    mov L_SARRAY_ITEMS(%r10),%rax
+    lea (%rax,%rcx,8),%rax
+    mov H0+8(%r12),%rcx
+    mov %rcx,(%rax)
+    incq L_SARRAY_LEN(%r10)
+    pop %rcx
+    pop %rax
+    mov $1,%r10d
+    jmp 8f
+9:  pop %rcx
+    pop %rax
+    xor %r10d,%r10d
+8:
+
 # arr.append from a trace, the common case: room in the array. r10 = the array, the payload is in the frame scratch slot at byte offset H0 (r12-relative),
 # H1 = the element type tag. r10d = 1 when the element was appended; 0 when the array is full (the caller then runs the helper). rax and rcx are saved.
 ST tr_append_fast
@@ -1935,14 +2085,9 @@ ST tr_append_fast
     mov L_SARRAY_LEN(%r10),%rcx
     cmp L_SARRAY_CAP(%r10),%rcx
     jge 9f
-    test %rcx,%rcx                      # element-type note: an empty array takes the value's type, a different type clears it
-    jz 2f
-    cmpb $H1,L_OBJ_XT(%r10)
-    je 1f
-    movb $0,L_OBJ_XT(%r10)
-    jmp 1f
-2:  movb $H1,L_OBJ_XT(%r10)
-1:  mov L_SARRAY_ITEMS(%r10),%rax
+    cmpb $H1,L_OBJ_XT(%r10)             # only an array already noted as holding this type (the note then stays)
+    jne 9f
+    mov L_SARRAY_ITEMS(%r10),%rax
     shl $4,%rcx
     add %rcx,%rax
     movq $H1,(%rax)

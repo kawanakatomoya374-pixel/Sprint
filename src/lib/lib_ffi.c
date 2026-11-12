@@ -489,7 +489,8 @@ static int f_call(VM *vm, int argc, SpValue *argv, SpValue *ret) {
     if (argv[2].type != T_ARRAY) return vm_set_error(vm, E_TYPE, "arguments must be an array");
     Sig sig;
     if (parse_sig(vm, AS_STR(argv[1]), &sig)) return 1;
-    return do_call(vm, addr, &sig, AS_ARRAY(argv[2])->items, AS_ARRAY(argv[2])->len, ret);
+    array_unpack(vm, AS_ARRAY(argv[2]));   /* the call reads boxed values */
+    return do_call(vm, addr, &sig, array_boxed(AS_ARRAY(argv[2])), AS_ARRAY(argv[2])->len, ret);
 }
 
 /* The call itself, shared by f_call (signature parsed per call) and prepared functions (parsed once, see prep). */
@@ -804,7 +805,7 @@ static int f_asm(VM *vm, int argc, SpValue *argv, SpValue *ret) {
     else if (argv[0].type == T_ARRAY) {
         const SArray *ca = AS_ARRAY(argv[0]);
         for (int64_t i = 0; i < ca->len; i++)
-            if (ca->items[i].type != T_INT || ca->items[i].as.i < 0 || ca->items[i].as.i > 255)
+            if (array_get(ca, i).type != T_INT || array_get(ca, i).as.i < 0 || array_get(ca, i).as.i > 255)
                 return vm_set_error(vm, E_VALUE, "machine code array element %lld is not a byte (0..255)", (long long)i);
         len = (size_t)ca->len;
     } else return vm_set_error(vm, E_TYPE, "machine code must be a string or an array of bytes, not %s", type_name(argv[0]));
@@ -814,7 +815,7 @@ static int f_asm(VM *vm, int argc, SpValue *argv, SpValue *ret) {
     void *mem = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (mem == MAP_FAILED) return vm_set_error(vm, E_MEMORY, "cannot map memory for machine code");
     if (argv[0].type == T_STRING) memcpy(mem, AS_STR(argv[0])->dp, len);
-    else for (size_t i = 0; i < len; i++) ((unsigned char *)mem)[i] = (unsigned char)AS_ARRAY(argv[0])->items[i].as.i;
+    else for (size_t i = 0; i < len; i++) ((unsigned char *)mem)[i] = (unsigned char)array_get(AS_ARRAY(argv[0]), (int64_t)i).as.i;
 #if defined(__aarch64__)
     __builtin___clear_cache((char *)mem, (char *)mem + len);
 #endif

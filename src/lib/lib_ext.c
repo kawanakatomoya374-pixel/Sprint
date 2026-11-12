@@ -120,9 +120,9 @@ static int r_shuffle(VM *vm, int argc, SpValue *argv, SpValue *ret) {
     SArray *a = AS_ARRAY(argv[0]);
     for (int64_t i = a->len - 1; i >= 1; i--) {
         int64_t j = rng_int(vm, 0, i);
-        SpValue t = a->items[i];
-        a->items[i] = a->items[j];
-        a->items[j] = t;
+        const SpValue t = array_get(a, i), u = array_get(a, j);   /* swapping two elements of one array: same layout, no conversion */
+        array_set(vm, a, i, u);
+        array_set(vm, a, j, t);
     }
     return 0;
 }
@@ -132,7 +132,7 @@ static int r_choice(VM *vm, int argc, SpValue *argv, SpValue *ret) {
     SArray *a = AS_ARRAY(argv[0]);
     if (a->len == 0) return vm_set_error(vm, E_INDEX, "choice() from an empty array");
     if (rng_ready(vm)) return 1;
-    *ret = a->items[rng_int(vm, 0, a->len - 1)];
+    *ret = array_get(a, rng_int(vm, 0, a->len - 1));
     return 0;
 }
 const NativeDesc lib_random_fns[] = {
@@ -446,7 +446,7 @@ static int j_emit(VM *vm, JBuf *b, SpValue v, int indent, int depth) {
         for (int64_t i = 0; i < a->len; i++) {
             if (i) jb_put(vm, b, ",", 1);
             jb_nl(vm, b, indent, depth + 1);
-            if (j_emit(vm, b, a->items[i], indent, depth + 1)) return 1;
+            if (j_emit(vm, b, array_get(a, i), indent, depth + 1)) return 1;
         }
         jb_nl(vm, b, indent, depth);
         jb_put(vm, b, "]", 1);

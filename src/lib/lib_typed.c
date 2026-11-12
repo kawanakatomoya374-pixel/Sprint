@@ -143,7 +143,7 @@ static int make(VM *vm, TKind kind, SpValue arg, SpValue *ret) {
         TArr *t = tarr(r);
         const SArray *a = AS_ARRAY(arg);
         for (int64_t i = 0; i < n; i++)
-            if (store_el(vm, t, i, a->items[i])) return 1;
+            if (store_el(vm, t, i, array_get(a, i))) return 1;
         *ret = r;
         return 0;
     }
@@ -209,7 +209,7 @@ static int tm_to_array(VM *vm, int argc, SpValue *argv, SpValue *ret) {
     if (self_typed(vm, argv[0])) return 1;
     const TArr *t = tarr(argv[0]);
     SArray *a = vm_new_array(vm, t->len);
-    for (int64_t i = 0; i < t->len; i++) a->items[a->len++] = load_el(t, i);
+    for (int64_t i = 0; i < t->len; i++) (void)array_push(vm, a, load_el(t, i));
     *ret = v_obj(T_ARRAY, a);
     return 0;
 }
@@ -237,7 +237,7 @@ static int tm_set_from(VM *vm, int argc, SpValue *argv, SpValue *ret) {
     if (argv[1].type == T_ARRAY) {
         const SArray *a = AS_ARRAY(argv[1]);
         for (int64_t i = 0; i < n; i++)
-            if (store_el(vm, d, off + i, a->items[i])) return 1;
+            if (store_el(vm, d, off + i, array_get(a, i))) return 1;
     } else {
         const TArr *s = tarr(argv[1]);
         if (s->kind == d->kind) {

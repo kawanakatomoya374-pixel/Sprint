@@ -22,7 +22,7 @@ typedef enum {
     SP_TIR_FCMP_EQ, SP_TIR_FCMP_NE, SP_TIR_FCMP_LT, SP_TIR_FCMP_LE,
     SP_TIR_FCMP_GT, SP_TIR_FCMP_GE, SP_TIR_GUARD_TRUE,
     SP_TIR_ALOAD,   /* dst = a[b]: a is an array reference, b an index; imm = the element tag the trace was recorded with; a failed bound or tag check deoptimises */
-    SP_TIR_ASTORE,  /* a[b] = value aux (no result); the backend performs it after the iteration's last deopt point; imm == 1: an append (b is the array's length, the helper grows it) */
+    SP_TIR_ASTORE,  /* a[b] = value aux (no result); the backend performs it after the iteration's last deopt point; imm == 1: an append (b is the array's length, the helper grows it); imm == 2: into a packed array that holds the value's type */
     SP_TIR_FLOAD,   /* dst = a.slot: a is an instance reference, aux the slot, imm the field tag the trace was recorded with; a tag mismatch deoptimises */
     SP_TIR_FSTORE,  /* a.slot = value aux (no result), imm = the slot; performed after the iteration's last deopt point, like ASTORE */
     SP_TIR_NEWINST, /* dst = a fresh instance of class imm (a pointer) with its default slots; never merged or reordered */

@@ -255,7 +255,7 @@ static int deep_eq(VM *vm, SpValue a, SpValue b, int depth, int *res) {
         if (x == y) { *res = 1; return 0; }
         if (x->len != y->len) { *res = 0; return 0; }
         for (int64_t i = 0; i < x->len; i++) {
-            if (deep_eq(vm, x->items[i], y->items[i], depth + 1, res)) return 1;
+            if (deep_eq(vm, array_get(x, i), array_get(y, i), depth + 1, res)) return 1;
             if (!*res) return 0;
         }
         *res = 1;
@@ -377,7 +377,7 @@ SpValue lib_module_value(VM *vm, const char *name) {
         else if (c->kind == 1) v = v_float(c->f);
         else if (strcmp(name, "sys") == 0 && strcmp(c->name, "args") == 0) {
             SArray *a = vm_new_array(vm, vm->prog_argc);
-            for (int i = 0; i < vm->prog_argc; i++) a->items[a->len++] = vstr(vm, vm->prog_argv[i], strlen(vm->prog_argv[i]));
+            for (int i = 0; i < vm->prog_argc; i++) (void)array_push(vm, a, vstr(vm, vm->prog_argv[i], strlen(vm->prog_argv[i])));
             v = v_obj(T_ARRAY, a);
         } else if (strcmp(c->name, "platform") == 0) {
 #if defined(__linux__)

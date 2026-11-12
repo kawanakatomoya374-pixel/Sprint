@@ -155,6 +155,13 @@ static void *jit_new_inst(VM *vm, SClass *k) {
 static int g_jit_defer;       /* compile_region declined for now and wants to be asked again */
 static SpValue g_hint_int;   /* "probably an int": the guess for the result of a call */
 static SpValue g_hint_string; /* a result known to be a string; every use still has a run-time type guard */
+static SpValue g_hint_flt, g_hint_bool;
+/* a value of the type the array's first element has (hints keep only the type): its own element when boxed, a typed constant when packed */
+static const SpValue *array_hint_value(const SArray *a) {
+    if (a->len <= 0) return NULL;
+    if (!array_packed(a)) return &array_boxed(a)[0];
+    return a->h.xt == (uint8_t)T_INT ? &g_hint_int : a->h.xt == (uint8_t)T_FLOAT ? &g_hint_flt : &g_hint_bool;
+}
 static int g_jit_stats;       /* opt-in compiler-shape diagnostics; zero-cost when disabled */
 
 void jit_configure(VM *vm) {
@@ -170,6 +177,8 @@ void jit_configure(VM *vm) {
     e = getenv("SPRINT_JIT_STATS");
     g_jit_stats = e && e[0] && e[0] != '0';
     g_hint_int = v_int(0);
+    g_hint_flt = v_float(0.0);
+    g_hint_bool = v_bool(0);
     g_hint_string = v_obj(T_STRING, NULL);
     vm->jit_cur = NULL;
     vm->jit_rsp = NULL;
@@ -526,6 +535,16 @@ static int x_jx(JC *c, int cc, int xe) {
     if (!xput(c, b, 6)) return 0;
     if (!addfix(c, at, 1, xe, -4)) { c->why = "too many branches"; return 0; }
     return 1;
+}
+/* array layout guards (see SArray): cmp byte [rp + xt], tag / leave unless the array is boxed (its note is not T_BOOL, T_INT or T_FLOAT; rax is scratch) */
+static int x_xt_cmp(JC *c, int rp, int tag) {
+    const uint8_t t = (uint8_t)tag;
+    return x_mem(c, 0, 0, 0x80, -1, 7, rp, (int)offsetof(Obj, xt)) && xput(c, &t, 1);
+}
+static int x_xt_not_packed(JC *c, int rp, int xe) {
+    static const uint8_t one = 1, two = 2;
+    return x_mem(c, 0, 0, 0x0f, 0xb6, R_RAX, rp, (int)offsetof(Obj, xt)) && x_rr(c, 0, 0, 0x83, -1, 5, R_RAX) && xput(c, &one, 1) &&
+           x_rr(c, 0, 0, 0x83, -1, 7, R_RAX) && xput(c, &two, 1) && x_jx(c, 6, xe);
 }
 /* jcc rel32 to the branch target chosen by set_target (c->tk / c->tt) */
 static int x_jt(JC *c, int cc) {
@@ -1580,7 +1599,7 @@ static int do_invoke(JC *c, uint32_t pc, int len, uint32_t *skip) {
         if (!flush_from(c, c->d0, pm)) return 0;
         c->xe = gexit(c);
         if (c->xe < 0) FAIL("out of memory");
-        int32_t lo = (int32_t)offsetof(SArray, len), io = (int32_t)offsetof(SArray, items), co = (int32_t)offsetof(SArray, cap);
+        int32_t lo = (int32_t)offsetof(SArray, len), io = (int32_t)offsetof(SArray, data), co = (int32_t)offsetof(SArray, cap);
         c->h5 = co;
         if (a->kind == EK_K) EM(ST_aappend_k, soff(c, pm), roff(c, m, pm), koff(a->idx), lo, io, 0);
         else EM(ST_aappend_r, soff(c, pm), roff(c, m, pm), roff(c, a, pb), lo, io, 0);
@@ -2490,8 +2509,8 @@ static int do_for_next(JC *c, uint32_t pc, uint32_t *skip) {
     if ((c->vt[s] & 0x7f) != TY_ARR || (c->vt[s + 1] & 0x7f) != TY_INT) FAIL("for-in over a non-array");
     if (!flush_from(c, c->d0, c->dep)) return 0;
     const SpValue *hint = NULL;
-    if (c->base[s].type == T_ARRAY && AS_ARRAY(c->base[s])->len > 0) hint = &AS_ARRAY(c->base[s])->items[0];
-    int32_t lo = (int32_t)offsetof(SArray, len), io = (int32_t)offsetof(SArray, items);
+    if (c->base[s].type == T_ARRAY) hint = array_hint_value(AS_ARRAY(c->base[s]));
+    int32_t lo = (int32_t)offsetof(SArray, len), io = (int32_t)offsetof(SArray, data);
     int dl = -1;
     if (n == 1 && !fuse_store(c, pc + 8, c->dep, &dl)) return 0;
     int32_t dst = dl >= 0 ? LOFF(c, dl) : soff(c, c->dep);
@@ -2530,7 +2549,7 @@ static int jh_getidx(VM *vm, const SpValue *o, const SpValue *k, SpValue *dst) {
     case T_ARRAY: {
         const SArray *a = AS_ARRAY(*o);
         if (k->type != T_INT || k->as.i < 0 || k->as.i >= a->len) return 0;
-        r = a->items[k->as.i];
+        r = array_get(a, k->as.i);
         break;
     }
     case T_STRING: {
@@ -2600,8 +2619,7 @@ static int jh_setidx(VM *vm, const SpValue *o, const SpValue *k, const SpValue *
     if (o->type == T_ARRAY) {
         SArray *a = AS_ARRAY(*o);
         if (k->type != T_INT || k->as.i < 0 || k->as.i >= a->len) return 0;
-        array_note_store(a, *v);
-        a->items[k->as.i] = *v;
+        array_set(vm, a, k->as.i, *v);
         return 1;
     }
     if (o->type == T_NATIVE) return typed_is(*o) && typed_poke(*o, *k, *v);
@@ -2611,8 +2629,7 @@ static int jh_setidx(VM *vm, const SpValue *o, const SpValue *k, const SpValue *
 static int jh_newarr(VM *vm, const SpValue *ops, unsigned n, SpValue *dst) {
     if (vm->bytes >= vm->gc_next) vm_gc(vm);
     SArray *a = vm_new_array(vm, (int64_t)n);
-    for (unsigned i = 0; i < n; i++) a->items[i] = ops[i];
-    a->len = (int64_t)n;
+    for (unsigned i = 0; i < n; i++) (void)array_push(vm, a, ops[i]);
     *dst = v_obj(T_ARRAY, a);
     return 1;
 }
@@ -2830,9 +2847,9 @@ static int do_get_index(JC *c, uint32_t pc, int len, uint32_t *skip) {
     if (a->kind != EK_K && a->kind != EK_MOD && hint_is_container(a)) { (void)len; (void)skip; return do_get_index_h(c, pc); }
     if (a->kind == EK_K || a->kind == EK_MOD) FAIL("index of a constant");
     if (!need(c, pa, TY_ARR) || !need(c, pb, TY_INT)) FAIL("index types");
-    int32_t so = (int32_t)offsetof(SArray, len), io = (int32_t)offsetof(SArray, items);
+    int32_t so = (int32_t)offsetof(SArray, len), io = (int32_t)offsetof(SArray, data);
     const SpValue *hint = NULL;
-    if (a->hint && a->hint->type == T_ARRAY && AS_ARRAY(*a->hint)->len > 0) hint = &AS_ARRAY(*a->hint)->items[0];
+    if (a->hint && a->hint->type == T_ARRAY) hint = array_hint_value(AS_ARRAY(*a->hint));
     int ety = hint ? ty_of(hint, 0) : TY_UNK;
     int64_t kk = b->kind == EK_K ? c->kt[b->idx].as.i : 0;
     if (c->reg_on && (ety == TY_INT || ety == TY_FLT || ety == TY_ARR) && (a->kind == EK_LOC || a->kind == EK_REG) &&
@@ -2845,23 +2862,32 @@ static int do_get_index(JC *c, uint32_t pc, int len, uint32_t *skip) {
         if (ra < 0) FAIL("no register");
         if (ae.kind != EK_REG && !x_ldop(c, ra, &ae, pa)) return 0;
         int32_t ed = 0;
+        /* a packed array (the sample's layout): 8-byte payloads and the element type is the array's note; otherwise 16-byte boxed slots, and the
+         * array must not have become packed */
+        const int packed = a->hint && a->hint->type == T_ARRAY && array_packed(AS_ARRAY(*a->hint)) && (ety == TY_INT || ety == TY_FLT);
+        const int esh = packed ? 3 : 4;
         if (be.kind == EK_K) {
-            if (!x_cmpi(c, ra, so, (int32_t)kk) || !x_jx(c, 6, c->xe) || !x_ld(c, R_RAX, ra, io)) return 0;
-            ed = (int32_t)(kk * 16);
+            if (!x_cmpi(c, ra, so, (int32_t)kk) || !x_jx(c, 6, c->xe)) return 0;
+            if (packed ? !x_xt_cmp(c, ra, (int)tag_of(ety)) || !x_jx(c, 5, c->xe) : !x_xt_not_packed(c, ra, c->xe)) return 0;
+            if (!x_ld(c, R_RAX, ra, io)) return 0;
+            ed = (int32_t)(kk * (1 << esh));
         } else {
             if (be.kind == EK_REG ? !x_mov(c, R_RCX, be.idx) : !x_ldop(c, R_RCX, &be, pb)) return 0;
-            if (!x_mem(c, 0, 1, 0x3b, -1, R_RCX, ra, so) || !x_jx(c, 3, c->xe) || !x_ld(c, R_RAX, ra, io)) return 0;
-            uint8_t sh = 4;
+            if (!x_mem(c, 0, 1, 0x3b, -1, R_RCX, ra, so) || !x_jx(c, 3, c->xe)) return 0;
+            if (packed ? !x_xt_cmp(c, ra, (int)tag_of(ety)) || !x_jx(c, 5, c->xe) : !x_xt_not_packed(c, ra, c->xe)) return 0;
+            if (!x_ld(c, R_RAX, ra, io)) return 0;
+            uint8_t sh = (uint8_t)esh;
             if (!x_rr(c, 0, 1, 0xc1, -1, 4, R_RCX) || !xput(c, &sh, 1) || !x_rr(c, 0, 1, 0x03, -1, R_RAX, R_RCX)) return 0;
         }
-        if (!x_cmpi(c, R_RAX, ed, (int32_t)tag_of(ety)) || !x_jx(c, 5, c->xe)) return 0;
+        if (!packed && (!x_cmpi(c, R_RAX, ed, (int32_t)tag_of(ety)) || !x_jx(c, 5, c->xe))) return 0;
+        const int32_t po = packed ? 0 : 8;   /* where the payload sits in the element */
         int rr = ra;
         if (ety == TY_FLT) {
             rr = reg_alloc(c, 1, pa, pb);
             if (rr < 0) FAIL("no register");
-            if (!x_sd_ld(c, rr, R_RAX, ed + 8)) return 0;
+            if (!x_sd_ld(c, rr, R_RAX, ed + po)) return 0;
             reg_put(c, 0, ra);
-        } else if (!x_ld(c, ra, R_RAX, ed + 8)) return 0;
+        } else if (!x_ld(c, ra, R_RAX, ed + po)) return 0;
         if (be.kind == EK_REG) reg_put(c, 0, be.idx);
         c->dep -= 2;
         Ent *r = push(c, EK_REG, ety, rr);
@@ -2904,9 +2930,11 @@ static int do_set_index(JC *c, uint32_t pc) {
     if (a->kind != EK_K && a->kind != EK_MOD && hint_is_container(a) && a->hint->type != T_STRING) return do_set_index_h(c);
     if (a->kind == EK_K || a->kind == EK_MOD) FAIL("index of a constant");
     if (!need(c, pa, TY_ARR) || !need(c, pi, TY_INT)) FAIL("index types");
-    int32_t so = (int32_t)offsetof(SArray, len), io = (int32_t)offsetof(SArray, items);
+    int32_t so = (int32_t)offsetof(SArray, len), io = (int32_t)offsetof(SArray, data);
     int64_t kk = i->kind == EK_K ? c->kt[i->idx].as.i : 0;
-    if (c->reg_on && v->kind != EK_MOD && v->ty != TY_MOD && a->kind != EK_MOD && (i->kind != EK_K || (kk >= 0 && kk < (1 << 24)))) {
+    const int packed_set = a->hint && a->hint->type == T_ARRAY && array_packed(AS_ARRAY(*a->hint));
+    if (c->reg_on && v->kind != EK_MOD && v->ty != TY_MOD && a->kind != EK_MOD && (i->kind != EK_K || (kk >= 0 && kk < (1 << 24))) &&
+        (!packed_set || (v->kind == EK_REG && (v->ty == TY_INT || v->ty == TY_FLT)))) {
         if (!flush_from(c, c->d0, pa)) return 0;
         c->xe = gexit(c);
         if (c->xe < 0) FAIL("out of memory");
@@ -2914,24 +2942,32 @@ static int do_set_index(JC *c, uint32_t pc) {
         int rp = ae.kind == EK_REG ? ae.idx : R_RDX;
         if (ae.kind != EK_REG && !x_ld(c, R_RDX, R_R12, roff(c, &ae, pa) + 8)) return 0;
         int32_t ed = 0;
+        const int esh = packed_set ? 3 : 4;
         if (ie.kind == EK_K) {
-            if (!x_cmpi(c, rp, so, (int32_t)kk) || !x_jx(c, 6, c->xe) || !x_ld(c, R_RAX, rp, io)) return 0;
-            ed = (int32_t)(kk * 16);
+            if (!x_cmpi(c, rp, so, (int32_t)kk) || !x_jx(c, 6, c->xe)) return 0;
+            if (packed_set ? !x_xt_cmp(c, rp, (int)tag_of(ve.ty)) || !x_jx(c, 5, c->xe) : !x_xt_not_packed(c, rp, c->xe)) return 0;
+            if (!x_ld(c, R_RAX, rp, io)) return 0;
+            ed = (int32_t)(kk * (1 << esh));
         } else {
             if (ie.kind == EK_REG ? !x_mov(c, R_RCX, ie.idx) : !x_ld(c, R_RCX, R_R12, roff(c, &ie, pi) + 8)) return 0;
-            uint8_t sh = 4;
-            if (!x_mem(c, 0, 1, 0x3b, -1, R_RCX, rp, so) || !x_jx(c, 3, c->xe) || !x_ld(c, R_RAX, rp, io) ||
-                !x_rr(c, 0, 1, 0xc1, -1, 4, R_RCX) || !xput(c, &sh, 1) || !x_rr(c, 0, 1, 0x03, -1, R_RAX, R_RCX)) return 0;
+            uint8_t sh = (uint8_t)esh;
+            if (!x_mem(c, 0, 1, 0x3b, -1, R_RCX, rp, so) || !x_jx(c, 3, c->xe)) return 0;
+            if (packed_set ? !x_xt_cmp(c, rp, (int)tag_of(ve.ty)) || !x_jx(c, 5, c->xe) : !x_xt_not_packed(c, rp, c->xe)) return 0;
+            if (!x_ld(c, R_RAX, rp, io) || !x_rr(c, 0, 1, 0xc1, -1, 4, R_RCX) || !xput(c, &sh, 1) || !x_rr(c, 0, 1, 0x03, -1, R_RAX, R_RCX)) return 0;
         }
         int ok;
-        if (ve.kind == EK_REG ? !x_note_store(c, rp, (int)tag_of(ve.ty), 0, 0)
-                              : !x_note_store(c, rp, -1, ve.kind == EK_K ? R_R13 : R_R12, ve.kind == EK_K ? koff(ve.idx) : roff(c, &ve, pv))) return 0;
-        if (ve.kind == EK_REG) {
-            ok = x_sti(c, R_RAX, ed, (int32_t)tag_of(ve.ty)) && (reg_is_x(&ve) ? x_sd_st(c, R_RAX, ed + 8, ve.idx) : x_st(c, R_RAX, ed + 8, ve.idx));
+        if (packed_set) {
+            ok = reg_is_x(&ve) ? x_sd_st(c, R_RAX, ed, ve.idx) : x_st(c, R_RAX, ed, ve.idx);
         } else {
-            int base = ve.kind == EK_K ? R_R13 : R_R12;
-            int32_t o = ve.kind == EK_K ? koff(ve.idx) : roff(c, &ve, pv);
-            ok = x_ld(c, R_RCX, base, o) && x_ld(c, R_RDX, base, o + 8) && x_st(c, R_RAX, ed, R_RCX) && x_st(c, R_RAX, ed + 8, R_RDX);
+            if (ve.kind == EK_REG ? !x_note_store(c, rp, (int)tag_of(ve.ty), 0, 0)
+                                  : !x_note_store(c, rp, -1, ve.kind == EK_K ? R_R13 : R_R12, ve.kind == EK_K ? koff(ve.idx) : roff(c, &ve, pv))) return 0;
+            if (ve.kind == EK_REG) {
+                ok = x_sti(c, R_RAX, ed, (int32_t)tag_of(ve.ty)) && (reg_is_x(&ve) ? x_sd_st(c, R_RAX, ed + 8, ve.idx) : x_st(c, R_RAX, ed + 8, ve.idx));
+            } else {
+                int base = ve.kind == EK_K ? R_R13 : R_R12;
+                int32_t o = ve.kind == EK_K ? koff(ve.idx) : roff(c, &ve, pv);
+                ok = x_ld(c, R_RCX, base, o) && x_ld(c, R_RDX, base, o + 8) && x_st(c, R_RAX, ed, R_RCX) && x_st(c, R_RAX, ed + 8, R_RDX);
+            }
         }
         if (!ok) return 0;
         if (ae.kind == EK_REG) reg_put(c, 0, ae.idx);

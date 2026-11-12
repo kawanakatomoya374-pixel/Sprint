@@ -92,7 +92,7 @@ void fmt_value(VM *vm, SpValue v, int depth, int repr, Out *o) {
         out_put(o, "[", 1);
         for (int64_t i = 0; i < a->len; i++) {
             if (i) out_put(o, ", ", 2);
-            fmt_value(vm, a->items[i], depth + 1, 1, o);
+            fmt_value(vm, array_get(a, i), depth + 1, 1, o);
         }
         out_put(o, "]", 1);
         break;
