@@ -503,9 +503,12 @@ static RunStatus RUN_LOOP_NAME(VM *vm, VMTraceCapture **capp, RunCold *ccold, in
             unsigned n = U16();
             GCP();
             STable *t = vm_new_table(vm, (int64_t)n);
-            for (unsigned i = 0; i < n; i++) {
-                SpValue *kv = sp - 2 * (int)n + 2 * (int)i;
-                if (table_set(vm, t, kv[0], kv[1])) RAISE();
+            if (table_init_small(t, sp - 2 * (int)n, n)) {   /* nil / float keys, big literals: the general path */
+                t->nent = 0; t->count = 0;
+                for (unsigned i = 0; i < n; i++) {
+                    SpValue *kv = sp - 2 * (int)n + 2 * (int)i;
+                    if (table_set(vm, t, kv[0], kv[1])) RAISE();
+                }
             }
             sp -= 2 * n;
             PUSH(v_obj(T_TABLE, t));

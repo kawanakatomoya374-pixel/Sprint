@@ -1927,6 +1927,37 @@ ST tr_ccall
     pop %rcx
     pop %rax
 
+# arr.append from a trace, the common case: room in the array. r10 = the array, the payload is in the frame scratch slot at byte offset H0 (r12-relative),
+# H1 = the element type tag. r10d = 1 when the element was appended; 0 when the array is full (the caller then runs the helper). rax and rcx are saved.
+ST tr_append_fast
+    push %rax
+    push %rcx
+    mov L_SARRAY_LEN(%r10),%rcx
+    cmp L_SARRAY_CAP(%r10),%rcx
+    jge 9f
+    test %rcx,%rcx                      # element-type note: an empty array takes the value's type, a different type clears it
+    jz 2f
+    cmpb $H1,L_OBJ_XT(%r10)
+    je 1f
+    movb $0,L_OBJ_XT(%r10)
+    jmp 1f
+2:  movb $H1,L_OBJ_XT(%r10)
+1:  mov L_SARRAY_ITEMS(%r10),%rax
+    shl $4,%rcx
+    add %rcx,%rax
+    movq $H1,(%rax)
+    mov H0+8(%r12),%rcx
+    mov %rcx,8(%rax)
+    incq L_SARRAY_LEN(%r10)
+    pop %rcx
+    pop %rax
+    mov $1,%r10d
+    jmp 8f
+9:  pop %rcx
+    pop %rax
+    xor %r10d,%r10d
+8:
+
 ST tr_f64_binop
     .byte 0xf2, 0x0f, HB0, 0xc1
 

@@ -25,6 +25,7 @@
 #define L_SINST_CLS 16
 #define L_SINST_SLOTS 32
 #define L_SARRAY_LEN 16
+#define L_SARRAY_CAP 24
 #define L_SARRAY_ITEMS 32
 #define L_SSTR_LEN 16
 #define L_SSTR_DP 24

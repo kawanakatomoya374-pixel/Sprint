@@ -769,8 +769,21 @@ static int ta_emit_pending_stores(const SpTraceIR *ir, const uint8_t *regs, cons
         }
         if (st->imm == 1U) {   /* an append: the array and the payload go to two scratch slots, the helper does the rest */
             if (!ta_store_tag(ir, st, &tag) || regs[st->a] >= 16U || (regs[st->aux] >= 16U && !ta_isx(regs[st->aux])) ||
-                !ta_local_store_reg(a, scratch, regs[st->a]) || !ta_local_store_reg(a, scratch + 1U, regs[st->aux]) ||
-                !ta_ccall(a, (uint64_t)(uintptr_t)&trace_arr_append, scratch, tag) || !ta_reg_test(a, 10U) || !ta_jcc(a, 0x84U, TA_DEOPT)) return 0;
+                !ta_local_store_reg(a, scratch, regs[st->a]) || !ta_local_store_reg(a, scratch + 1U, regs[st->aux])) return 0;
+            {   /* room in the array: appended inline; otherwise (r10d == 0) the helper grows it */
+                TracePatch fp = ta_patch();
+                size_t at;
+                fp.h[0] = (int32_t)((scratch + 1U) * 16U);
+                fp.h[1] = (int32_t)tag;
+                if (!ta_reg_mov(a, 10U, regs[st->a]) || !ta_stencil(a, ST_tr_append_fast, &fp) || !ta_reg_test(a, 10U) ||
+                    a->len + 6U > sizeof a->bytes) return 0;
+                a->bytes[a->len] = 0x0fU; a->bytes[a->len + 1U] = 0x85U;   /* jnz over the helper call */
+                at = a->len + 2U;
+                memset(&a->bytes[at], 0, 4U);
+                a->len += 6U;
+                if (!ta_ccall(a, (uint64_t)(uintptr_t)&trace_arr_append, scratch, tag)) return 0;
+                { const int32_t d = (int32_t)(a->len - (at + 4U)); memcpy(&a->bytes[at], &d, sizeof d); }
+            }
             continue;
         }
         if ((regs[st->aux] >= 16U && !ta_isx(regs[st->aux])) || !ta_store_tag(ir, st, &tag) || !ta_note_store(a, regs[st->a], tag) ||

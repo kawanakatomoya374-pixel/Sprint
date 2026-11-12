@@ -53,14 +53,20 @@ static int norm_key(VM *vm, SpValue *k) {
     return 0;
 }
 
+static void t_rebuild(VM *vm, STable *t, int64_t newcap);
 STable *vm_new_table(VM *vm, int64_t cap) {
     STable *t = new_obj(vm, sizeof *t, T_TABLE, 1);
-    if (cap > 0) table_reserve(vm, t, cap);
+    if (cap > 0) t_rebuild(vm, t, cap);   /* exactly the entries a literal holds */
     return t;
 }
 
+/* A table of at most TABLE_SMALL entries has no hash index: its entries are scanned (cheaper than hashing, and the index array is saved) */
+#define TABLE_SMALL 8
 static int64_t t_find(const STable *t, SpValue k, uint64_t h, int64_t *slot_out) {
-    if (!t->idx) return -1;
+    if (!t->idx) {
+        for (int64_t e = 0; e < t->nent; e++) if (key_eq(t->ents[e].key, k)) return e;
+        return -1;
+    }
     uint64_t mask = (uint64_t)t->idxcap - 1;
     uint64_t i = h & mask;
     for (;;) {
@@ -81,7 +87,15 @@ static int64_t t_find_sstr(const STable *t, const SString *key, uint32_t h32,
                            int64_t *slot_out, uint64_t *hash_out) {
     uint64_t h = mix64(h32);
     if (hash_out) *hash_out = h;
-    if (!t->idx) return -1;
+    if (!t->idx) {
+        for (int64_t e = 0; e < t->nent; e++) {
+            const TEntry *te = &t->ents[e];
+            if (te->key.type != T_STRING) continue;
+            const SString *ks = AS_STR(te->key);
+            if (ks == key || ((ks->hash == h32 || !ks->hash) && ks->len == key->len && memcmp(ks->dp, key->dp, key->len) == 0)) return e;
+        }
+        return -1;
+    }
     uint64_t mask = (uint64_t)t->idxcap - 1;
     uint64_t i = h & mask;
     for (;;) {
@@ -105,7 +119,10 @@ static int64_t t_find_sstr(const STable *t, const SString *key, uint32_t h32,
 
 /* lookup of an integer key: no generic equality call */
 static inline int64_t t_find_int(const STable *t, int64_t k, uint64_t h, int64_t *slot_out) {
-    if (!t->idx) return -1;
+    if (!t->idx) {
+        for (int64_t e = 0; e < t->nent; e++) if (t->ents[e].key.type == T_INT && t->ents[e].key.as.i == k) return e;
+        return -1;
+    }
     const uint64_t mask = (uint64_t)t->idxcap - 1;
     uint64_t i = h & mask;
     for (;;) {
@@ -135,22 +152,30 @@ static void t_idx_insert(STable *t, int32_t e) {
 
 static void t_rebuild(VM *vm, STable *t, int64_t newcap) {
     if ((uint64_t)newcap > vm->lim.max_table_entries) vm_fatal(vm, RS_MEMORY, "table size limit exceeded");
-    int64_t icap = 8;
-    while (icap < newcap * 2) icap <<= 1;
-    TEntry *ne = vm_mem(vm, NULL, 0, (size_t)newcap * sizeof(TEntry));
-    int32_t *ni = vm_mem(vm, NULL, 0, (size_t)icap * sizeof(int32_t));
+    int64_t icap = 0;
+    if (newcap > TABLE_SMALL) { icap = 8; while (icap < newcap * 2) icap <<= 1; }
+    int32_t *ni = icap ? vm_mem(vm, NULL, 0, (size_t)icap * sizeof(int32_t)) : NULL;
     int64_t n = 0;
-    for (int64_t i = 0; i < t->nent; i++)
-        if (t->ents[i].key.type != T_NIL) ne[n++] = t->ents[i];
-    if (t->ents) vm_mem(vm, t->ents, (size_t)t->cap * sizeof(TEntry), 0);
+    if (t->ents && t->nent == t->count && newcap >= t->cap) {
+        /* no dead entries: grow the entry array where it is (no second copy of a big table alive at once) */
+        t->ents = vm_mem(vm, t->ents, (size_t)t->cap * sizeof(TEntry), (size_t)newcap * sizeof(TEntry));
+        n = t->nent;
+    } else {
+        TEntry *ne = vm_mem(vm, NULL, 0, (size_t)newcap * sizeof(TEntry));
+        for (int64_t i = 0; i < t->nent; i++)
+            if (t->ents[i].key.type != T_NIL) ne[n++] = t->ents[i];
+        if (t->ents) vm_mem(vm, t->ents, (size_t)t->cap * sizeof(TEntry), 0);
+        t->ents = ne;
+    }
     if (t->idx) vm_mem(vm, t->idx, (size_t)t->idxcap * sizeof(int32_t), 0);
-    t->ents = ne;
     t->cap = newcap;
     t->nent = n;
     t->idx = ni;
     t->idxcap = icap;
-    for (int64_t i = 0; i < icap; i++) ni[i] = -1;
-    for (int64_t i = 0; i < n; i++) t_idx_insert(t, (int32_t)i);
+    if (ni) {
+        for (int64_t i = 0; i < icap; i++) ni[i] = -1;
+        for (int64_t i = 0; i < n; i++) t_idx_insert(t, (int32_t)i);
+    }
 }
 
 int table_reserve(VM *vm, STable *t, int64_t n) {
@@ -190,7 +215,13 @@ int64_t table_find_sstr(const STable *t, const SString *key) {
     return t_find_sstr(t, key, str_hash_peek(key), NULL, NULL);
 }
 int table_get_str(STable *t, const char *s, size_t len, SpValue *out) {
-    if (!t->idx) return 0;
+    if (!t->idx) {
+        for (int64_t e = 0; e < t->nent; e++) {
+            SpValue k = t->ents[e].key;
+            if (k.type == T_STRING && AS_STR(k)->len == len && memcmp(AS_STR(k)->dp, s, len) == 0) { if (out) *out = t->ents[e].val; return 1; }
+        }
+        return 0;
+    }
     uint32_t h32 = str_hash_calc(s, len);
     uint64_t h = mix64(h32);
     uint64_t mask = (uint64_t)t->idxcap - 1;
@@ -230,7 +261,7 @@ int table_set(VM *vm, STable *t, SpValue key, SpValue val) {
         if (e >= 0) {
             t->ents[e].key = v_nil();
             t->ents[e].val = v_nil();
-            t->idx[slot] = -2;
+            if (t->idx) t->idx[slot] = -2;
             t->count--;
             t->version++;
         }
@@ -243,10 +274,36 @@ int table_set(VM *vm, STable *t, SpValue key, SpValue val) {
     }
     t->ents[t->nent].key = key;
     t->ents[t->nent].val = val;
-    t_idx_insert_h(t, (int32_t)t->nent, h);
+    if (t->idx) t_idx_insert_h(t, (int32_t)t->nent, h);
     t->nent++;
     t->count++;
     t->version++;
+    return 0;
+}
+
+/* the pairs of a table literal (n <= TABLE_SMALL, a fresh table of capacity n): entries are appended directly, a repeated key overwrites
+ * the earlier value. Returns 1 when a key needs the general path (nil, a float), 0 when done. */
+int table_init_small(STable *t, const SpValue *kv, unsigned n) {
+    if (n > TABLE_SMALL || t->idx != NULL || t->cap < (int64_t)n || t->nent != 0) return 1;
+    for (unsigned i = 0; i < n; i++) {
+        const SpValue k = kv[2 * i], v = kv[2 * i + 1];
+        int64_t e;
+        if (k.type == T_NIL || k.type == T_FLOAT || v.type == T_NIL) return 1;
+        for (e = 0; e < t->nent; e++) {
+            const SpValue ek = t->ents[e].key;
+            if (ek.type != k.type) continue;
+            if (k.type == T_STRING) {
+                const SString *x = AS_STR(ek), *y = AS_STR(k);
+                if (x == y || (x->len == y->len && memcmp(x->dp, y->dp, x->len) == 0)) break;
+            } else if (key_eq(ek, k)) break;
+        }
+        if (e < t->nent) { t->ents[e].val = v; continue; }
+        t->ents[t->nent].key = k;
+        t->ents[t->nent].val = v;
+        t->nent++;
+        t->count++;
+        t->version++;
+    }
     return 0;
 }
 

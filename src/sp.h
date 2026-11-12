@@ -806,6 +806,7 @@ SpValue vm_perm_string(VM *vm, const char *s, size_t len);
 int table_get(VM *vm, STable *t, SpValue key, SpValue *out, int *found);
 SString *vm_concat_fast(VM *vm, const SpValue *ops, unsigned n); /* strings and ints only, NULL otherwise */
 int table_set(VM *vm, STable *t, SpValue key, SpValue val); /* nil val deletes */
+int table_init_small(STable *t, const SpValue *kv, unsigned n); /* table literal fast path; returns 1 if the general path is needed */
 int table_get_str(STable *t, const char *s, size_t len, SpValue *out);
 SNativeObj *vm_new_native_obj(VM *vm, const NativeClass *cls, size_t size);
 int lib_fs_check(VM *vm, SpValue pv, int write, const char *op, char *out);

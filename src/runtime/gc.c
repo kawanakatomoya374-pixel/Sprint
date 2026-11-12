@@ -291,7 +291,9 @@ void vm_gc(VM *vm) {
         }
     }
     size_t live = vm->bytes;
-    size_t next = live > SIZE_MAX / 3U ? SIZE_MAX : live * 3U;
+    static int factor = -1;
+    if (factor < 0) { const char *e = getenv("SPRINT_GC_FACTOR"); factor = e && e[0] >= '1' && e[0] <= '9' ? e[0] - '0' : 2; }
+    size_t next = live > SIZE_MAX / (size_t)factor ? SIZE_MAX : live * (size_t)factor;
     if (next < ((size_t)1U << 20U)) next = (size_t)1U << 20U;
     if (vm->lim.max_heap_bytes != 0U && next > vm->lim.max_heap_bytes)
         next = vm->lim.max_heap_bytes;
