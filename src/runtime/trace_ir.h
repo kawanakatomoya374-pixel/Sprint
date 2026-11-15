@@ -71,6 +71,7 @@ int sp_tir_emit_phi(SpTraceIR *ir, SpTIRType type, SpTIRValue entry, SpTIRValue 
 int sp_tir_set_phi_backedge(SpTraceIR *ir, SpTIRValue phi, SpTIRValue backedge);
 int sp_tir_emit_binary(SpTraceIR *ir, SpTIROp op, SpTIRValue a, SpTIRValue b, SpTIRValue *out);
 int sp_tir_emit_unary(SpTraceIR *ir, SpTIROp op, SpTIRValue a, SpTIRValue *out);
+int sp_tir_emit_neguard(SpTraceIR *ir, SpTIRValue a, SpTIRValue b);
 int sp_tir_emit_alen(SpTraceIR *ir, SpTIRValue array, SpTIRValue *out);
 int sp_tir_emit_aappend(SpTraceIR *ir, SpTIRValue array, SpTIRValue len, SpTIRValue value);
 int sp_tir_emit_fcall(SpTraceIR *ir, SpTIROp op, uint64_t fn, unsigned aux, SpTIRValue a, SpTIRValue *out);

@@ -585,6 +585,12 @@ int sp_tir_emit_rguard(SpTraceIR *ir, SpTIRValue ref, uint64_t ptr) {
     if (!tir_value_type(ir, ref, &t) || t != SP_TIR_T_REF) return 0;
     return tir_append(ir, SP_TIR_CGUARD, SP_TIR_T_REF, ref, SP_TIR_NO_VALUE, 1U, ptr, 0, NULL);
 }
+/* deoptimise unless references a and b differ (two objects the trace treats as distinct: their fields cannot alias) */
+int sp_tir_emit_neguard(SpTraceIR *ir, SpTIRValue a, SpTIRValue b) {
+    SpTIRType ta, tb;
+    if (!tir_value_type(ir, a, &ta) || ta != SP_TIR_T_REF || !tir_value_type(ir, b, &tb) || tb != SP_TIR_T_REF) return 0;
+    return tir_append(ir, SP_TIR_CGUARD, SP_TIR_T_REF, a, b, 5U, 0U, 0, NULL);
+}
 int sp_tir_emit_cguard(SpTraceIR *ir, SpTIRValue object, uint64_t cls) {
     SpTIRType t;
     if (!tir_value_type(ir, object, &t) || t != SP_TIR_T_REF) return 0;
@@ -891,7 +897,8 @@ int sp_tir_verify(const SpTraceIR *ir, char *message, size_t message_size) {
             break;
         case SP_TIR_CGUARD:
             if (!tir_value_defined_before(defs, in->a, i, (size_t)ir->nvalues) || types[in->a] != (in->aux == 3U ? SP_TIR_T_I64 : SP_TIR_T_REF) ||
-                (in->aux == 2U && (!tir_value_defined_before(defs, in->b, i, (size_t)ir->nvalues) || types[in->b] != SP_TIR_T_I64))) {
+                (in->aux == 2U && (!tir_value_defined_before(defs, in->b, i, (size_t)ir->nvalues) || types[in->b] != SP_TIR_T_I64)) ||
+                (in->aux == 5U && (!tir_value_defined_before(defs, in->b, i, (size_t)ir->nvalues) || types[in->b] != SP_TIR_T_REF))) {
                 tir_error(message, message_size, "invalid class guard operand");
                 goto done;
             }
