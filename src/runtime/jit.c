@@ -3498,6 +3498,26 @@ static int walk(JC *c) {
             continue;
         }
         c->cur_pc = pc;
+        if (!c->unit && c->cur_ic == 0 && c->nbridge > 0) {
+            /* the header of a traced inner loop: run its trace here, the body is never compiled (it may not even be compilable: the trace
+             * handles what the region cannot). When no trace runs, or it leaves at the header, the interpreter takes the loop from here. */
+            int hit = -1;
+            for (int bi = 0; bi < c->nbridge; bi++)
+                if (c->bridge[bi].hdr == pc && c->bridge[bi].exit > pc && c->bridge[bi].exit < c->end && c->lmap[c->bridge[bi].exit - c->hdr] >= 0) hit = bi;
+            if (hit >= 0) {
+                const uint32_t bexit = c->bridge[hit].exit;
+                if (!flush_regs(c) || !flush_from(c, c->d0, c->dep)) return 0;
+                int bx = exit_for(c, UINT32_MAX, c->dep);
+                if (bx < 0 || !set_target(c, bexit, pc, 0)) FAIL("traced inner loop");
+                c->xe = bx;
+                EM(ST_htrace, (int32_t)pc, c->dep, (int32_t)bexit, 0, 0, (uint64_t)(uintptr_t)jh_trace);
+                c->rax_off = -1; c->xmm_off = -1; c->skip1 = 0; c->skipx = 0;
+                if (!do_exit_here(c)) return 0;
+                reach = 0;
+                pc = bexit;
+                continue;
+            }
+        }
         uint32_t skip = 0;
         int ok = 1;
         if ((jit_ra_mask(&c->gpr_bank) != 0U || jit_ra_mask(&c->xmm_bank) != 0U) &&
