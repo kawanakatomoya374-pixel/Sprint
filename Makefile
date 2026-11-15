@@ -350,10 +350,10 @@ test-trace-side: $(BUILD)/sprint
 	@test $$(grep -c 'trace-jit: side-compiled' $(BUILD)/trace-side.log) -ge 3
 	@grep -q 'trace-jit: side-hit linked_side@69' $(BUILD)/trace-side.log
 	@grep -q 'trace-jit: side-record-request ref_loop@' $(BUILD)/trace-side.log
-	@test $$(grep -c 'trace-jit: side-compiled ref_loop@' $(BUILD)/trace-side.log) -eq 4
+	@test $$(grep -c 'trace-jit: side-compiled ref_loop@' $(BUILD)/trace-side.log) -eq 5
 	@grep -q 'trace-jit: side-compiled ref_loop@.*depth=1 ' $(BUILD)/trace-side.log
 	@grep -q 'trace-jit: side-compiled ref_loop@.*depth=2 ' $(BUILD)/trace-side.log
-	@test $$(grep -c 'trace-jit: side-compiled ref_loop@.*depth=3 ' $(BUILD)/trace-side.log) -eq 2
+	@test $$(grep -c 'trace-jit: side-compiled ref_loop@.*depth=3 ' $(BUILD)/trace-side.log) -eq 1
 	@grep -q 'trace-jit: side-record-request ref_loop@.*depth=2 ' $(BUILD)/trace-side.log
 	@grep -q 'trace-jit: side-hit ref_loop@' $(BUILD)/trace-side.log
 	@tail -n 18 $(BUILD)/trace-side.log > $(BUILD)/trace-side.out

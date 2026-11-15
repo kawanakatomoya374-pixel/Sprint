@@ -29,8 +29,8 @@ enum {
     TRACE_CACHE_MAX_REGIONS = SP_JIT_SNAPSHOT_SLOT_COUNT,
     TRACE_CACHE_MAX_BYTES = 1 << 20,
     TRACE_INDEX_CAP = 128,
-    TRACE_SIDE_MAX = 4,
-    TRACE_SIDE_DEPTH_MAX = 3,
+    TRACE_SIDE_MAX = 12,
+    TRACE_SIDE_DEPTH_MAX = 8,
     TRACE_SIDE_ATTEMPT_MAX = 8
 };
 
@@ -3437,9 +3437,14 @@ walked:
             break;
         }
         case OP_RETURN_NIL:
-            /* only a constructor can end this way: the call's value is the new instance */
-            if (blvl == 0U || fctor[blvl] == 0U || depth != fbase[blvl]) goto done;
-            stack[depth++] = fctor[blvl];
+            /* a constructor's value is the new instance; any other function returns nil, which is only allowed when the caller pops it */
+            if (blvl == 0U || depth != fbase[blvl]) goto done;
+            if (fctor[blvl] != 0U) {
+                stack[depth++] = fctor[blvl];
+            } else {
+                if (i + 1U >= np || path[i + 1U].op != OP_POP || !sp_tir_emit_const_i64(ir, 0, &r)) { why = "return nil that is used"; goto done; }
+                stack[depth++] = r;
+            }
             blvl--;
             break;
         case OP_RETURN:
@@ -3993,7 +3998,7 @@ int jit_trace_site(VM *vm, Proto *p, const uint8_t *hdr, SpValue *base, SpValue 
     if (snapshot_kind == SP_JIT_SNAPSHOT_DEOPT) {
         TraceRegion *rt = trace_root_region(owner);
         /* while path variants can still be recorded the deopts are the loop's way of asking for them: not yet counted against the trace */
-        if (rt != NULL && (trace_variant_head(owner)->vtries >= 3U || trace_variant_tail(trace_variant_head(owner))->depth >= TRACE_SIDE_DEPTH_MAX || rt->dead)) {
+        if (rt != NULL && (trace_variant_head(owner)->vtries >= 7U || trace_variant_tail(trace_variant_head(owner))->depth >= TRACE_SIDE_DEPTH_MAX || rt->dead)) {
             rt->deopts++;
             rt->deopt_iters += budget_before >= vm->ileft ? budget_before - vm->ileft : 0U;
             if (rt->deopts >= (uint64_t)TRACE_DEOPT_MIN && rt->deopt_iters < rt->deopts * (uint64_t)TRACE_DEOPT_ITERS) {
@@ -4042,7 +4047,7 @@ int jit_trace_site(VM *vm, Proto *p, const uint8_t *hdr, SpValue *base, SpValue 
     if (snapshot_kind == SP_JIT_SNAPSHOT_DEOPT && owner != NULL && side_parent_slot_out != NULL) {
         TraceRegion *head = trace_variant_head(owner), *tail = trace_variant_tail(head), *vroot = trace_root_region(owner);
         /* low progress since entry: the chain went round without finding a path that fits (a long run of matching paths ends in hops==0 too) */
-        if (budget_before - vm->ileft < 32U && !head->dead && vroot != NULL && !vroot->dead && tail->depth < TRACE_SIDE_DEPTH_MAX && head->vtries < 3U &&
+        if ((budget_before - vm->ileft < 32U || (vm->trace_hops < 256U && budget_before - vm->ileft < (256U - vm->trace_hops) * 6U)) && !head->dead && vroot != NULL && !vroot->dead && tail->depth < TRACE_SIDE_DEPTH_MAX && head->vtries < 7U &&
             trace_side_total(vroot) < TRACE_SIDE_MAX && ++head->vdeopts >= 2U) {
             /* the loop keeps leaving the chain of its traces by a guard: record the path it takes now as one more variant */
             head->vdeopts = 0U; head->vtries++; tail->variant_pending = 1U;
