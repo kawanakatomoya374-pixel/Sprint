@@ -3788,6 +3788,11 @@ int jit_trace_compile(VM *vm, Proto *p, uint32_t header, const TraceStep *steps,
             goto done; }
     (void)frame_size;
     if (as->len == 0U || as->len > sizeof as->bytes) { fail_reason = "invalid native trace size"; goto done; }
+    {   /* developer aid: SPRINT_TRACE_JIT_DUMP=file appends every compiled trace's bytes (objdump -D -b binary -mi386:x86-64 -M intel) */
+        const char *dump = getenv("SPRINT_TRACE_JIT_DUMP");
+        FILE *df = dump ? fopen(dump, "ab") : NULL;
+        if (df) { (void)fwrite(as->bytes, 1, as->len, df); (void)fclose(df); }
+    }
     mem = jit_code_publish(as->bytes, as->len, &map_size);
     if (!mem) { fail_reason = "code publication failed"; goto done; }
     if (tr->snapshot_set.bytes < sizeof tr->snapshot_set ||

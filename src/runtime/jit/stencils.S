@@ -2246,9 +2246,9 @@ ST tr_return
 ST tr_touch
     movabs $HQ,%r10
     mov 16(%r10),%r11
-    lock incq (%r11)
+    incq (%r11)                         # the clock and the timestamp belong to one VM, which runs on one thread: no atomic operation (lock / xchg cost ~20 cycles each)
     mov (%r11),%r11
-    xchg %r11,8(%r10)
+    mov %r11,8(%r10)
 
 # Trace exit with an optional native tail link.  The link target has the same
 # TraceEntry ABI; unwind this trace frame before entering it so linked traces
@@ -2256,9 +2256,9 @@ ST tr_touch
 ST tr_exit
     movabs $HQ,%r10
     mov 16(%r10),%r11
-    lock incq (%r11)
+    incq (%r11)                         # the clock and the timestamp belong to one VM, which runs on one thread: no atomic operation (lock / xchg cost ~20 cycles each)
     mov (%r11),%r11
-    xchg %r11,8(%r10)
+    mov %r11,8(%r10)
     mov (%r10),%r10
     test %r10,%r10
     jz 1f
