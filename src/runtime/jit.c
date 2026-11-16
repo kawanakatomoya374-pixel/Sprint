@@ -280,6 +280,7 @@ typedef struct {
     const SClass **vk;                   /* class of a variable whose type is TY_INST (fixed once chosen) */
     uint8_t *lt, *lvalid;                /* per-leader variable states */
     uint8_t *ldep;                       /* per-leader stack depth above d0 (0xff: not yet known); the values are in memory at a join */
+    const SpValue **lhint;               /* per-leader hints of the stack entries (LH_MAX deep): kept when every edge into the join agrees on the type */
     int *lmap, nl;                       /* pc - hdr -> leader index or -1 */
     uint8_t *isins;                      /* pc - hdr -> instruction start */
     uint8_t *rnext_unit;                 /* per RANGE_NEXT: proved constant positive unit step during this walk */
@@ -782,6 +783,7 @@ static int num_types(JC *c, int pa, int pb) {
 
 /* ---- leader states ---- */
 static uint8_t *lstate(JC *c, int li) { return c->lt + (size_t)li * (size_t)c->nvars; }
+enum { LH_MAX = 8 };
 
 static int merge_to(JC *c, uint32_t tpc) {
     int li = c->lmap[tpc - c->hdr];
@@ -791,6 +793,14 @@ static int merge_to(JC *c, uint32_t tpc) {
         if (c->st[i].kind != EK_MEM) { c->why = "pending value at a join"; return 0; }
     if (c->ldep[li] == 0xff) c->ldep[li] = (uint8_t)depth;
     else if (c->ldep[li] != depth) { c->why = "stack depth differs at a join"; return 0; }
+    {   /* what the stack entries were seen to hold survives the join when every edge into it agrees (a dict receiver stays a dict) */
+        const SpValue **dh = c->lhint + (size_t)li * LH_MAX;
+        for (int k = 0; k < depth && k < LH_MAX; k++) {
+            const SpValue *h = c->st[c->d0 + k].hint;
+            if (!c->lvalid[li]) dh[k] = h;
+            else if (dh[k] && (!h || h->type != dh[k]->type)) { dh[k] = NULL; c->changed = 1; }
+        }
+    }
     uint8_t *d = lstate(c, li);
     if (!c->lvalid[li]) {
         memcpy(d, c->vt, (size_t)c->nvars);
@@ -3592,7 +3602,12 @@ static int walk(JC *c) {
             c->rax_off = -1;
             c->xmm_off = -1;
             c->dep = c->d0;
-            for (int k = 0; k < c->ldep[li]; k++) { Ent *je = push(c, EK_MEM, TY_UNK, 0); if (!je) return 0; je->ppc = pc; }
+            for (int k = 0; k < c->ldep[li]; k++) {
+                Ent *je = push(c, EK_MEM, TY_UNK, 0);
+                if (!je) return 0;
+                je->ppc = pc;
+                if (k < LH_MAX) je->hint = c->lhint[(size_t)li * LH_MAX + (size_t)k];
+            }
             jit_ra_reset(&c->gpr_bank); jit_ra_reset(&c->xmm_bank); c->nlc = 0;
             reach = 1;
             c->pcaddr[pc - c->hdr] = (uint32_t)c->cn;
@@ -3771,7 +3786,7 @@ static int op_allowed(int op, int unit) {
 }
 
 static void jc_free(JC *c) {
-    free(c->vt); free(c->vk); free(c->vlive); free(c->lt); free(c->lvalid); free(c->ldep); free(c->lmap); free(c->isins); free(c->rnext_unit); free(c->st);
+    free(c->vt); free(c->vk); free(c->vlive); free(c->lt); free(c->lhint); free(c->lvalid); free(c->ldep); free(c->lmap); free(c->isins); free(c->rnext_unit); free(c->st);
     free(c->lrd); free(c->cb); free(c->fx); free(c->pcaddr); free(c->ex); free(c->kt); free(c->ic);
     pics_free(c->pics, c->npics);
 }
@@ -3898,10 +3913,11 @@ static int compile_region(VM *vm, Proto *p, JRegion *r, SFunc *fn, SpValue *base
     c->vlive = calloc((size_t)c->nvars, 1);
     c->vk = calloc((size_t)c->nvars, sizeof *c->vk);
     c->lt = calloc((size_t)c->nl * (size_t)c->nvars, 1);
+    c->lhint = calloc((size_t)(c->nl > 0 ? c->nl : 1) * LH_MAX, sizeof *c->lhint);
     c->lvalid = calloc((size_t)c->nl, 1);
     c->ldep = malloc((size_t)c->nl);
     if (c->ldep) memset(c->ldep, 0xff, (size_t)c->nl);
-    if (!c->vt || !c->vlive || !c->vk || !c->lt || !c->lvalid || !c->ldep) { c->why = "out of memory"; goto done; }
+    if (!c->vt || !c->vlive || !c->vk || !c->lt || !c->lhint || !c->lvalid || !c->ldep) { c->why = "out of memory"; goto done; }
     for (int i = 0; i < c->nloc; i++) {
         if (c->unit && i >= p->nparams) { lstate(c, 0)[i] = TY_UNK; continue; }
         if (base[i].type == T_INSTANCE) { lstate(c, 0)[i] = TY_INST; c->vk[i] = AS_INSTANCE(base[i])->cls; continue; }
