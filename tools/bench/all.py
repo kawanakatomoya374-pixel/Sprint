@@ -11,6 +11,18 @@ ap.add_argument("names", nargs="*")
 a = ap.parse_args()
 d = os.path.dirname(os.path.abspath(__file__))
 names = a.names or sorted(os.path.basename(f)[:-3] for f in glob.glob(d + "/*.sp") if os.path.exists(d + "/lua/" + os.path.basename(f)[:-3] + ".lua"))
+def same(x, y):
+    """token-wise equality; numbers compare with relative tolerance 1e-9 (17 vs 14 printed digits, 87991000.0 vs 87991000)"""
+    xs, ys = x.split(), y.split()
+    if len(xs) != len(ys): return False
+    for p, q in zip(xs, ys):
+        if p == q: continue
+        try:
+            u, v = float(p), float(q)
+        except ValueError:
+            return False
+        if abs(u - v) > 1e-9 * max(abs(u), abs(v), 1.0): return False
+    return True
 def run(cmd):
     best, out = None, ""
     for _ in range(a.n):
@@ -27,11 +39,11 @@ rows = []
 for n in names:
     lj = d + "/lua/" + n + ".luajit.lua"
     if not os.path.exists(lj): lj = d + "/lua/" + n + ".lua"
-    ts, os_ = run([a.s, "run", d + "/" + n + ".sp"])
+    ts, os_ = run([a.s, "run", "--allow-ffi", d + "/" + n + ".sp"])
     tl, ol = run(["luajit", lj])
     if ts is None or tl is None:
         rows.append((n, ts or 0, tl or 0, 0, "TIMEOUT")); continue
-    ok = "ok" if os_ == ol else "DIFF"
+    ok = "ok" if same(os_, ol) else "DIFF"
     rows.append((n, ts, tl, ts / tl if tl > 0 else 0, ok))
 rows.sort(key=lambda r: -r[3])
 print("%-14s %8s %8s %7s  %s" % ("bench", "sprint", "luajit", "ratio", ""))
