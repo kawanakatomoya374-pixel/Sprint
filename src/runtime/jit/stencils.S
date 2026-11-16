@@ -1084,7 +1084,9 @@ ST ifdiv_p2
 ST idiv_rr
     cmpq $0,H2+8(%r12)
     je JIT_X
+    xorps %xmm0,%xmm0
     cvtsi2sdq H1+8(%r12),%xmm0
+    xorps %xmm1,%xmm1
     cvtsi2sdq H2+8(%r12),%xmm1
     divsd %xmm1,%xmm0
     movq $T_FLOAT,H0(%r12)
@@ -1095,6 +1097,7 @@ ST idiv_rr
 .ifc \t,f
     movsd \hole+8(\r),\x
 .else
+    xorps \x,\x
     cvtsi2sdq \hole+8(\r),\x
 .endif
 .endm
@@ -1193,6 +1196,7 @@ ST fsqrt
     movsd %xmm0,H0+8(%r12)
 
 ST i2f                          # slot H0 <- float(int slot H1)
+    xorps %xmm0,%xmm0
     cvtsi2sdq H1+8(%r12),%xmm0
     movq $T_FLOAT,H0(%r12)
     movsd %xmm0,H0+8(%r12)

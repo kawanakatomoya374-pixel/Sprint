@@ -938,8 +938,8 @@ static int arith_reg(JC *c, int op, int pa, int pb, int fl) {
         if (cr == -2) return 0;
         if (cr >= 0) ok = x_rr(c, 0, 0, 0x0f, 0x28, xd, cr);
         else if (lf->ty == TY_FLT) ok = lf->kind == EK_K ? x_sd_ld(c, xd, R_R13, koff(lf->idx) + 8) : x_sd_ld(c, xd, R_R12, roff(c, lf, lpos) + 8);
-        else if (lf->kind == EK_REG) ok = x_rr(c, 0xf2, 1, 0x0f, 0x2a, xd, lf->idx);
-        else ok = x_mem(c, 0xf2, 1, 0x0f, 0x2a, xd, lf->kind == EK_K ? R_R13 : R_R12, (lf->kind == EK_K ? koff(lf->idx) : roff(c, lf, lpos)) + 8);
+        else if (lf->kind == EK_REG) ok = x_rr(c, 0x66, 0, 0x0f, 0x57, xd, xd) && x_rr(c, 0xf2, 1, 0x0f, 0x2a, xd, lf->idx);
+        else ok = x_rr(c, 0x66, 0, 0x0f, 0x57, xd, xd) && x_mem(c, 0xf2, 1, 0x0f, 0x2a, xd, lf->kind == EK_K ? R_R13 : R_R12, (lf->kind == EK_K ? koff(lf->idx) : roff(c, lf, lpos)) + 8);
         if (!ok) return 0;
     }
     if (op == OP_DIV) {          /* x / 0.0 (and x / NaN) is an error the interpreter raises: leave through the exit */
@@ -950,8 +950,8 @@ static int arith_reg(JC *c, int op, int pa, int pb, int fl) {
         if (rt->ty == TY_FLT && rt->kind == EK_REG) xs = rt->idx;
         else if (dcr >= 0) xs = dcr;
         else if (rt->ty == TY_FLT) ok = x_sd_ld(c, 0, rt->kind == EK_K ? R_R13 : R_R12, (rt->kind == EK_K ? koff(rt->idx) : roff(c, rt, rpos)) + 8);
-        else if (rt->kind == EK_REG) ok = x_rr(c, 0xf2, 1, 0x0f, 0x2a, 0, rt->idx);
-        else ok = x_mem(c, 0xf2, 1, 0x0f, 0x2a, 0, rt->kind == EK_K ? R_R13 : R_R12, (rt->kind == EK_K ? koff(rt->idx) : roff(c, rt, rpos)) + 8);
+        else if (rt->kind == EK_REG) ok = x_rr(c, 0x66, 0, 0x0f, 0x57, 0, 0) && x_rr(c, 0xf2, 1, 0x0f, 0x2a, 0, rt->idx);
+        else ok = x_rr(c, 0x66, 0, 0x0f, 0x57, 0, 0) && x_mem(c, 0xf2, 1, 0x0f, 0x2a, 0, rt->kind == EK_K ? R_R13 : R_R12, (rt->kind == EK_K ? koff(rt->idx) : roff(c, rt, rpos)) + 8);
         ok = ok && x_rr(c, 0x66, 0, 0x0f, 0x57, 15, 15) && x_rr(c, 0x66, 0, 0x0f, 0x2e, xs, 15) && x_jx(c, 4, xe) && x_sd_rr(c, op2, xd, xs);
         if (!ok) return 0;
     } else {
@@ -963,8 +963,8 @@ static int arith_reg(JC *c, int op, int pa, int pb, int fl) {
             else if (cr >= 0) ok = x_sd_rr(c, op2, xd, cr);
             else ok = x_sd_rm(c, op2, xd, rt->kind == EK_K ? R_R13 : R_R12, (rt->kind == EK_K ? koff(rt->idx) : roff(c, rt, rpos)) + 8);
         } else {
-            if (rt->kind == EK_REG) ok = x_rr(c, 0xf2, 1, 0x0f, 0x2a, 0, rt->idx);
-            else ok = x_mem(c, 0xf2, 1, 0x0f, 0x2a, 0, rt->kind == EK_K ? R_R13 : R_R12, (rt->kind == EK_K ? koff(rt->idx) : roff(c, rt, rpos)) + 8);
+            if (rt->kind == EK_REG) ok = x_rr(c, 0x66, 0, 0x0f, 0x57, 0, 0) && x_rr(c, 0xf2, 1, 0x0f, 0x2a, 0, rt->idx);
+            else ok = x_rr(c, 0x66, 0, 0x0f, 0x57, 0, 0) && x_mem(c, 0xf2, 1, 0x0f, 0x2a, 0, rt->kind == EK_K ? R_R13 : R_R12, (rt->kind == EK_K ? koff(rt->idx) : roff(c, rt, rpos)) + 8);
             ok = ok && x_sd_rr(c, op2, xd, 0);
         }
         if (!ok) return 0;
@@ -1750,8 +1750,8 @@ static int do_invoke(JC *c, uint32_t pc, int len, uint32_t *skip) {
             int base = ae.kind == EK_K ? R_R13 : R_R12;
             int32_t ao = (ae.kind == EK_K ? koff(ae.idx) : roff(c, &ae, pb)) + 8;
             if (ae.ty == TY_FLT) ok = x_sd_ld(c, xd, base, ao);
-            else if (ae.kind == EK_REG) ok = x_rr(c, 0xf2, 1, 0x0f, 0x2a, xd, ae.idx);
-            else ok = x_mem(c, 0xf2, 1, 0x0f, 0x2a, xd, base, ao);
+            else if (ae.kind == EK_REG) ok = x_rr(c, 0x66, 0, 0x0f, 0x57, xd, xd) && x_rr(c, 0xf2, 1, 0x0f, 0x2a, xd, ae.idx);
+            else ok = x_rr(c, 0x66, 0, 0x0f, 0x57, xd, xd) && x_mem(c, 0xf2, 1, 0x0f, 0x2a, xd, base, ao);
         }
         ok = ok && x_rr(c, 0x66, 0, 0x0f, 0x57, 15, 15) && x_rr(c, 0x66, 0, 0x0f, 0x2e, xd, 15) && x_jx(c, 2, c->xe) &&
              x_rr(c, 0xf2, 0, 0x0f, 0x51, xd, xd);
@@ -2929,7 +2929,7 @@ static int do_set_index_ta(JC *c, int kind, int pa, int pi, int pv) {
         int ok = ve.kind == EK_REG ? x_mov(c, R_RDX, ve.idx)
                : ve.kind == EK_K ? x_ld(c, R_RDX, R_R13, koff(ve.idx) + 8) : x_ldop(c, R_RDX, &ve, pv);
         if (!ok) return 0;
-        if (isf && !x_rr(c, 0xf2, 1, 0x0f, 0x2a, 0, R_RDX)) return 0;   /* cvtsi2sd xmm0, rdx */
+        if (isf && !(x_rr(c, 0x66, 0, 0x0f, 0x57, 0, 0) && x_rr(c, 0xf2, 1, 0x0f, 0x2a, 0, R_RDX))) return 0;   /* xorpd xmm0, xmm0; cvtsi2sd xmm0, rdx */
     }
     int ok;
     switch ((TKind)kind) {
