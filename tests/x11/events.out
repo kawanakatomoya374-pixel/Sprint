@@ -1,0 +1,19 @@
+pixel 50,50 = ffcc00  200,150 = 336699
+READY
+{"type": "mouse_move", "x": 50, "y": 50}
+{"type": "mouse_down", "x": 50, "y": 50, "button": 1, "mods": "", "clicks": 1}
+{"type": "mouse_up", "x": 50, "y": 50, "button": 1, "mods": ""}
+{"type": "mouse_down", "x": 50, "y": 50, "button": 1, "mods": "", "clicks": 2}
+{"type": "mouse_up", "x": 50, "y": 50, "button": 1, "mods": ""}
+{"type": "mouse_down", "x": 50, "y": 50, "button": 3, "mods": "", "clicks": 1}
+{"type": "mouse_up", "x": 50, "y": 50, "button": 3, "mods": ""}
+{"type": "wheel", "x": 50, "y": 50, "dy": 1}
+{"type": "wheel", "x": 50, "y": 50, "dy": -1}
+{"type": "text", "text": "a"}
+{"type": "key", "key": "Ctrl+c"}
+{"type": "key", "key": "Enter"}
+{"type": "key", "key": "Left"}
+{"type": "key", "key": "Tab"}
+{"type": "key", "key": "F1"}
+{"type": "key", "key": "ShiftTab"}
+DONE

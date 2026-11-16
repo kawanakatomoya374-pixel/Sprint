@@ -557,7 +557,7 @@ typedef struct Limits {
 } Limits;
 
 enum { CAP_STDIO_READ = 1, CAP_STDIO_WRITE = 2, CAP_FS_READ = 4, CAP_FS_WRITE = 8,
-       CAP_CLOCK = 16, CAP_RANDOM = 32, CAP_FFI = 64, CAP_ASM = 128 };
+       CAP_CLOCK = 16, CAP_RANDOM = 32, CAP_FFI = 64, CAP_ASM = 128, CAP_WINDOW = 256 };
 
 enum { FK_NORMAL = 0, FK_DEFER_RUN = 1, FK_DEFER_UNWIND = 2, FK_BOUNDARY = 3, FK_CTOR = 4 /* init run by the construction fast path; uev holds the new instance */ };
 
@@ -837,6 +837,7 @@ int lib_io_fail(VM *vm, int err, const char *op, const char *path);
 extern const NativeDesc lib_gfx_fns[];
 const uint32_t *gfx_canvas_pixels(SpValue v, int *w, int *h); /* host access to a canvas (the OS kernel) */
 extern const NativeDesc lib_ffi_fns[];
+extern const NativeDesc lib_x11_fns[]; /* native X11 window (lib_x11.c) */
 uint32_t sp_hash_bytes(const char *s, size_t n);
 uint32_t str_hash_calc(const char *s, size_t n); /* never 0 */
 uint32_t str_hash_slow(SString *s);
