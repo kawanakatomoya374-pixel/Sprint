@@ -765,6 +765,25 @@ struct VM {
     /* GC bookkeeping is appended so offsets consumed by native stencils do not move. */
     size_t gc_mark_limit;       /* optional developer cap; zero means unlimited */
     int gc_gray_overflow;       /* mark-stack fallback scan required */
+    /* generational collector (gc.c): sticky mark bits, non-moving. Objects that survive a collection keep their mark (the colour
+     * gc_black) and are "old"; objects allocated since are "young" (white). A minor collection marks and sweeps only the young ones,
+     * starting from the roots and from the remembered old objects (those a store of a reference was made into: see gc_wb). A major
+     * collection flips gc_black, so every old object is unmarked at once, and marks and sweeps everything. */
+    uint8_t gc_black;           /* colour of old objects: GC_BLACK_A or GC_BLACK_B */
+    int gc_gen;                 /* generational collection enabled (SPRINT_GC_GEN=0 turns every collection into a major one) */
+    int gc_verify;              /* SPRINT_GC_VERIFY=1: before each minor collection check that every old->young edge is remembered */
+    int gc_force_major;         /* the next collection is a major one */
+    Obj *gc_young_end;          /* first old object of the object list: everything before it is young (NULL: all young) */
+    Obj **rem_buf;              /* remembered old objects (REM bit set) */
+    size_t rem_n, rem_cap;
+    size_t gc_major_next;       /* heap size (bytes) at which the next collection is a major one */
+    size_t gc_last_live;        /* heap size right after the previous collection */
+    int gc_window_pct;          /* allocation window after a collection, in percent of the live data (at least gc_nursery) */
+    size_t gc_nursery;          /* bytes of allocation between minor collections */
+    unsigned long gc_minors, gc_majors;
+    void *jit_wb;               /* machine-code write barrier (jit.c): called with the object in rax, preserves every register */
+    int gc_trace;               /* SPRINT_GC_TRACE=1: totals at exit, 2: one line per collection */
+    double gc_trace_ms;
 };
 
 
@@ -897,7 +916,16 @@ SError *vm_make_error(VM *vm, int code, SString *kind, SString *msg);
 const uint8_t *vm_error_ipc(const VM *vm);
 
 /* gc */
-void vm_gc(VM *vm);
+enum { GC_WHITE = 0, GC_GRAY = 1, GC_BLACK_A = 2, GC_BLACK_B = 3, GC_REM = 4 };   /* Obj.marked: colour in the low two bits, remembered flag */
+void vm_gc(VM *vm);              /* a minor collection, or a major one when the heap has grown enough */
+void vm_gc_full(VM *vm);         /* a major collection (gc.collect()) */
+void gc_remember(VM *vm, Obj *o); /* slow path of gc_wb */
+void *sp_jit_wb_addr(void);       /* the machine-code write barrier stub, or NULL where there is no JIT */
+/* Write barrier: call it BEFORE or AFTER storing the reference `v` into the heap object `o` (any time before the next allocation).
+ * An old object that gets a reference stored is remembered, so that the next minor collection looks at it again. */
+static inline void gc_wb(VM *vm, Obj *o, SpValue v) {
+    if ((o->marked & 6U) == 2U && v.type >= T_STRING && v.type <= T_CELL) gc_remember(vm, o);
+}
 void gc_mark(VM *vm, SpValue v); /* for NativeClass.trace */
 #define GC_POINT(vm) do { if ((vm)->bytes >= (vm)->gc_next) vm_gc(vm); } while (0)
 

@@ -1,3 +1,5 @@
+#define _POSIX_C_SOURCE 200809L
+#include <time.h>
 /* GC: precise, non-moving mark & sweep with no C recursion. */
 #include "value_int.h"
 
@@ -49,14 +51,14 @@ __attribute__((noinline))
 static void mark_obj_new(VM *vm, Obj *o) {
     if (o->type == T_STRING) {
         SString *ss = (SString *)o;
-        o->marked = 2U; /* strings have no outgoing references ... */
+        o->marked = vm->gc_black; /* strings have no outgoing references ... */
         if (ss->dp != ss->idata) {   /* ... except a string sharing a buffer, which keeps the hidden owner string alive */
             SString *own = (SString *)(void *)(ss->dp - offsetof(SString, idata));
-            own->h.marked = 2U;
+            own->h.marked = vm->gc_black;
         }
         return;
     }
-    o->marked = 1U; /* gray: queued, or discoverable by the fallback heap scan */
+    o->marked = GC_GRAY; /* gray: queued, or discoverable by the fallback heap scan; the sweep makes the survivors black */
     gray_push(vm, o);
 }
 
@@ -64,7 +66,10 @@ static void mark_obj_new(VM *vm, Obj *o) {
 __attribute__((always_inline))
 #endif
 static inline void mark_obj(VM *vm, Obj *o) {
-    if (o == NULL || o->marked != 0U) return;
+    if (o == NULL) return;
+    /* unmarked = white (young, or any object at the start of a major collection) or the colour old objects had before the flip */
+    const unsigned c = o->marked & 3U;
+    if (c != 0U && c != 5U - vm->gc_black) return;
     mark_obj_new(vm, o);
 }
 
@@ -209,12 +214,93 @@ static void free_obj(VM *vm, Obj *o) {
     vm->bytes -= sz;
 }
 
-void vm_gc(VM *vm) {
-    vm->gc_runs++;
-    vm->ngray = 0U;
-    vm->gc_gray_overflow = 0;
-    memset(vm->ic, 0, sizeof vm->ic);
-    memset(vm->mc, 0, sizeof vm->mc);
+/* ---- remembered set and heap verification ------------------------------------------------------------------------------ */
+void gc_remember(VM *vm, Obj *o) {
+    o->marked |= GC_REM;
+    if (vm->rem_n == vm->rem_cap) {
+        size_t nc = vm->rem_cap ? vm->rem_cap * 2U : 1024U;
+        Obj **nb = (Obj **)realloc(vm->rem_buf, nc * sizeof *nb);
+        if (nb == NULL) vm_fatal(vm, RS_MEMORY, "out of memory");
+        vm->rem_buf = nb;
+        vm->rem_cap = nc;
+    }
+    vm->rem_buf[vm->rem_n++] = o;
+}
+
+typedef void (*ChildFn)(VM *vm, Obj *parent, SpValue child, void *ctx);
+static void exec_children(VM *vm, Obj *parent, const ExecState *st, ChildFn f, void *ctx) {
+    for (const SpValue *p = st->stack; p < st->sp; p++) f(vm, parent, *p, ctx);
+    for (int i = 0; i < st->nframes; i++) {
+        f(vm, parent, v_obj(T_FUNCTION, st->frames[i].fn), ctx);
+        f(vm, parent, st->frames[i].uev, ctx);
+    }
+    for (int i = 0; i < st->ndv; i++) f(vm, parent, st->dvals[i], ctx);
+    for (int i = 0; i < st->ndr; i++)
+        if (st->drecs[i].method) f(vm, parent, v_obj(T_FUNCTION, st->drecs[i].method), ctx);
+}
+/* every reference the object holds, as blacken sees them (used only by the verifier) */
+static void each_child(VM *vm, Obj *o, ChildFn f, void *ctx) {
+    switch (o->type) {
+    case T_ARRAY: {
+        SArray *a = (SArray *)o;
+        if (!(a->h.xt >= (uint8_t)T_BOOL && a->h.xt <= (uint8_t)T_FLOAT))
+            for (int64_t i = 0; i < a->len; i++) f(vm, o, array_get(a, i), ctx);
+        break;
+    }
+    case T_TABLE: {
+        STable *t = (STable *)o;
+        for (int64_t i = 0; i < t->nent; i++)
+            if (t->ents[i].key.type != T_NIL) { f(vm, o, t->ents[i].key, ctx); f(vm, o, t->ents[i].val, ctx); }
+        break;
+    }
+    case T_FUNCTION: { SFunc *fn = (SFunc *)o; for (int i = 0; i < fn->nup; i++) f(vm, o, v_obj(T_CELL, fn->up[i]), ctx); break; }
+    case T_CELL: f(vm, o, ((SCell *)o)->v, ctx); break;
+    case T_ITERATOR: f(vm, o, ((SIterator *)o)->held, ctx); break;
+    case T_COROUTINE: {
+        SCoroutine *co = (SCoroutine *)o;
+        f(vm, o, v_obj(T_FUNCTION, co->fn), ctx);
+        if (co->status == CO_SUSPENDED && co->block) exec_children(vm, o, &co->st, f, ctx);
+        break;
+    }
+    case T_CLASS: {
+        SClass *c = (SClass *)o;
+        f(vm, o, v_obj(T_STRING, c->name), ctx); f(vm, o, v_obj(T_CLASS, c->parent), ctx); f(vm, o, v_obj(T_TABLE, c->fields), ctx);
+        f(vm, o, v_obj(T_TABLE, c->methods), ctx); f(vm, o, v_obj(T_FUNCTION, c->ctor), ctx);
+        break;
+    }
+    case T_INSTANCE: {
+        SInstance *in = (SInstance *)o;
+        f(vm, o, v_obj(T_CLASS, in->cls), ctx);
+        for (int i = 0; i < in->nslots; i++) f(vm, o, in->slots[i], ctx);
+        break;
+    }
+    case T_MODULE: { SModule *m = (SModule *)o; f(vm, o, v_obj(T_STRING, m->name), ctx); f(vm, o, v_obj(T_TABLE, m->exports), ctx); break; }
+    case T_ERROR: {
+        SError *e = (SError *)o;
+        f(vm, o, v_obj(T_STRING, e->kind), ctx); f(vm, o, v_obj(T_STRING, e->message), ctx); f(vm, o, v_obj(T_STRING, e->file), ctx);
+        f(vm, o, v_obj(T_STRING, e->trace), ctx); f(vm, o, e->cause, ctx); f(vm, o, e->data, ctx); f(vm, o, e->suppressed, ctx);
+        break;
+    }
+    default: break;   /* natives: their trace callbacks are not enumerable here */
+    }
+}
+static void verify_edge(VM *vm, Obj *parent, SpValue child, void *ctx) {
+    (void)vm; (void)ctx;
+    if (child.type < T_STRING || child.type > T_CELL || child.as.o == NULL) return;
+    if ((child.as.o->marked & 3U) == 0U && (parent->marked & GC_REM) == 0U) {
+        (void)fprintf(stderr, "gc-verify: old %s holds a young %s and is not remembered (a missing write barrier)\n",
+                      type_name(v_obj(parent->type, parent)), type_name(child));
+        abort();
+    }
+}
+/* before a minor collection: every old object that holds a young one must be in the remembered set */
+static void gc_verify(VM *vm) {
+    for (Obj *o = vm->gc_young_end; o != NULL; o = o->next)
+        if ((o->marked & 3U) == vm->gc_black) each_child(vm, o, verify_edge, NULL);
+}
+
+/* ---- collection --------------------------------------------------------------------------------------------------------- */
+static void gc_mark_roots(VM *vm) {
     {
         ExecState cur;
         exec_save(vm, &cur);
@@ -240,6 +326,9 @@ void vm_gc(VM *vm) {
     mark_val(vm, vm->uncaught);
     for (int i = 0; i < 17; i++) mark_obj(vm, (Obj *)vm->type_names[i]);
     for (int i = 0; i < 4; i++) mark_obj(vm, (Obj *)vm->co_status_names[i]);
+}
+
+static void gc_drain(VM *vm) {
     for (;;) {
         while (vm->ngray != 0U) {
             Obj *o = vm->gray[--vm->ngray];
@@ -255,8 +344,8 @@ void vm_gc(VM *vm) {
         for (;;) {
             size_t found = 0U;
             for (Obj *o = vm->objs; o != NULL; o = o->next) {
-                if (o->marked == 1U) {
-                    o->marked = 2U;
+                if ((o->marked & 3U) == GC_GRAY) {
+                    o->marked = (uint8_t)((o->marked & ~3U) | vm->gc_black);   /* processed */
                     blacken(vm, o);
                     found++;
                 }
@@ -267,44 +356,135 @@ void vm_gc(VM *vm) {
         vm->gc_gray_overflow = 0;
         break;
     }
+}
 
-    intern_sweep(vm);   /* dead strings leave the intern table before their blocks are freed */
-    Obj **pp = &vm->objs;
-    while (*pp) {
+/* free the dead objects of the list from *pp up to `stop` (exclusive); the survivors become (or stay) old. `major`: the unmarked
+ * ones also include the objects still carrying the pre-flip colour. */
+static void gc_sweep(VM *vm, Obj **pp, const Obj *stop) {
+    const unsigned stale = 5U - vm->gc_black;
+    size_t freed = 0U;                          /* bytes of the blocks released by the fast path below, taken off vm->bytes once */
+    while (*pp != stop) {
         Obj *o = *pp;
-        if (o->marked) {
-            o->marked = 0;
+        const unsigned c = o->marked & 3U;
+        if (c != 0U && c != stale) {
+            o->marked = vm->gc_black;           /* survivor: old from now on, not remembered */
             pp = &o->next;
-        } else {
-            *pp = o->next;
-            if (o->type == T_INSTANCE) {         /* the common garbage: no external storage, so the block goes straight back to its size class */
-                size_t hs = offsetof(SInstance, slots) + (size_t)((SInstance *)o)->nslots * sizeof(SpValue);
-                vm->bytes -= hs;
-                if (hs <= SP_POOL_MAX) {
-                    size_t cl = (hs + 15) >> 4;
-                    *(void **)(void *)o = vm->pool_free[cl];
-                    vm->pool_free[cl] = o;
-                } else {
-                    free(o);
-                }
+            continue;
+        }
+        *pp = o->next;
+        size_t hs = 0U;                          /* the common garbage has no external storage: its block goes straight back to its size class */
+        switch (o->type) {
+        case T_INSTANCE: hs = offsetof(SInstance, slots) + (size_t)((SInstance *)o)->nslots * sizeof(SpValue); break;
+        case T_ARRAY: if (array_inline((SArray *)o)) hs = sizeof(SArray) + (size_t)((SArray *)o)->h.icap * sizeof(SpValue); break;
+        case T_STRING: if (((SString *)o)->dp == ((SString *)o)->idata) hs = offsetof(SString, idata) + (size_t)((SString *)o)->len + 1U; break;
+        case T_CELL: hs = sizeof(SCell); break;
+        default: break;
+        }
+        if (hs != 0U) {
+            freed += hs;
+            if (hs <= SP_POOL_MAX) {
+                size_t cl = (hs + 15) >> 4;
+                *(void **)(void *)o = vm->pool_free[cl];
+                vm->pool_free[cl] = o;
             } else {
-                free_obj(vm, o);
+                free(o);
             }
+        } else {
+            free_obj(vm, o);
         }
     }
-    size_t live = vm->bytes;
-    static int factor = -1;
-    if (factor < 0) { const char *e = getenv("SPRINT_GC_FACTOR"); factor = e && e[0] >= '1' && e[0] <= '9' ? e[0] - '0' : 2; }
-    size_t next = live > SIZE_MAX / (size_t)factor ? SIZE_MAX : live * (size_t)factor;
-    if (next < ((size_t)1U << 20U)) next = (size_t)1U << 20U;
+    vm->bytes -= freed;
+}
+
+static double gc_now_ms(void) {
+    struct timespec t;
+    (void)clock_gettime(CLOCK_MONOTONIC, &t);
+    return (double)t.tv_sec * 1e3 + (double)t.tv_nsec / 1e6;
+}
+
+static void gc_collect(VM *vm, int major) {
+    const int trace = vm->gc_trace;
+    const double t0 = trace ? gc_now_ms() : 0.0;
+    const size_t before = vm->bytes, nrem = vm->rem_n;
+    vm->gc_runs++;
+    vm->ngray = 0U;
+    vm->gc_gray_overflow = 0;
+    memset(vm->ic, 0, sizeof vm->ic);
+    memset(vm->mc, 0, sizeof vm->mc);
+    if (major) {
+        vm->gc_majors++;
+        for (size_t i = 0; i < vm->rem_n; i++) vm->rem_buf[i]->marked &= (uint8_t)~GC_REM;
+        vm->rem_n = 0U;
+        vm->gc_black = (uint8_t)(5U - vm->gc_black);    /* every old object is unmarked at once */
+    } else {
+        vm->gc_minors++;
+        if (vm->gc_verify) gc_verify(vm);
+    }
+    gc_mark_roots(vm);
+    if (!major) {                                       /* old objects that were stored into since the last collection */
+        for (size_t i = 0; i < vm->rem_n; i++) {
+            Obj *o = vm->rem_buf[i];
+            o->marked &= (uint8_t)~GC_REM;
+            blacken(vm, o);
+        }
+        vm->rem_n = 0U;
+    }
+    gc_drain(vm);
+    intern_sweep(vm);   /* dead strings leave the intern table before their blocks are freed */
+    gc_sweep(vm, &vm->objs, major ? NULL : vm->gc_young_end);
+    vm->gc_young_end = vm->objs;                        /* everything that is left is old */
+
+    const size_t live = vm->bytes;
+    /* a minor collection that promoted most of what was allocated bought nothing (the heap is only growing): wait for the major threshold,
+     * as a non-generational collector would */
+    const size_t young_bytes = before > vm->gc_last_live ? before - vm->gc_last_live : 0U;
+    const int growing = !major && young_bytes != 0U && live > vm->gc_last_live && (live - vm->gc_last_live) / 10U * 10U > young_bytes / 10U * 6U;
+    vm->gc_last_live = live;
+    if (major) {
+        size_t m = live > SIZE_MAX / 2U ? SIZE_MAX : live * 2U;
+        if (m < ((size_t)4U << 20U)) m = (size_t)4U << 20U;
+        vm->gc_major_next = m;
+    }
+    /* The allocation window until the next collection: at least gc_nursery, and half the heap for a big one (a heap that only grows is
+     * collected about as often as before, instead of once per 4MB; gc_window_pct percent of the live data), at most 64MB. vm_gc decides then whether it is a major collection. */
+    size_t window = vm->gc_nursery;
+    if (live / 100U * (size_t)vm->gc_window_pct > window) window = live / 100U * (size_t)vm->gc_window_pct;
+    if (window > ((size_t)64U << 20U) && window > vm->gc_nursery) window = (size_t)64U << 20U;
+    size_t next = live > SIZE_MAX - window ? SIZE_MAX : live + window;
+    if (growing && vm->gc_major_next > next) next = vm->gc_major_next;
+    {   /* never far past the heap size at which the next major collection is due (that bound is what keeps the peak near twice the live data) */
+        size_t cap = vm->gc_major_next > live + vm->gc_nursery ? vm->gc_major_next : live + vm->gc_nursery;
+        if (next > cap) next = cap;
+    }
     if (vm->lim.max_heap_bytes != 0U && next > vm->lim.max_heap_bytes)
         next = vm->lim.max_heap_bytes;
-    if (next < live) next = live;
+    if (next <= live) next = live == SIZE_MAX ? SIZE_MAX : live + 1U;
     if (vm->gc_stress) next = live == SIZE_MAX ? SIZE_MAX : live + 1U;
     vm->gc_next = next;
+    if (trace) {
+        vm->gc_trace_ms += gc_now_ms() - t0;
+        if (trace > 1)
+            (void)fprintf(stderr, "gc: %s  %zu -> %zu bytes (remembered %zu)  %.3f ms  next at %zu\n", major ? "major" : "minor", before, live, nrem,
+                          gc_now_ms() - t0, next);
+    }
+}
+
+void vm_gc(VM *vm) {
+    int major = !vm->gc_gen || vm->gc_force_major || vm->bytes >= vm->gc_major_next;
+    /* stress mode collects at every allocation: mostly minor ones, a major one now and then so that both get exercised */
+    if (vm->gc_stress && vm->gc_gen && !vm->gc_force_major) major = vm->bytes >= vm->gc_major_next || (vm->gc_runs & 15) == 15;
+    vm->gc_force_major = 0;
+    gc_collect(vm, major);
+}
+
+void vm_gc_full(VM *vm) {
+    vm->gc_force_major = 1;
+    vm_gc(vm);
 }
 
 void vm_free(VM *vm) {
+    if (vm->gc_trace)
+        (void)fprintf(stderr, "gc: %lu minor + %lu major collections, %.1f ms\n", vm->gc_minors, vm->gc_majors, vm->gc_trace_ms);
     lib_ext_free(vm);
     Obj *o = vm->objs;
     while (o) {
@@ -346,6 +526,7 @@ void vm_free(VM *vm) {
     free(vm->hmods);
     free(vm->hdiag);
     free(vm->gray);
+    free(vm->rem_buf);
     free(vm->itab);
     free(vm->slots);
     free(vm->links);

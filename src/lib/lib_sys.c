@@ -136,7 +136,7 @@ const NativeDesc time_fns[] = {
 
 static int gc_collect(VM *vm, int argc, SpValue *argv, SpValue *ret) {
     (void)argc; (void)argv; (void)ret;
-    vm_gc(vm);
+    vm_gc_full(vm);
     return 0;
 }
 static int gc_stats(VM *vm, int argc, SpValue *argv, SpValue *ret) {

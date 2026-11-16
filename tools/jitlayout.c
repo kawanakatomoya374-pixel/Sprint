@@ -57,5 +57,10 @@ int main(void) {
     P("L_VM_OBJS", offsetof(VM, objs));
     P("L_VM_NEXTID", offsetof(VM, next_id));
     P("L_VM_POOLFREE", offsetof(VM, pool_free));
+    P("L_VM_JITWB", offsetof(VM, jit_wb));
+    P("L_OBJ_MARKED", offsetof(Obj, marked));
+    P("L_VM_REMN", offsetof(VM, rem_n));
+    P("L_VM_REMCAP", offsetof(VM, rem_cap));
+    P("L_VM_REMBUF", offsetof(VM, rem_buf));
     return 0;
 }

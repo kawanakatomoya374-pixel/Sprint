@@ -19,6 +19,7 @@
 
 #if !SP_JIT
 
+void *sp_jit_wb_addr(void) { return NULL; }
 int jit_site(VM *vm, Proto *p, const uint8_t *hdr, SpValue *base, SpValue *sp) {
     (void)vm; (void)p; (void)hdr; (void)base; (void)sp;
     return 0;
@@ -62,6 +63,8 @@ _Static_assert(L_VM_SLOTS == offsetof(VM, slots) && L_VM_ILEFT == offsetof(VM, i
                L_VM_NDR == offsetof(VM, ndr) && L_VM_JCUR == offsetof(VM, jit_cur) &&
                L_VM_JRSP == offsetof(VM, jit_rsp) && L_VM_JFMAX == offsetof(VM, jit_fmax), "VM layout");
 _Static_assert(L_JU_PROTO == offsetof(JitUnit, proto) && L_PROTO_CODE == offsetof(Proto, code), "JIT layout 2");
+_Static_assert(L_VM_JITWB == offsetof(VM, jit_wb) && L_OBJ_MARKED == offsetof(Obj, marked) && L_VM_REMN == offsetof(VM, rem_n) &&
+               L_VM_REMCAP == offsetof(VM, rem_cap) && L_VM_REMBUF == offsetof(VM, rem_buf), "write barrier layout");
 _Static_assert(L_VM_SP == offsetof(VM, sp) && L_VM_JNEW == offsetof(VM, jit_new), "VM layout 2");
 _Static_assert(L_CLS_NF == offsetof(SClass, nfields) && L_CLS_DFLT == offsetof(SClass, dflt) && L_INST_NSLOTS == offsetof(SInstance, nslots) &&
                L_VM_BYTES == offsetof(VM, bytes) && L_VM_GCNEXT == offsetof(VM, gc_next) && L_VM_OBJS == offsetof(VM, objs) &&
@@ -1457,6 +1460,29 @@ static int do_get_member(JC *c, uint32_t pc, int len, uint32_t *skip) {
     return 1;
 }
 
+/* generational write barrier before storing the value `ve` (stack position pv) into the object whose pointer is in register objreg; preserves
+ * every register but rax. Nothing is emitted when the value cannot be a reference. */
+static int emit_wb(JC *c, int objreg, const Ent *ve, int pv) {
+    int stn;
+    int32_t h0 = 0;
+    if (ve->kind == EK_REG) {
+        if (ve->ty != TY_ARR && ve->ty != TY_INST) return 1;
+        stn = ST_wbk;
+    } else if (ve->kind == EK_K) {
+        const SpValue kv = c->kt[ve->idx];
+        if (kv.type < T_STRING || kv.type > T_CELL) return 1;
+        stn = ST_wbk;
+    } else {
+        if (ve->ty == TY_INT || ve->ty == TY_FLT || ve->ty == TY_BOOL) return 1;
+        stn = ST_wbm;
+        h0 = roff(c, ve, pv);
+    }
+    if (objreg != R_RAX && !x_mov(c, R_RAX, objreg)) return 0;
+    if (!em(c, stn, h0, 0, 0, 0, 0, 0)) return 0;
+    c->rax_off = -1; c->xmm_off = -1; c->skip1 = 0; c->skipx = 0;
+    return 1;
+}
+
 static int do_set_member(JC *c, uint32_t pc) {
     unsigned kix = rd16(c->code + pc + 1);
     int pv = c->dep - 1, pr = c->dep - 2;
@@ -1475,6 +1501,7 @@ static int do_set_member(JC *c, uint32_t pc) {
         Ent re = *r, ve = *v;
         int rp = re.kind == EK_REG ? re.idx : R_RAX;
         int ok = re.kind == EK_REG ? 1 : x_ld(c, R_RAX, R_R12, roff(c, &re, pr) + 8);
+        if (ok) ok = emit_wb(c, rp, &ve, pv);
         if (ok) {
             if (ve.kind == EK_REG) {
                 ok = x_sti(c, rp, fo, (int32_t)tag_of(ve.ty)) && (reg_is_x(&ve) ? x_sd_st(c, rp, fo + 8, ve.idx) : x_st(c, rp, fo + 8, ve.idx));
@@ -3054,6 +3081,7 @@ static int do_set_index(JC *c, uint32_t pc) {
         if (ae.kind != EK_REG && !x_ld(c, R_RDX, R_R12, roff(c, &ae, pa) + 8)) return 0;
         int32_t ed = 0;
         const int esh = packed_set ? 3 : 4;
+        if (!packed_set && !emit_wb(c, rp, &ve, pv)) return 0;
         if (ie.kind == EK_K) {
             if (!x_cmpi(c, rp, so, (int32_t)kk) || !x_jx(c, 6, c->xe)) return 0;
             if (packed_set ? !x_xt_cmp(c, rp, (int)tag_of(ve.ty)) || !x_jx(c, 5, c->xe) : !x_xt_not_packed(c, rp, c->xe)) return 0;
@@ -4162,6 +4190,59 @@ void jit_region_trace_ready(VM *vm, Proto *p, uint32_t header) {
         if (vm->jit_dbg) (void)fprintf(stderr, "jit: region #%d retired (a trace for @%u is ready)\n", i, header);
     }
 }
+
+#if SP_JIT
+#define XSTR_(x) #x
+#define XSTR(x) XSTR_(x)
+/* The generational write barrier's slow path, called from generated code (`call *L_VM_JITWB(%rbx)`) with the object in rax: it keeps every
+ * register (including the xmm ones and flags are not needed), so the code around the call needs no flushing, and calls gc_remember(vm, rax). */
+__asm__(".text\n"
+        ".p2align 4\n"
+        ".globl sp_jit_wb_stub\n"
+        ".hidden sp_jit_wb_stub\n"
+        ".type sp_jit_wb_stub,@function\n"
+        "sp_jit_wb_stub:\n"
+        "    endbr64\n"
+        "    push %rcx\n"                                  /* fast path: room in the remembered set: append the object, set its flag */
+        "    mov " XSTR(L_VM_REMN) "(%rbx),%rcx\n"
+        "    cmp " XSTR(L_VM_REMCAP) "(%rbx),%rcx\n"
+        "    jae 1f\n"
+        "    push %rdx\n"
+        "    mov " XSTR(L_VM_REMBUF) "(%rbx),%rdx\n"
+        "    mov %rax,(%rdx,%rcx,8)\n"
+        "    inc %rcx\n"
+        "    mov %rcx," XSTR(L_VM_REMN) "(%rbx)\n"
+        "    orb $4," XSTR(L_OBJ_MARKED) "(%rax)\n"
+        "    pop %rdx\n"
+        "    pop %rcx\n"
+        "    ret\n"
+        "1:  pop %rcx\n"                                   /* the set is full: gc_remember grows it */
+        "    push %rbp\n"
+        "    mov %rsp,%rbp\n"
+        "    and $-16,%rsp\n"
+        "    sub $336,%rsp\n"
+        "    mov %rax,0(%rsp)\n    mov %rcx,8(%rsp)\n    mov %rdx,16(%rsp)\n    mov %rsi,24(%rsp)\n    mov %rdi,32(%rsp)\n"
+        "    mov %r8,40(%rsp)\n    mov %r9,48(%rsp)\n    mov %r10,56(%rsp)\n    mov %r11,64(%rsp)\n"
+        "    movdqu %xmm0,80(%rsp)\n    movdqu %xmm1,96(%rsp)\n    movdqu %xmm2,112(%rsp)\n    movdqu %xmm3,128(%rsp)\n"
+        "    movdqu %xmm4,144(%rsp)\n    movdqu %xmm5,160(%rsp)\n    movdqu %xmm6,176(%rsp)\n    movdqu %xmm7,192(%rsp)\n"
+        "    movdqu %xmm8,208(%rsp)\n    movdqu %xmm9,224(%rsp)\n    movdqu %xmm10,240(%rsp)\n    movdqu %xmm11,256(%rsp)\n"
+        "    movdqu %xmm12,272(%rsp)\n    movdqu %xmm13,288(%rsp)\n    movdqu %xmm14,304(%rsp)\n    movdqu %xmm15,320(%rsp)\n"
+        "    mov %rbx,%rdi\n"
+        "    mov %rax,%rsi\n"
+        "    call gc_remember\n"
+        "    mov 0(%rsp),%rax\n    mov 8(%rsp),%rcx\n    mov 16(%rsp),%rdx\n    mov 24(%rsp),%rsi\n    mov 32(%rsp),%rdi\n"
+        "    mov 40(%rsp),%r8\n    mov 48(%rsp),%r9\n    mov 56(%rsp),%r10\n    mov 64(%rsp),%r11\n"
+        "    movdqu 80(%rsp),%xmm0\n    movdqu 96(%rsp),%xmm1\n    movdqu 112(%rsp),%xmm2\n    movdqu 128(%rsp),%xmm3\n"
+        "    movdqu 144(%rsp),%xmm4\n    movdqu 160(%rsp),%xmm5\n    movdqu 176(%rsp),%xmm6\n    movdqu 192(%rsp),%xmm7\n"
+        "    movdqu 208(%rsp),%xmm8\n    movdqu 224(%rsp),%xmm9\n    movdqu 240(%rsp),%xmm10\n    movdqu 256(%rsp),%xmm11\n"
+        "    movdqu 272(%rsp),%xmm12\n    movdqu 288(%rsp),%xmm13\n    movdqu 304(%rsp),%xmm14\n    movdqu 320(%rsp),%xmm15\n"
+        "    mov %rbp,%rsp\n"
+        "    pop %rbp\n"
+        "    ret\n"
+        ".size sp_jit_wb_stub,.-sp_jit_wb_stub\n");
+extern void sp_jit_wb_stub(void);
+void *sp_jit_wb_addr(void) { return (void *)(uintptr_t)sp_jit_wb_stub; }
+#endif
 
 struct JitProto *jit_proto(Proto *p) {
     struct JitProto *jp = p->jit;

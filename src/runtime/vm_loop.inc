@@ -270,11 +270,12 @@ static RunStatus RUN_LOOP_NAME(VM *vm, VMTraceCapture **capp, RunCold *ccold, in
         case OP_STORE_CELL: {
             SpValue cv = base[U16()];
             if (cv.type != T_CELL) { (void)vm_set_error(vm, E_RUNTIME, "corrupt bytecode: local is not a cell"); RAISE(); }
+            gc_wb(vm, &AS_CELL(cv)->h, sp[-1]);
             AS_CELL(cv)->v = *--sp;
             break;
         }
         case OP_LOAD_UPVAL: L_OP_LOAD_UPVAL: q_load_upval: PUSH(fr->fn->up[U16()]->v); NEXT();
-        case OP_STORE_UPVAL: L_OP_STORE_UPVAL: fr->fn->up[U16()]->v = *--sp; NEXT();
+        case OP_STORE_UPVAL: L_OP_STORE_UPVAL: { SCell *uc = fr->fn->up[U16()]; gc_wb(vm, &uc->h, sp[-1]); uc->v = *--sp; NEXT(); }
         case OP_LOAD_MODULE: L_OP_LOAD_MODULE: q_load_module: {
             unsigned i = U16();
             if (vm->slots[i].type == T_UNINIT) {
@@ -482,7 +483,7 @@ static RunStatus RUN_LOOP_NAME(VM *vm, VMTraceCapture **capp, RunCold *ccold, in
             if (sp[-2].type == T_INSTANCE) {
                 SInstance *si = AS_INSTANCE(sp[-2]);
                 const ICEnt *ce = ic_find(vm, si->cls, name);
-                if (ce && ce->kind == 1) { si->slots[ce->slot] = sp[-1]; sp -= 2; NEXT(); }
+                if (ce && ce->kind == 1) { gc_wb(vm, &si->h, sp[-1]); si->slots[ce->slot] = sp[-1]; sp -= 2; NEXT(); }
             }
             GCP();
             if (set_member(vm, sp[-2], name, sp[-1])) RAISE();
@@ -967,6 +968,7 @@ static RunStatus RUN_LOOP_NAME(VM *vm, VMTraceCapture **capp, RunCold *ccold, in
                 (void)vm_set_error(vm, E_RUNTIME, "corrupt bytecode: bad instance slot");
                 RAISE();
             }
+            gc_wb(vm, &AS_INSTANCE(sp[-2])->h, sp[-1]);
             AS_INSTANCE(sp[-2])->slots[i] = sp[-1];
             sp -= 2;
             break;
@@ -1035,6 +1037,7 @@ static RunStatus RUN_LOOP_NAME(VM *vm, VMTraceCapture **capp, RunCold *ccold, in
             SCoroutine *co = vm->cur_co;
             exec_save(vm, &co->st);
             co->status = CO_SUSPENDED;
+            if ((co->h.marked & 6U) == 2U) gc_remember(vm, &co->h);   /* an old coroutine's stack now holds values the collector has not seen */
             exec_load(vm, &co->caller);
             vm->cur_co = co->resumer;
             if (vm->cur_co) vm->cur_co->status = CO_RUNNING;
@@ -1864,7 +1867,7 @@ static RunStatus RUN_LOOP_NAME(VM *vm, VMTraceCapture **capp, RunCold *ccold, in
             sp = fv;
             if (err) {
                 if (defer_mode == FK_DEFER_RUN) goto raise;
-                ev = combine_errors(defer_ev, take_pending(vm));
+                ev = combine_errors(vm, defer_ev, take_pending(vm));
                 goto unwind;
             }
             if (defer_mode == FK_DEFER_RUN) {
@@ -1945,7 +1948,7 @@ static RunStatus RUN_LOOP_NAME(VM *vm, VMTraceCapture **capp, RunCold *ccold, in
                 vm->uncaught = ev;
                 RET(AS_ERROR(ev)->code == E_PERM ? RS_PERM : RS_ERROR);
             }
-            if (fr->kind == FK_DEFER_UNWIND) ev = combine_errors(fr->uev, ev);
+            if (fr->kind == FK_DEFER_UNWIND) ev = combine_errors(vm, fr->uev, ev);
             while (vm->nh > 0 && vm->handlers[vm->nh - 1].frame >= top) vm->nh--;
             sp = fr->base - 1;
             vm->nframes--;

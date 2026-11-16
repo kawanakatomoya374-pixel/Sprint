@@ -48,3 +48,8 @@
 #define L_VM_OBJS 12344
 #define L_VM_NEXTID 12536
 #define L_VM_POOLFREE 12352
+#define L_VM_JITWB 30720
+#define L_OBJ_MARKED 1
+#define L_VM_REMN 30656
+#define L_VM_REMCAP 30664
+#define L_VM_REMBUF 30648

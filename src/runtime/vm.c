@@ -299,7 +299,7 @@ static int set_member(VM *vm, SpValue o, SString *name, SpValue v) {
     case T_INSTANCE: {
         SInstance *in = AS_INSTANCE(o);
         const ICEnt *ce = ic_find(vm, in->cls, name);
-        if (ce && ce->kind == 1) { in->slots[ce->slot] = v; return 0; }
+        if (ce && ce->kind == 1) { gc_wb(vm, &in->h, v); in->slots[ce->slot] = v; return 0; }
         if (ce)
             return vm_set_error(vm, E_TYPE, "cannot assign to method '%s'", name->dp);
         return vm_set_error(vm, E_NAME, "'%s' instance has no field '%s'", in->cls->name->dp, name->dp);
@@ -332,11 +332,11 @@ static SpValue take_pending(VM *vm) {
 static int uncatchable(const SError *e) { return e->code == E_PANIC || e->code == E_CLOSE; }
 
 /* SPEC 12.4.3: a deferred call failed with e2 while e1 was propagating. */
-static SpValue combine_errors(SpValue e1, SpValue e2) {
+static SpValue combine_errors(VM *vm, SpValue e1, SpValue e2) {
     SError *a = AS_ERROR(e1), *b = AS_ERROR(e2);
     if (uncatchable(b)) return e2;
     if (uncatchable(a)) return e1;
-    if (a->suppressed.type == T_NIL) a->suppressed = e2;
+    if (a->suppressed.type == T_NIL) { gc_wb(vm, &a->h, e2); a->suppressed = e2; }
     return e1;
 }
 

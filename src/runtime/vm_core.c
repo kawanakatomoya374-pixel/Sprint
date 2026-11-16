@@ -24,6 +24,22 @@ VM *vm_new(const Limits *lim, int caps) {
     }
     vm->caps = caps;
     vm->gc_next = vm->gc_stress ? 1U : ((size_t)1 << 20);
+    vm->gc_black = GC_BLACK_A;
+    vm->gc_window_pct = 75;
+    vm->jit_wb = sp_jit_wb_addr();
+    vm->gc_gen = 1;
+    vm->gc_nursery = (size_t)4U << 20U;
+    vm->gc_major_next = (size_t)4U << 20U;
+    {
+        const char *eg = getenv("SPRINT_GC_GEN"), *ev = getenv("SPRINT_GC_VERIFY"), *en = getenv("SPRINT_GC_NURSERY_KB");
+        if (eg && eg[0] == '0') vm->gc_gen = 0;
+        if (ev && ev[0] && ev[0] != '0') vm->gc_verify = 1;
+        const char *ew = getenv("SPRINT_GC_WINDOW_PCT");
+        if (ew && ew[0] && atoi(ew) > 0) vm->gc_window_pct = atoi(ew);
+        const char *et = getenv("SPRINT_GC_TRACE");
+        if (et && et[0] >= '1' && et[0] <= '9') vm->gc_trace = et[0] - '0';
+        if (en && en[0]) { long kb = atol(en); if (kb >= 64) vm->gc_nursery = (size_t)kb << 10U; }
+    }
     vm->gray = NULL;
     vm->capgray = 0U;
     vm->h_append = str_hash_calc("append", 6);

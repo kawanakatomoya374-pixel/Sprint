@@ -20,6 +20,7 @@
 #define T_FLOAT 3
 #define T_ARRAY 5
 #define T_STRING 4
+#define T_CELL 15
 
 .macro ST name
     .section .text.\name,"ax",@progbits
@@ -35,6 +36,58 @@
 
 #define T_FUNCTION 7
 #define T_INSTANCE 9
+
+# ---- generational write barrier ---------------------------------------------------------------------------------------------------
+# Storing a reference into an OLD object that is not yet remembered must tell the collector (gc_wb in sp.h). The check is inline (obj marked
+# & 6 == 2, value type between T_STRING and T_CELL); the rare slow path calls vm->jit_wb (rbx = VM), which keeps every register.
+.macro WB_RAX_RCX                       # object in rax, value type word in rcx; clobbers edx
+    movzbl L_OBJ_MARKED(%rax),%edx
+    and $6,%edx
+    cmp $2,%edx
+    jne 70f
+    movzbl %cl,%edx
+    sub $T_STRING,%edx
+    cmp $(T_CELL - T_STRING),%edx
+    ja 70f
+    call *L_VM_JITWB(%rbx)
+70:
+.endm
+.macro WB_RAX_DL                        # object in rax, value type in dl; clobbers esi
+    movzbl L_OBJ_MARKED(%rax),%esi
+    and $6,%esi
+    cmp $2,%esi
+    jne 70f
+    movzbl %dl,%esi
+    sub $T_STRING,%esi
+    cmp $(T_CELL - T_STRING),%esi
+    ja 70f
+    call *L_VM_JITWB(%rbx)
+70:
+.endm
+
+
+# Barrier stencils for code the region emitter writes by hand: the object is in rax; every register but the flags is preserved.
+ST wbk                          # the value is known to be a reference
+    push %rcx
+    movzbl L_OBJ_MARKED(%rax),%ecx
+    and $6,%ecx
+    cmp $2,%ecx
+    jne 71f
+    call *L_VM_JITWB(%rbx)
+71: pop %rcx
+
+ST wbm                          # the value's type word is at frame slot H0
+    push %rcx
+    movzbl L_OBJ_MARKED(%rax),%ecx
+    and $6,%ecx
+    cmp $2,%ecx
+    jne 71f
+    movzbl H0(%r12),%ecx
+    sub $T_STRING,%ecx
+    cmp $(T_CELL - T_STRING),%ecx
+    ja 71f
+    call *L_VM_JITWB(%rbx)
+71: pop %rcx
 
 ST entry                        # loop region: rdi = VM, rsi = frame base, rdx = constants, rcx = current Frame
     endbr64
@@ -676,6 +729,7 @@ ST ldfld_f                      # as ldfld, the field must be a float: xmm0 <- i
 ST stfld                        # field H2 of the instance in slot H0 <- slot H1
     mov H0+8(%r12),%rax
     mov H1(%r12),%rcx
+    WB_RAX_RCX
     mov H1+8(%r12),%rdx
     mov %rcx,H2(%rax)
     mov %rdx,H2+8(%rax)
@@ -683,6 +737,7 @@ ST stfld                        # field H2 of the instance in slot H0 <- slot H1
 ST stfldk                       # field H2 of the instance in slot H0 <- constant H1
     mov H0+8(%r12),%rax
     mov H1(%r13),%rcx
+    WB_RAX_RCX
     mov H1+8(%r13),%rdx
     mov %rcx,H2(%rax)
     mov %rdx,H2+8(%rax)
@@ -702,6 +757,7 @@ ST stup                         # upvalue (byte offset H1) <- slot H0
     mov L_SFUNC_UP(%rax),%rax
     mov H1(%rax),%rax
     mov H0(%r12),%rcx
+    WB_RAX_RCX
     mov H0+8(%r12),%rdx
     mov %rcx,L_CELL_V(%rax)
     mov %rdx,L_CELL_V+8(%rax)
@@ -711,6 +767,7 @@ ST stupk                        # upvalue (byte offset H1) <- constant H0
     mov L_SFUNC_UP(%rax),%rax
     mov H1(%rax),%rax
     mov H0(%r13),%rcx
+    WB_RAX_RCX
     mov H0+8(%r13),%rdx
     mov %rcx,L_CELL_V(%rax)
     mov %rdx,L_CELL_V+8(%rax)
@@ -785,6 +842,7 @@ ST stupi                        # upvalue (byte offset H1) of the closure in slo
     mov L_SFUNC_UP(%rax),%rax
     mov H1(%rax),%rax
     mov H0(%r12),%rcx
+    WB_RAX_RCX
     mov H0+8(%r12),%rdx
     mov %rcx,L_CELL_V(%rax)
     mov %rdx,L_CELL_V+8(%rax)
@@ -794,6 +852,7 @@ ST stupki                       # upvalue (byte offset H1) of the closure in slo
     mov L_SFUNC_UP(%rax),%rax
     mov H1(%rax),%rax
     mov H0(%r13),%rcx
+    WB_RAX_RCX
     mov H0+8(%r13),%rdx
     mov %rcx,L_CELL_V(%rax)
     mov %rdx,L_CELL_V+8(%rax)
@@ -1461,7 +1520,8 @@ ST setidx_rr                    # array(H0)[int(H1)] <- slot H2
     cmp %dl,%r8b                            # a boxed array: its element-type note drops to "unknown" if this value differs
     je 1f
     movb $0,L_OBJ_XT(%rax)
-1:  mov H4(%rax),%rax
+1:  WB_RAX_DL
+    mov H4(%rax),%rax
     shl $4,%rcx
     mov H2(%r12),%rdx
     mov H2+8(%r12),%rsi
@@ -1493,7 +1553,8 @@ ST setidx_rk                    # value is the constant H2
     cmp %dl,%r8b                            # a boxed array: its element-type note drops to "unknown" if this value differs
     je 1f
     movb $0,L_OBJ_XT(%rax)
-1:  mov H4(%rax),%rax
+1:  WB_RAX_DL
+    mov H4(%rax),%rax
     shl $4,%rcx
     mov H2(%r13),%rdx
     mov H2+8(%r13),%rsi
@@ -1630,7 +1691,8 @@ ST aappend_r                    # value in slot H2
 6:  cmp %dl,%sil
     je 1f
     movb $0,L_OBJ_XT(%rax)
-1:  lea 1(%rcx),%rdx
+1:  WB_RAX_DL
+    lea 1(%rcx),%rdx
     mov %rdx,H3(%rax)
     mov H4(%rax),%rax
     shl $4,%rcx
@@ -1681,7 +1743,8 @@ ST aappend_k                    # value is the constant H2
 6:  cmp %dl,%sil
     je 1f
     movb $0,L_OBJ_XT(%rax)
-1:  lea 1(%rcx),%rdx
+1:  WB_RAX_DL
+    lea 1(%rcx),%rdx
     mov %rdx,H3(%rax)
     mov H4(%rax),%rax
     shl $4,%rcx

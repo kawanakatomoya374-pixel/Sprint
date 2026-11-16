@@ -267,6 +267,8 @@ int table_set(VM *vm, STable *t, SpValue key, SpValue val) {
         }
         return 0;
     }
+    gc_wb(vm, &t->h, key);
+    gc_wb(vm, &t->h, val);
     if (e >= 0) { t->ents[e].val = val; return 0; }
     if (t->nent == t->cap) {
         int64_t nc = t->count * 2 > t->cap ? (t->cap ? t->cap * 2 : 4) : (t->cap ? t->cap : 4);

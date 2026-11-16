@@ -231,7 +231,10 @@ static void intern_grow(VM *vm) {
 void intern_sweep(VM *vm) {
     for (size_t i = 0; i < vm->icap; i++) {
         SString *e = vm->itab[i];
-        if (e && e != IT_DEL && !e->h.marked) { vm->itab[i] = IT_DEL; vm->icount--; vm->itomb++; }
+        if (e && e != IT_DEL) {                      /* dead: white (young) or still carrying the colour old objects had before a major collection's flip */
+            const unsigned c = e->h.marked & 3U;
+            if (c == 0U || c == 5U - vm->gc_black) { vm->itab[i] = IT_DEL; vm->icount--; vm->itomb++; }
+        }
     }
 }
 /* Interning only pays when strings repeat (a slice used as a key again and again). A window of 1024 attempts with fewer than 40%
@@ -357,7 +360,7 @@ int array_push(VM *vm, SArray *a, SpValue v) {
     if (a->len == 0 || a->h.xt != v.type) array_adopt_type(vm, a, (uint8_t)v.type);
     if (a->len == a->cap) array_reserve(vm, a, a->len + 1);
     if (array_packed(a)) ((int64_t *)a->data)[a->len] = v.type == T_BOOL ? (int64_t)(v.as.b != 0) : v.as.i;
-    else ((SpValue *)a->data)[a->len] = v;
+    else { gc_wb(vm, &a->h, v); ((SpValue *)a->data)[a->len] = v; }
     a->len++;
     return 0;
 }
@@ -368,7 +371,7 @@ void array_put(VM *vm, SArray *a, int64_t i, SpValue v) {
         a->h.xt = 0U;
     }
     if (array_packed(a)) ((int64_t *)a->data)[i] = v.type == T_BOOL ? (int64_t)(v.as.b != 0) : v.as.i;
-    else ((SpValue *)a->data)[i] = v;
+    else { gc_wb(vm, &a->h, v); ((SpValue *)a->data)[i] = v; }
 }
 
 /* a copy of a[s..e) that keeps the layout and the type note */
