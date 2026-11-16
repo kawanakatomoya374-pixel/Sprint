@@ -18,6 +18,7 @@ struct JitProto {
     uint64_t trace_clock;
     struct TraceIndexSlot *trace_index;
     TraceRegion *trace_slots[64];
+    uint8_t *rfb;            /* type feedback: rfb[pc] = type (T_INT / T_FLOAT / T_BOOL) of the value a call left on the stack when compiled code left at pc */
 };
 
 typedef struct {

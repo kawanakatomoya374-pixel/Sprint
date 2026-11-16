@@ -130,6 +130,7 @@ typedef struct JRegion {
     int npics;
     int poly;                /* loop regions: compiled with polymorphic method calls (after the monomorphic code kept being left) */
     int inv_inst;            /* the code has an INVOKE on an instance guarded by one class: a candidate for polymorphic recompilation */
+    uint8_t recomp, nrecomp; /* loop regions: new type feedback arrived (recompile at the next visit), and how many times that happened */
     JitUnit u;
     Proto *proto;
 } JRegion;
@@ -249,6 +250,7 @@ void jit_roots(Proto *p, void (*mark)(VM *, SpValue), VM *vm) {
 }
 
 void jit_free_proto(Proto *p) {
+    if (p->jit) free(p->jit->rfb);
     jit_pure_free(p);
     jit_leaf_free(p->leaf);
     p->leaf = NULL;
@@ -337,6 +339,16 @@ typedef struct {
     const char *why;
     char whybuf[48];
 } JC;
+
+static const SpValue *call_result_hint(const JC *c, uint32_t next_pc) {
+    const struct JitProto *jp = c->p->jit;
+    if (jp && jp->rfb && next_pc < c->p->code_len) {
+        const uint8_t t = jp->rfb[next_pc];
+        if (t == (uint8_t)T_FLOAT) return &g_hint_flt;
+        if (t == (uint8_t)T_BOOL) return &g_hint_bool;
+    }
+    return &g_hint_int;
+}
 
 static unsigned rd16(const uint8_t *p) { return (unsigned)p[0] | ((unsigned)p[1] << 8); }
 static int32_t rd32s(const uint8_t *p) {
@@ -1599,7 +1611,7 @@ static int do_invoke_poly(JC *c, uint32_t pc, int len, const SClass *k, const SS
     Ent *r = push(c, EK_MEM, TY_UNK, 0);
     if (!r) return 0;
     r->ppc = pc;
-    r->hint = &g_hint_int;
+    r->hint = call_result_hint(c, pc + (uint32_t)len);
     return after_call(c, pc + (uint32_t)len);
 }
 
@@ -1658,7 +1670,7 @@ static int do_invoke_inst(JC *c, uint32_t pc, int len, const SClass *k, const SS
     Ent *r = push(c, EK_MEM, TY_UNK, 0);
     if (!r) return 0;
     r->ppc = pc;
-    r->hint = &g_hint_int;
+    r->hint = call_result_hint(c, pc + (uint32_t)len);
     return after_call(c, pc + (uint32_t)len);
 }
 
@@ -2428,7 +2440,7 @@ called:
     Ent *r = push(c, EK_MEM, TY_UNK, 0);
     if (!r) return 0;
     r->ppc = pc;
-    r->hint = &g_hint_int;
+    r->hint = call_result_hint(c, pc + (uint32_t)len);
     return after_call(c, pc + (uint32_t)len);
 }
 
@@ -4135,7 +4147,7 @@ done:
 /* Compiled code has left (exit `id`, possibly deep inside native calls): point the interpreter at the instruction the
  * exit names, in the innermost frame. */
 static void jit_finish(VM *vm, int id) {
-    const JRegion *x = vm->jit_cur;
+    JRegion *x = vm->jit_cur;
     const JExit *e = &x->exits[id];
     if (e->pc == UINT32_MAX) return;      /* a traced inner loop left the frame set for the interpreter (jh_trace) */
     Frame *f = &vm->frames[vm->nframes - 1];
@@ -4171,6 +4183,19 @@ static void jit_finish(VM *vm, int id) {
     }
     f->pc = fp->code + e->pc;
     vm->sp = f->base + fp->nlocals + e->depth;
+    if (e->depth >= 1) {   /* type feedback: compiled code left right after a call; remember what the call returned (the next compile guesses it) */
+        const uint8_t *oc = fp->ocode ? fp->ocode : fp->code;
+        const SpValue top = vm->sp[-1];
+        if ((top.type == T_FLOAT || top.type == T_BOOL) && ((e->pc >= 4 && oc[e->pc - 4] == OP_INVOKE) || (e->pc >= 2 && oc[e->pc - 2] == OP_CALL))) {
+            struct JitProto *jp = jit_proto(fp);
+            if (jp && !jp->rfb) jp->rfb = calloc((size_t)fp->code_len + 1U, 1);
+            if (jp && jp->rfb && e->pc <= fp->code_len && jp->rfb[e->pc] != (uint8_t)top.type) {
+                jp->rfb[e->pc] = (uint8_t)top.type;
+                if (!x->unit && x->nrecomp < 2) { x->recomp = 1; x->nrecomp++; }
+                if (vm->jit_dbg > 1) (void)fprintf(stderr, "jit: feedback pc %u -> type %d\n", e->pc, (int)top.type);
+            }
+        }
+    }
 }
 
 /* A trace for the loop at `header` is ready. A region compiled earlier around that loop did not call it (there was none): retire the
@@ -4309,6 +4334,13 @@ int jit_site(VM *vm, Proto *p, const uint8_t *hdr, SpValue *base, SpValue *sp) {
     r->nent++;
     r->work += before - vm->ileft;
     jit_finish(vm, id);                 /* before any reset below: it reads this region's exit table */
+    if (r->recomp) {                    /* a call returned a type the code did not expect: compile again with that knowledge */
+        r->recomp = 0;
+        region_reset(r);
+        r->state = JS_NEW;
+        jp->nok--;
+        return 1;
+    }
     /* a region that keeps being left at once (a call it cannot make, a guard that fails) costs more than it gains */
     {   /* a polymorphic region waits longer: the methods it calls get their own compiled code only after they ran a while */
         const int lim = (r->poly || g_jit_force_poly) ? 4096 : 64;
