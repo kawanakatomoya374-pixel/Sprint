@@ -3238,6 +3238,7 @@ static int do_dup(JC *c, int n, uint32_t pc) {
         Ent *e = push(c, src.kind, src.ty, src.idx);
         if (!e) return 0;
         e->hint = src.hint;
+        e->cls = src.cls;                 /* a duplicated instance keeps its class (self.count += 1 reads and writes self) */
         e->ppc = src.kind == EK_MEM ? pc : src.ppc;
         if (src.kind == EK_MEM) {
             c->xe = -1;
