@@ -8,6 +8,7 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
+#include "platform.h"
 
 /* ---------------------------------------------------------------- */
 /* helpers                                                           */

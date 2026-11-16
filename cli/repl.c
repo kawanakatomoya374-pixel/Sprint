@@ -8,6 +8,7 @@
 #include "sp.h"
 #include "tools.h"
 #include <unistd.h>
+#include "platform.h"
 
 #define MAX_ALLOW 16
 

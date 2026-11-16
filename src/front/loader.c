@@ -6,6 +6,7 @@
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
+#include "platform.h"
 
 char *sp_read_file(const char *path, size_t *len) {
     FILE *f = fopen(path, "rb");

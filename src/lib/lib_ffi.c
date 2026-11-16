@@ -11,29 +11,29 @@
  * a wrong prototype or address crashes the process. It is never available in deterministic mode. */
 #define _POSIX_C_SOURCE 200809L
 #include "sp.h"
-#if !defined(__wasi__)
+#if !defined(__wasi__) && !defined(_WIN32)
 #include <dlfcn.h>
 #endif
 #include <stdlib.h>
 #include <string.h>
-#if !defined(__wasi__)
+#if !defined(__wasi__) && !defined(_WIN32)
 #include <sys/mman.h>
 #endif
 #include <unistd.h>
 
-#if defined(__wasi__)
-/* WebAssembly has neither dlopen nor executable memory: the ffi module is present but every call reports that. */
+#if defined(__wasi__) || defined(_WIN32)
+/* WebAssembly and (for now) Windows have neither dlopen nor executable memory: the ffi module is present but every call reports that. */
 static int ffi_unsupported(VM *vm, int argc, SpValue *argv, SpValue *ret) {
     (void)argc; (void)argv; (void)ret;
     if (!(vm->caps & CAP_FFI) || vm->deterministic)
         return vm_set_error(vm, E_PERM, "ffi is not permitted (run with --allow-ffi; it is never available with --deterministic)");
-    return vm_set_error(vm, E_RUNTIME, "ffi is not supported on WebAssembly");
+    return vm_set_error(vm, E_RUNTIME, "ffi is not supported on this platform");
 }
 static int asm_unsupported(VM *vm, int argc, SpValue *argv, SpValue *ret) {
     (void)argc; (void)argv; (void)ret;
     if (!(vm->caps & CAP_ASM) || vm->deterministic)
         return vm_set_error(vm, E_PERM, "asm is not permitted (run with --allow-asm; it is never available with --deterministic)");
-    return vm_set_error(vm, E_RUNTIME, "asm is not supported on WebAssembly");
+    return vm_set_error(vm, E_RUNTIME, "asm is not supported on this platform");
 }
 int ffi_jit_safe(const NativeDesc *d) { (void)d; return 0; }
 int ffi_jit_info(const NativeDesc *d, FfiJit *out) { (void)d; (void)out; return 0; }
@@ -858,4 +858,4 @@ const NativeDesc lib_ffi_fns[] = {
     {"callback", 2, 2, f_callback}, {"release_callback", 1, 1, f_release_callback}, {"abi", 0, 0, f_abi},
     {"prep", 2, 2, f_prep}, {"asm", 2, 2, f_asm},
     {NULL, 0, 0, NULL}};
-#endif /* !__wasi__ */
+#endif /* !(__wasi__ || _WIN32) */

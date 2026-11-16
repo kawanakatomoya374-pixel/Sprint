@@ -15,7 +15,7 @@
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
-#if !defined(__wasi__)
+#if !defined(__wasi__) && !defined(_WIN32)
 #include <sys/mman.h>
 #endif
 #include <unistd.h>

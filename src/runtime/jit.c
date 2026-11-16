@@ -46,7 +46,7 @@ void jit_configure(VM *vm) { vm->jit_on = 0; }
 
 #include <math.h>
 #include <stddef.h>
-#if !defined(__wasi__)
+#if !defined(__wasi__) && !defined(_WIN32)
 #include <sys/mman.h>
 #endif
 #include <unistd.h>

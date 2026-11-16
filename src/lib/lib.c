@@ -342,7 +342,7 @@ static const ModDesc modules[] = {
     {"math", math_fns, math_consts}, {"str", str_fns, no_consts}, {"table", table_fns, no_consts},
     {"io", io_fns, no_consts}, {"sys", sys_fns, sys_consts}, {"time", time_fns, no_consts},
     {"gc", gc_fns, no_consts}, {"coroutine", co_fns, no_consts},
-    {"json", lib_json_fns, no_consts}, {"gfx", lib_gfx_fns, no_consts}, {"random", lib_random_fns, no_consts}, {"fs", lib_fs_fns, no_consts}, {"_ffi", lib_ffi_fns, no_consts}, {"_x11", lib_x11_fns, no_consts}, {"typed", lib_typed_fns, no_consts}, {NULL, NULL, NULL}};
+    {"json", lib_json_fns, no_consts}, {"gfx", lib_gfx_fns, no_consts}, {"random", lib_random_fns, no_consts}, {"fs", lib_fs_fns, no_consts}, {"_ffi", lib_ffi_fns, no_consts}, {"_x11", lib_x11_fns, no_consts}, {"_win32", lib_win32_fns, no_consts}, {"typed", lib_typed_fns, no_consts}, {NULL, NULL, NULL}};
 
 const ModDesc *lib_find_module(const VM *vm, const char *name, size_t len) {
     for (int i = 0; modules[i].name; i++)
@@ -384,6 +384,8 @@ SpValue lib_module_value(VM *vm, const char *name) {
             v = vstr(vm, vm->deterministic ? "other" : "linux", 5);
 #elif defined(__APPLE__)
             v = vstr(vm, vm->deterministic ? "other" : "macos", 5);
+#elif defined(_WIN32)
+            v = vm->deterministic ? vstr(vm, "other", 5) : vstr(vm, "windows", 7);
 #else
             v = vstr(vm, "other", 5);
 #endif

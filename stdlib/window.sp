@@ -1,9 +1,9 @@
 # window: the platform layer between a gui.App and a display. A Backend owns one window: it delivers
 # input events (the same dicts gui.mouse_move() etc. build), shows finished frames and receives the
 # mouse-pointer shape. Backends are looked up by name; "headless" (an in-memory display that scripts
-# feed with events and that keeps every presented frame's hash) is always present. "x11" is a native
-# window on Linux/BSD (needs --allow-window and an X server; libX11 is loaded at run time). Other native backends
-# (Win32, Cocoa, framebuffer) register themselves with register().
+# feed with events and that keeps every presented frame's hash) is always present. "x11" (Linux/BSD) and "win32" (Windows) are native
+# windows (need --allow-window); "native" picks the one for this platform. Other backends (Cocoa, framebuffer)
+# register themselves with register().
 #
 #   import window
 #   let win = window.open(320, 200, "demo")
@@ -11,8 +11,10 @@
 #   window.run(app, win)
 import gfx
 import gui
+import sys
 import time
 import _x11
+import _win32
 
 # Interface every backend implements.
 export class Backend:
@@ -84,21 +86,25 @@ export class Headless extends Backend:
     func screenshot(self, path):
         self.last.save_png(path)
 
-# A native X11 window (Linux/BSD). Needs --allow-window and a reachable X server (DISPLAY); libX11 is loaded at run
-# time. poll() waits up to `wait_ms` for input and adds a "tick" event about every `tick_ms` so animations advance.
-export class X11 extends Backend:
+# Shared by the backends that show a real host window. A native object `win` (from _x11 / _win32) does the host
+# work; poll() waits up to `wait_ms` for input and adds a "tick" event about every `tick_ms` so animations advance.
+# Needs --allow-window (never with --deterministic).
+export class Native extends Backend:
     let win = nil
     let wait_ms = 16
     let tick_ms = 16
     let last = 0.0
     override func init(self):
-        self.name = "x11"
+        self.name = "native"
         self.live = true
+    # subclasses return the host window object
+    func host_open(self, w, h, title):
+        throw error("RuntimeError", "no host window on this platform")
     override func open(self, w, h, title):
         self.width = w
         self.height = h
         self.title = title
-        self.win = _x11.open(w, h, title)
+        self.win = self.host_open(w, h, title)
         self.last = time.monotonic()
     override func poll(self):
         if self.closed:
@@ -126,7 +132,28 @@ export class X11 extends Backend:
             self.win.close()
         self.closed = true
 
-const FACTORIES = {headless: () => Headless(), x11: () => X11()}
+# X11 window (Linux/BSD): libX11 is loaded at run time and DISPLAY must reach an X server.
+export class X11 extends Native:
+    override func init(self):
+        self.name = "x11"
+        self.live = true
+    override func host_open(self, w, h, title):
+        return _x11.open(w, h, title)
+
+# Win32 window (Windows).
+export class Win32 extends Native:
+    override func init(self):
+        self.name = "win32"
+        self.live = true
+    override func host_open(self, w, h, title):
+        return _win32.open(w, h, title)
+
+func native_backend():
+    if sys.platform == "windows":
+        return Win32()
+    return X11()
+
+const FACTORIES = {headless: () => Headless(), x11: () => X11(), win32: () => Win32(), native: native_backend}
 
 # register(name, factory): factory() returns a Backend. Replaces an earlier backend of that name.
 export func register(name, factory):

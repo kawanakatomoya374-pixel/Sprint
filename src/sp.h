@@ -838,6 +838,7 @@ extern const NativeDesc lib_gfx_fns[];
 const uint32_t *gfx_canvas_pixels(SpValue v, int *w, int *h); /* host access to a canvas (the OS kernel) */
 extern const NativeDesc lib_ffi_fns[];
 extern const NativeDesc lib_x11_fns[]; /* native X11 window (lib_x11.c) */
+extern const NativeDesc lib_win32_fns[]; /* native Win32 window (lib_win32.c) */
 uint32_t sp_hash_bytes(const char *s, size_t n);
 uint32_t str_hash_calc(const char *s, size_t n); /* never 0 */
 uint32_t str_hash_slow(SString *s);
@@ -929,6 +930,10 @@ uint8_t *image_encode(const Program *pg, size_t *out_len);
 Program *image_decode(VM *vm, const uint8_t *buf, size_t len, char *err, size_t errsz);
 void prog_quicken(Program *pg);
 
+/* no mmap / dlopen / machine-code ffi on these targets (WebAssembly and Windows use the heap and a stubbed ffi) */
+#if defined(__wasi__) || defined(_WIN32)
+#define SP_NO_MMAP 1
+#endif
 /* copy-and-patch loop JIT (x86-64 Linux only; elsewhere these are no-ops) */
 #if defined(__x86_64__) && defined(__linux__) && !defined(SP_NO_JIT) && !defined(SP_OS) && !defined(SP_OS_USER)
 #define SP_JIT 1
