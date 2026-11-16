@@ -239,6 +239,7 @@ void vm_gc(VM *vm) {
     mark_val(vm, vm->pend_obj);
     mark_val(vm, vm->uncaught);
     for (int i = 0; i < 17; i++) mark_obj(vm, (Obj *)vm->type_names[i]);
+    for (int i = 0; i < 4; i++) mark_obj(vm, (Obj *)vm->co_status_names[i]);
     for (;;) {
         while (vm->ngray != 0U) {
             Obj *o = vm->gray[--vm->ngray];

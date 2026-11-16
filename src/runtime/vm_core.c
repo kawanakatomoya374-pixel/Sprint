@@ -55,6 +55,10 @@ VM *vm_new(const Limits *lim, int caps) {
         const char *nm = type_name(tmp);
         vm->type_names[i] = vm_new_string(vm, nm, strlen(nm));
     }
+    {
+        static const char *const co_names[4] = {"suspended", "running", "normal", "dead"};
+        for (int i = 0; i < 4; i++) vm->co_status_names[i] = vm_new_string(vm, co_names[i], strlen(co_names[i]));
+    }
     lib_init(vm);
     return vm;
 }

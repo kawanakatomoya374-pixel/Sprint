@@ -723,6 +723,7 @@ struct VM {
     char fatal_msg[256];
 
     SString *type_names[17];
+    SString *co_status_names[4]; /* coroutine.status() results, indexed by CO_*: no string is allocated per call */
     SpValue *roots; /* permanent roots (prelude, modules) */
     int nroots, caproots;
 

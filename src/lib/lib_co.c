@@ -43,8 +43,8 @@ static int co_resume(VM *vm, int argc, SpValue *argv, SpValue *ret) {
 static int co_status(VM *vm, int argc, SpValue *argv, SpValue *ret) {
     (void)argc;
     if (need_co(vm, argv[0])) return 1;
-    const char *s = co_status_name(AS_CO(argv[0]));
-    *ret = vstr(vm, s, strlen(s));
+    int st = AS_CO(argv[0])->status;
+    *ret = v_obj(T_STRING, vm->co_status_names[st >= CO_SUSPENDED && st <= CO_DEAD ? st : CO_DEAD]);
     return 0;
 }
 static int co_close(VM *vm, int argc, SpValue *argv, SpValue *ret) {
