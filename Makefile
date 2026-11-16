@@ -117,7 +117,7 @@ pgo:
 	sh tools/pgo_train.sh $(BUILD)/pgo/sprint
 	find $(BUILD)/pgo -name '*.o' -delete
 	rm -f $(BUILD)/pgo/sprint
-	$(MAKE) BUILD=$(BUILD)/pgo PGO="-fprofile-use -fprofile-correction -Wno-error=coverage-mismatch -Wno-missing-profile" $(BUILD)/pgo/sprint
+	$(MAKE) BUILD=$(BUILD)/pgo PGO="-fprofile-use -fprofile-correction -Wno-error=coverage-mismatch -Wno-missing-profile -Wno-suggest-attribute=cold" $(BUILD)/pgo/sprint
 	cp $(BUILD)/pgo/sprint $(BUILD)/sprint-pgo
 .PHONY: pgo
 

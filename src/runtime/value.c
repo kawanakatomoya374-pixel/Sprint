@@ -384,9 +384,27 @@ SArray *array_slice(VM *vm, const SArray *a, int64_t s, int64_t e) {
     return r;
 }
 
+/* the array of vals[0..n) in the state n pushes would leave it in (layout and element-type note), without the per-element work */
 SArray *array_from(VM *vm, const SpValue *vals, int64_t n) {
     SArray *a = vm_new_array(vm, n);
-    for (int64_t i = 0; i < n; i++) array_push(vm, a, vals[i]);
+    if (n <= 0) return a;
+    const uint8_t t = (uint8_t)vals[0].type;
+    int64_t i = 1;
+    while (i < n && (uint8_t)vals[i].type == t) i++;
+    if (i < n) {                                   /* mixed types: boxed, no note */
+        memcpy(a->data, vals, (size_t)n * sizeof(SpValue));
+        a->h.xt = 0U;
+    } else if (SP_PACKED_ARRAYS && t >= (uint8_t)T_BOOL && t <= (uint8_t)T_FLOAT) {
+        array_relayout(vm, a, 1);
+        int64_t *d = (int64_t *)a->data;
+        if (t == (uint8_t)T_BOOL) for (i = 0; i < n; i++) d[i] = vals[i].as.b != 0;
+        else for (i = 0; i < n; i++) d[i] = vals[i].as.i;
+        a->h.xt = t;
+    } else {
+        memcpy(a->data, vals, (size_t)n * sizeof(SpValue));
+        a->h.xt = t;
+    }
+    a->len = n;
     return a;
 }
 

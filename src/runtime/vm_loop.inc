@@ -492,8 +492,7 @@ static RunStatus RUN_LOOP_NAME(VM *vm, VMTraceCapture **capp, RunCold *ccold, in
         case OP_NEW_ARRAY: {
             unsigned n = U16();
             GCP();
-            SArray *a = vm_new_array(vm, (int64_t)n);
-            for (unsigned i = 0; i < n; i++) (void)array_push(vm, a, sp[-(int)n + (int)i]);
+            SArray *a = array_from(vm, sp - (int)n, (int64_t)n);
             sp -= n;
             PUSH(v_obj(T_ARRAY, a));
             break;

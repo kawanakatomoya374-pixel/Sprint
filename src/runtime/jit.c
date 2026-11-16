@@ -2740,8 +2740,7 @@ static int jh_setidx(VM *vm, const SpValue *o, const SpValue *k, const SpValue *
 /* [a, b, ...] / []: the elements sit in the consecutive stack slots ops[0..n-1] (published to the collector by ST_hconcat) */
 static int jh_newarr(VM *vm, const SpValue *ops, unsigned n, SpValue *dst) {
     if (vm->bytes >= vm->gc_next) vm_gc(vm);
-    SArray *a = vm_new_array(vm, (int64_t)n);
-    for (unsigned i = 0; i < n; i++) (void)array_push(vm, a, ops[i]);
+    SArray *a = array_from(vm, ops, (int64_t)n);
     *dst = v_obj(T_ARRAY, a);
     return 1;
 }
