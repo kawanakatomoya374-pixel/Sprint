@@ -205,7 +205,69 @@ void string_finish(SString *s) {
     else s->hash = 0;
 }
 
+/* Short strings made from bytes (slices, literals, library results) are interned: equal contents share one object, so a table lookup
+ * with such a key is a pointer compare and a loop that builds the same keys over and over allocates nothing. The table is weak
+ * (intern_sweep, called by the GC after marking). Strings built in place (concatenation, formatting) are not interned. */
+enum { INTERN_MAX = 16 };
+#define IT_DEL ((SString *)(uintptr_t)1)
+static inline size_t intern_slot(uint32_t h, size_t mask) { return (size_t)(h * 2654435761u >> 8) & mask; }
+static void intern_grow(VM *vm) {
+    size_t ncap = vm->icap ? vm->icap * 2 : 1024;
+    if (vm->icount * 2 < vm->icap) ncap = vm->icap;                       /* mostly tombstones: rebuild at the same size */
+    SString **nt = calloc(ncap, sizeof *nt);
+    if (!nt) return;                                                       /* keep the old table: interning only gets slower */
+    for (size_t i = 0; i < vm->icap; i++) {
+        SString *e = vm->itab[i];
+        if (!e || e == IT_DEL) continue;
+        size_t j = intern_slot(e->hash, ncap - 1);
+        while (nt[j]) j = (j + 1) & (ncap - 1);
+        nt[j] = e;
+    }
+    free(vm->itab);
+    vm->itab = nt;
+    vm->icap = ncap;
+    vm->itomb = 0;
+}
+void intern_sweep(VM *vm) {
+    for (size_t i = 0; i < vm->icap; i++) {
+        SString *e = vm->itab[i];
+        if (e && e != IT_DEL && !e->h.marked) { vm->itab[i] = IT_DEL; vm->icount--; vm->itomb++; }
+    }
+}
+/* Interning only pays when strings repeat (a slice used as a key again and again). A window of 1024 attempts with fewer than 40%
+ * hits (a split() of distinct tokens) switches it off for the next 65536 strings, then it is sampled again. */
+enum { IQ_WINDOW = 1024, IQ_MIN_HITS = 410, IQ_PAUSE = 65536 };
 SString *vm_new_string(VM *vm, const char *src, size_t len) {
+    if (len <= INTERN_MAX && vm->iq_off == 0) {
+        const uint32_t h = str_hash_calc(src, len);
+        if (++vm->iq_n >= IQ_WINDOW) {
+            if (vm->iq_hit < IQ_MIN_HITS) vm->iq_off = IQ_PAUSE;
+            vm->iq_n = 0;
+            vm->iq_hit = 0;
+        }
+        if (vm->itab) {
+            const size_t mask = vm->icap - 1;
+            for (size_t i = intern_slot(h, mask);; i = (i + 1) & mask) {
+                SString *e = vm->itab[i];
+                if (!e) break;
+                if (e != IT_DEL && e->hash == h && e->len == len && memcmp(e->dp, src, len) == 0) { vm->iq_hit++; return e; }
+            }
+        }
+        SString *s = vm_alloc_string(vm, len);
+        if (len) memcpy(s->dp, src, len);
+        s->hash = h;
+        if ((vm->icount + vm->itomb + 1) * 2 > vm->icap) intern_grow(vm);
+        if (vm->itab && (vm->icount + vm->itomb + 1) * 2 <= vm->icap) {
+            const size_t mask = vm->icap - 1;
+            size_t i = intern_slot(h, mask);
+            while (vm->itab[i] && vm->itab[i] != IT_DEL) i = (i + 1) & mask;
+            if (vm->itab[i] == IT_DEL) vm->itomb--;
+            vm->itab[i] = s;
+            vm->icount++;
+        }
+        return s;
+    }
+    if (vm->iq_off) vm->iq_off--;
     SString *s = vm_alloc_string(vm, len);
     if (len) memcpy(s->dp, src, len);
     string_finish(s);

@@ -723,6 +723,9 @@ struct VM {
     char fatal_msg[256];
 
     SString *type_names[17];
+    SString **itab;              /* intern table of short strings (open addressing; NULL = empty, 1 = deleted); weak: the GC drops dead entries */
+    size_t icap, icount, itomb;
+    uint32_t iq_n, iq_hit, iq_off; /* interning policy: attempts and hits in the current window, and attempts to skip (low hit rate) */
     SString *co_status_names[4]; /* coroutine.status() results, indexed by CO_*: no string is allocated per call */
     SpValue *roots; /* permanent roots (prelude, modules) */
     int nroots, caproots;
@@ -842,6 +845,7 @@ extern const NativeDesc lib_x11_fns[]; /* native X11 window (lib_x11.c) */
 extern const NativeDesc lib_win32_fns[]; /* native Win32 window (lib_win32.c) */
 uint32_t sp_hash_bytes(const char *s, size_t n);
 uint32_t str_hash_calc(const char *s, size_t n); /* never 0 */
+void intern_sweep(VM *vm);                         /* GC: drop dead strings from the intern table */
 uint32_t str_hash_slow(SString *s);
 /* A long string's hash is computed on first use (0 = not yet), so building big strings costs no hashing. */
 static inline uint32_t str_hash_peek(const SString *s) { return s->hash ? s->hash : str_hash_calc(s->dp, s->len); }

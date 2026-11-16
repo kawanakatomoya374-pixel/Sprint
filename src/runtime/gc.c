@@ -268,6 +268,7 @@ void vm_gc(VM *vm) {
         break;
     }
 
+    intern_sweep(vm);   /* dead strings leave the intern table before their blocks are freed */
     Obj **pp = &vm->objs;
     while (*pp) {
         Obj *o = *pp;
@@ -345,6 +346,7 @@ void vm_free(VM *vm) {
     free(vm->hmods);
     free(vm->hdiag);
     free(vm->gray);
+    free(vm->itab);
     free(vm->slots);
     free(vm->links);
     free(vm);
