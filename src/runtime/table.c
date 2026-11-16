@@ -204,6 +204,9 @@ int table_get(VM *vm, STable *t, SpValue key, SpValue *out, int *found) {
     return 0;
 }
 
+/* the entry index of an integer key, or -1 (the JIT's table helpers) */
+int64_t table_find_int(const STable *t, int64_t k) { return t_find_int(t, k, hash_int(k), NULL); }
+
 /* Same as table_get_str for a key that is already an SString. */
 int table_get_sstr(const STable *t, const SString *key, SpValue *out) {
     int64_t e = t_find_sstr(t, key, str_hash_peek(key), NULL, NULL);

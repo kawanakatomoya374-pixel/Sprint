@@ -2693,12 +2693,18 @@ static int do_for_next(JC *c, uint32_t pc, uint32_t *skip) {
  * interpreter, which runs the instruction (and raises its errors) as always. The collector may run inside them: the stencil
  * publishes the stack top first. */
 static int jh_getidx(VM *vm, const SpValue *o, const SpValue *k, SpValue *dst) {
+    (void)vm;
     SpValue r;
     switch (o->type) {
-    case T_TABLE:
-        if (k->type != T_STRING && k->type != T_INT) return 0;
-        if (table_get(vm, AS_TABLE(*o), *k, &r, NULL)) return 0;
+    case T_TABLE: {
+        const STable *t = AS_TABLE(*o);
+        int64_t e;
+        if (k->type == T_INT) e = table_find_int(t, k->as.i);
+        else if (k->type == T_STRING) e = table_find_sstr(t, AS_STR(*k));
+        else return 0;
+        r = e >= 0 ? t->ents[e].val : v_nil();
         break;
+    }
     case T_ARRAY: {
         const SArray *a = AS_ARRAY(*o);
         if (k->type != T_INT || k->as.i < 0 || k->as.i >= a->len) return 0;
@@ -2766,8 +2772,17 @@ static int jh_strmethod(VM *vm, SpValue *argv, unsigned argc, SpValue *dst, Nati
 static int jh_setidx(VM *vm, const SpValue *o, const SpValue *k, const SpValue *v) {
     if (vm->bytes >= vm->gc_next) vm_gc(vm);
     if (o->type == T_TABLE) {
+        STable *t = AS_TABLE(*o);
         if (k->type != T_STRING && k->type != T_INT) return 0;
-        return table_set(vm, AS_TABLE(*o), *k, *v) == 0;
+        if (v->type != T_NIL) {   /* the key is already there: overwrite the value in place (the common case of t[k] = t[k] + 1) */
+            const int64_t e = k->type == T_INT ? table_find_int(t, k->as.i) : table_find_sstr(t, AS_STR(*k));
+            if (e >= 0) {
+                gc_wb(vm, &t->h, *v);
+                t->ents[e].val = *v;
+                return 1;
+            }
+        }
+        return table_set(vm, t, *k, *v) == 0;
     }
     if (o->type == T_ARRAY) {
         SArray *a = AS_ARRAY(*o);
