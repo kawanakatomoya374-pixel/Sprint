@@ -521,6 +521,54 @@ static RunStatus run_loop(VM *vm) {
 /* Call a Sprint value from a native (SPEC 20.5). The only C recursion in the
  * VM; bounded by max_native_reentry. Returns 1 with the error pending. */
 int vm_call(VM *vm, SpValue fnv, int argc, const SpValue *argv, SpValue *ret) {
+#if SP_JIT
+    /* a callback (array.map(f), sort comparators, ...) whose function has compiled code runs it directly instead of entering the interpreter
+     * loop. The frame is an ordinary one while the code runs (its return stores the result in the callee slot fv[0]); when the code leaves
+     * for the interpreter, the frame becomes the boundary frame and run_loop finishes the call as usual. */
+    if (fnv.type == T_FUNCTION && vm->jit_on) {
+        SFunc *jf = AS_FUNC(fnv);
+        Proto *jp = jf->proto;
+        JitUnit *ju = jp ? jp->junit : NULL;
+        if (ju && argc == jp->nparams && argc == jp->nrequired && !jp->has_rest && jp->ndefaults == 0 && vm->native_depth < vm->max_reentry &&
+            vm->nframes < vm->max_frames) {
+            SpValue *fv = vm->sp;
+            SpValue *nb = fv + 1;
+            if ((char *)nb + ju->need + 8 * sizeof(SpValue) <= (char *)vm->stack_end) {
+                fv[0] = fnv;
+                for (int i = 0; i < argc; i++) nb[i] = argv[i];
+                for (int i = argc; i < jp->nlocals; i++) nb[i] = v_nil();
+                const int depth = vm->nframes;
+                Frame *nf = &vm->frames[vm->nframes++];
+                nf->fn = jf;
+                nf->base = nb;
+                nf->kind = FK_NORMAL;
+                nf->dbase = vm->ndr;
+                nf->uev = v_nil();
+                nf->pc = jp->code;
+                vm->sp = nb + jp->nlocals;
+                vm->native_depth++;
+                jit_run(vm, ju, nb);
+                vm->native_depth--;
+                if (vm->nframes == depth) {   /* returned */
+                    *ret = fv[0];
+                    vm->sp = fv;
+                    return 0;
+                }
+                vm->frames[depth].kind = FK_BOUNDARY;
+                vm->native_depth++;
+                RunStatus jst = run_loop(vm);
+                vm->native_depth--;
+                vm->sp = fv;
+                if (jst == RS_OK) {
+                    *ret = vm->bret;
+                    vm->bret = v_nil();
+                    return 0;
+                }
+                return 1;
+            }
+        }
+    }
+#endif
     if (fnv.type == T_CLASS) fnv = v_obj(T_FUNCTION, AS_CLASS(fnv)->ctor);
     if (check_callable(vm, &fnv, argc)) return 1;
     if (vm->native_depth >= vm->max_reentry) vm_fatal(vm, RS_MEMORY, "native re-entry limit exceeded");
@@ -565,6 +613,12 @@ int vm_call(VM *vm, SpValue fnv, int argc, const SpValue *argv, SpValue *ret) {
     }
     nf->pc = p->code + entry;
     vm->sp = nb + p->nlocals;
+#if SP_JIT
+    if (vm->jit_on && !p->junit && argc == p->nparams && !p->has_rest && p->ndefaults == 0) {   /* a callback that keeps being called gets compiled (the fast path above runs it next time) */
+        if (p->jcall > 1) p->jcall--;
+        else (void)jit_call_hot(vm, f, nb);
+    }
+#endif
     vm->native_depth++;
     RunStatus st = run_loop(vm);
     vm->native_depth--;
