@@ -89,6 +89,17 @@ static const uint8_t JIT_REGION_XMM_POOL[7] = {1U, 2U, 3U, 4U, 5U, 6U, 7U};
 
 typedef struct { uint32_t pc; int depth; int ictx; } JExit;   /* ictx: 0, or 1 + the inlined call the exit lies in */
 typedef struct { Proto *proto; uint32_t retpc; int base_slots; int ctor; int parent; } JIctx;   /* an inlined callee: resume pc of the caller, callee base in slots */
+/* A polymorphic method call site (stencil pinvoke reads cls[] / fn[] at these offsets): up to four receiver classes and their
+ * methods; jh_pic fills it on a miss. The GC marks what it holds as long as the region lives (jit_roots). */
+static int g_jit_force_poly;   /* developer aid SPRINT_JIT_POLY=1: every loop region compiles polymorphic method calls */
+typedef struct JPic {
+    const SClass *cls[4];            /* offset 0 */
+    SFunc *fn[4];                    /* offset 32 */
+    const SString *name;
+    uint32_t pc;                     /* the INVOKE this cache belongs to */
+    int n, rr;
+} JPic;
+
 typedef struct JRegion {
     uint32_t hdr;
     int state;
@@ -112,6 +123,10 @@ typedef struct JRegion {
     int64_t inl_extent;      /* loop regions: bytes above the frame base that inlined calls use (0: none), checked at entry */
     int oks, fails;          /* units: normal returns / entry-guard failures of the outermost call */
     int nk0, nk;             /* kt[nk0..nk): objects the code refers to (classes, methods), kept alive by the GC */
+    JPic **pics;             /* polymorphic call sites of this code */
+    int npics;
+    int poly;                /* loop regions: compiled with polymorphic method calls (after the monomorphic code kept being left) */
+    int inv_inst;            /* the code has an INVOKE on an instance guarded by one class: a candidate for polymorphic recompilation */
     JitUnit u;
     Proto *proto;
 } JRegion;
@@ -177,6 +192,7 @@ void jit_configure(VM *vm) {
     e = getenv("SPRINT_JIT_DEBUG");
     if (e && e[0] >= '1') vm->jit_dbg = e[0] - '0';
     e = getenv("SPRINT_JIT_STATS");
+    { const char *ep = getenv("SPRINT_JIT_POLY"); g_jit_force_poly = ep && ep[0] == '1'; }
     g_jit_stats = e && e[0] && e[0] != '0';
     g_hint_int = v_int(0);
     g_hint_flt = v_float(0.0);
@@ -188,8 +204,25 @@ void jit_configure(VM *vm) {
     vm->jit_new = jit_new_inst;
 }
 
+static void pics_free(JPic **pics, int n) {
+    for (int i = 0; i < n; i++) free(pics[i]);
+    free(pics);
+}
+
+/* throw the compiled code away (the region is not running) so that it can be compiled again */
+static void region_reset(JRegion *r) {
+    pics_free(r->pics, r->npics);
+    jit_code_unmap(r->mem, r->msize);
+    free(r->kt);
+    free(r->exits);
+    free(r->ictx);
+    r->pics = NULL; r->npics = 0; r->mem = NULL; r->msize = 0; r->kt = NULL; r->exits = NULL; r->nexits = 0;
+    r->ictx = NULL; r->nictx = 0; r->nk0 = r->nk = 0; r->fn = NULL; r->inl_extent = 0; r->nent = 0; r->work = 0; r->cnt = 0;
+}
+
 static void region_free(JRegion *r) {
     if (!r) return;
+    pics_free(r->pics, r->npics);
     jit_code_unmap(r->mem, r->msize);
     free(r->kt);
     free(r->exits);
@@ -204,6 +237,11 @@ void jit_roots(Proto *p, void (*mark)(VM *, SpValue), VM *vm) {
         const JRegion *r = i < jp->n ? jp->r[i] : jp->unit;
         if (!r || !r->kt) continue;
         for (int k = r->nk0; k < r->nk; k++) mark(vm, r->kt[k]);
+        for (int q = 0; q < r->npics; q++)
+            for (int j = 0; j < 4; j++) {
+                if (r->pics[q]->cls[j]) mark(vm, v_obj(T_CLASS, (Obj *)(uintptr_t)r->pics[q]->cls[j]));
+                if (r->pics[q]->fn[j]) mark(vm, v_obj(T_FUNCTION, r->pics[q]->fn[j]));
+            }
     }
 }
 
@@ -277,6 +315,10 @@ typedef struct {
     int skip1;                           /* the next stencil may drop its leading "mov H1+8(%r12),%rax" */
     int32_t h5;                          /* sixth hole of the next stencil (consumed by em) */
     uint64_t hq2;                        /* second 64-bit hole of the next stencil (consumed by em) */
+    int poly;                            /* emit polymorphic method calls (pinvoke) instead of a class guard */
+    int inv_inst;                        /* an instance INVOKE with a class guard was emitted */
+    JPic **pics;
+    int npics;
     uint32_t cur_pc;
     /* Compile-time diagnostics, reset for each final analysis/emission walk. */
     uint32_t nstencils, nraw, nspills, nflushed, nlocal_mirrors;
@@ -1468,7 +1510,65 @@ static int ictx_add(JC *c, Proto *kp, uint32_t retpc, int base_slots);
 static int inl_body(JC *c, const Proto *kp, const uint8_t *kcode, int argc, int pf, uint32_t pc0, int ic, SFunc *cf, const SClass *ctor);
 static int do_get_index(JC *c, uint32_t pc, int len, uint32_t *skip);
 static int do_set_index(JC *c, uint32_t pc);
+/* resolve the method of receiver class k for a polymorphic site and remember it (stencil pinvoke's slow path); NULL: let the
+ * interpreter make the call (a field holding a function, a native or missing method) */
+static SFunc *jh_pic(VM *vm, JPic *pic, const SClass *k) {
+    (void)vm;
+    SpValue fv;
+    if (table_get_sstr(k->fields, pic->name, &fv)) return NULL;
+    if (!table_get_sstr(k->methods, pic->name, &fv) || fv.type != T_FUNCTION || !AS_FUNC(fv)->proto) return NULL;
+    int slot = pic->n < 4 ? pic->n++ : (pic->rr++ & 3);
+    pic->cls[slot] = k;
+    pic->fn[slot] = AS_FUNC(fv);
+    return AS_FUNC(fv);
+}
+
+static JPic *pic_for(JC *c, uint32_t pc, const SString *name) {
+    for (int i = 0; i < c->npics; i++)
+        if (c->pics[i]->pc == pc) return c->pics[i];
+    JPic **np = realloc(c->pics, (size_t)(c->npics + 1) * sizeof *np);
+    if (!np) return NULL;
+    c->pics = np;
+    JPic *pic = calloc(1, sizeof *pic);
+    if (!pic) return NULL;
+    pic->name = name;
+    pic->pc = pc;
+    c->pics[c->npics++] = pic;
+    return pic;
+}
+
+/* INVOKE on an instance whose class varies from one execution to the next: no class guard, the receiver's class picks the method
+ * through the site's cache (the methods are called, not inlined) */
+static int do_invoke_poly(JC *c, uint32_t pc, int len, const SClass *k, const SString *name, int argc) {
+    if (!flush_regs(c)) return 0;
+    int pm = c->dep - 1 - argc;
+    if (pm < c->d0) FAIL("stack underflow");
+    SpValue fv;
+    if (table_get_sstr(k->fields, name, &fv)) FAIL("field call");
+    if (!table_get_sstr(k->methods, name, &fv) || fv.type != T_FUNCTION || !AS_FUNC(fv)->proto) FAIL("method");
+    if (c->st[pm].kind == EK_K || c->st[pm].kind == EK_MOD) FAIL("method receiver");
+    JPic *pic = pic_for(c, pc, name);
+    if (!pic) FAIL("out of memory");
+    if (pic->n == 0) { pic->cls[0] = k; pic->fn[0] = AS_FUNC(fv); pic->n = 1; }
+    int pk = kadd(c, v_int((int64_t)(intptr_t)pic));
+    if (pk < 0) FAIL("too many constants");
+    if (!flush_from(c, c->d0, c->dep)) return 0;
+    int x = exit_for(c, pc, c->dep);
+    if (x < 0) FAIL("out of memory");
+    c->xe = x;
+    c->hq2 = (uint64_t)(uintptr_t)jh_pic;
+    EM(ST_pinvoke, soff(c, pm), argc, koff(pk), 0, 0, (uint64_t)(uintptr_t)(c->p->code + pc + (uint32_t)len));
+    c->dep -= argc + 1;
+    Ent *r = push(c, EK_MEM, TY_UNK, 0);
+    if (!r) return 0;
+    r->ppc = pc;
+    r->hint = &g_hint_int;
+    return after_call(c, pc + (uint32_t)len);
+}
+
 static int do_invoke_inst(JC *c, uint32_t pc, int len, const SClass *k, const SString *name, int argc) {
+    if (c->poly && c->cur_ic == 0) return do_invoke_poly(c, pc, len, k, name, argc);
+    c->inv_inst = 1;
     if (!flush_regs(c)) return 0;
     int pm = c->dep - 1 - argc;
     if (pm < c->d0) FAIL("stack underflow");
@@ -3673,6 +3773,7 @@ static int op_allowed(int op, int unit) {
 static void jc_free(JC *c) {
     free(c->vt); free(c->vk); free(c->vlive); free(c->lt); free(c->lvalid); free(c->ldep); free(c->lmap); free(c->isins); free(c->rnext_unit); free(c->st);
     free(c->lrd); free(c->cb); free(c->fx); free(c->pcaddr); free(c->ex); free(c->kt); free(c->ic);
+    pics_free(c->pics, c->npics);
 }
 
 static int jc_setup(JC *c, uint32_t len) {
@@ -3700,6 +3801,8 @@ static int compile_region(VM *vm, Proto *p, JRegion *r, SFunc *fn, SpValue *base
     c->p = p;
     c->fn = fn;
     c->unit = r->unit;
+    c->poly = r->poly;
+    if (g_jit_force_poly && !c->unit) c->poly = 1;
     c->region = r;
     c->code = p->ocode ? p->ocode : p->code;
     c->hdr = r->hdr;
@@ -3956,6 +4059,11 @@ static int compile_region(VM *vm, Proto *p, JRegion *r, SFunc *fn, SpValue *base
     r->ictx = c->ic;
     c->ic = NULL;
     r->nictx = c->nic;
+    r->inv_inst = c->inv_inst;
+    r->pics = c->pics;
+    r->npics = c->npics;
+    c->pics = NULL;
+    c->npics = 0;
     r->inl_extent = c->inl_extent;
     r->d0 = depth;
     ok = 1;
@@ -4095,9 +4203,21 @@ int jit_site(VM *vm, Proto *p, const uint8_t *hdr, SpValue *base, SpValue *sp) {
     int id = r->fn(vm, base, r->kt, fr);
     r->nent++;
     r->work += before - vm->ileft;
+    jit_finish(vm, id);                 /* before any reset below: it reads this region's exit table */
     /* a region that keeps being left at once (a call it cannot make, a guard that fails) costs more than it gains */
-    if (r->nent == 64 && r->work < 2u * 64u) r->state = JS_FAIL;
-    jit_finish(vm, id);
+    {   /* a polymorphic region waits longer: the methods it calls get their own compiled code only after they ran a while */
+        const int lim = (r->poly || g_jit_force_poly) ? 4096 : 64;
+        if (r->nent == lim && r->work < 2u * (uint64_t)lim) {
+            if (!r->poly && !r->unit && r->inv_inst) {   /* the class guards of its method calls keep failing: try polymorphic calls once */
+                region_reset(r);
+                r->poly = 1;
+                r->state = JS_NEW;
+                jp->nok--;
+            } else {
+                r->state = JS_FAIL;
+            }
+        }
+    }
     return 1;
 }
 

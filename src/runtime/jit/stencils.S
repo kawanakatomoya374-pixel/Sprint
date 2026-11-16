@@ -34,6 +34,7 @@
 #include "layout.h"
 
 #define T_FUNCTION 7
+#define T_INSTANCE 9
 
 ST entry                        # loop region: rdi = VM, rsi = frame base, rdx = constants, rcx = current Frame
     endbr64
@@ -416,6 +417,60 @@ ST uinvoke
     jns 3b
     mov H2(%r13),%r9
     mov %r9,H0(%r12)
+    mov %rax,H0+8(%r12)
+    UC_EFFECT H1+1, 0, $0, $0, HQ
+
+# polymorphic method call on an instance: slot H0 = receiver, H1 more arguments, constant H2 (kt, an int) = the site's cache
+# {cls[4], fn[4]}, HQ = pc to resume the caller at, HQ2 = jh_pic(vm, cache, cls) -> SFunc* or 0 (resolves and remembers the
+# receiver class's method). The receiver's class picks the method (four classes without leaving the code); a receiver that is
+# not an instance, a class the helper cannot resolve, or a method without compiled code leaves through JIT_X before anything has
+# been done, and the interpreter repeats the call. Otherwise the same as uinvoke.
+ST pinvoke
+    cmpq $T_INSTANCE,H0(%r12)
+    jne JIT_X
+    mov H0+8(%r12),%rax
+    mov L_INST_CLS(%rax),%rax               # the receiver's class
+    mov H2+8(%r13),%rdx                     # the cache
+    cmp (%rdx),%rax
+    jne 5f
+    mov 32(%rdx),%rax
+    jmp 9f
+5:  cmp 8(%rdx),%rax
+    jne 6f
+    mov 40(%rdx),%rax
+    jmp 9f
+6:  cmp 16(%rdx),%rax
+    jne 7f
+    mov 48(%rdx),%rax
+    jmp 9f
+7:  cmp 24(%rdx),%rax
+    jne 8f
+    mov 56(%rdx),%rax
+    jmp 9f
+8:  mov %rbx,%rdi                           # miss: resolve and remember
+    mov %rdx,%rsi
+    mov %rax,%rdx
+    movabs $HQ2,%rax
+    call *%rax
+    test %rax,%rax
+    jz JIT_X
+9:  mov L_SFUNC_PROTO(%rax),%rcx
+    test %rcx,%rcx
+    jz JIT_X
+    mov L_PROTO_JUNIT(%rcx),%rdx
+    test %rdx,%rdx
+    jz JIT_X
+    UC_CHECKS H1+1
+    mov $H1,%r10d                           # shift slots H1 .. 0 up by one
+3:  mov %r10,%r11
+    shl $4,%r11
+    mov H0(%r12,%r11),%r9
+    mov %r9,H0+16(%r12,%r11)
+    mov H0+8(%r12,%r11),%r9
+    mov %r9,H0+24(%r12,%r11)
+    dec %r10
+    jns 3b
+    movq $T_FUNCTION,H0(%r12)
     mov %rax,H0+8(%r12)
     UC_EFFECT H1+1, 0, $0, $0, HQ
 
