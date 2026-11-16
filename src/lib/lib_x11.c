@@ -13,8 +13,12 @@
 #include <locale.h>
 #include <stdio.h>
 
-#if defined(_WIN32)
-const NativeDesc lib_x11_fns[] = {{NULL, 0, 0, NULL}};
+#if defined(_WIN32) || defined(__wasi__)
+static int x_unsupported(VM *vm, int argc, SpValue *argv, SpValue *ret) {
+    (void)argc; (void)argv; (void)ret;
+    return vm_set_error(vm, E_RUNTIME, "the x11 backend is not available on this platform");
+}
+const NativeDesc lib_x11_fns[] = {{"open", 3, 3, x_unsupported}, {NULL, 0, 0, NULL}};
 #else
 #include <dlfcn.h>
 #include <poll.h>

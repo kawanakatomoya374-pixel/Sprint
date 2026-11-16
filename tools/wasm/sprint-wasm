@@ -1,0 +1,4 @@
+#!/bin/sh
+# `sprint` backed by build/sprint.wasm (for tests: SPRINT=tools/wasm/sprint-wasm tests/run_tests.sh)
+d=$(dirname "$0")
+exec node --no-warnings "$d/run.js" "$@"

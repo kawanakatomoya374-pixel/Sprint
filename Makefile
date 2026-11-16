@@ -386,3 +386,16 @@ test-trace-snapshot-budget: $(BUILD)/sprint
 .PHONY: test-x11
 test-x11: $(BUILD)/sprint
 	@tests/x11/run.sh $(BUILD)/sprint
+
+# ---- WebAssembly (WASI) build ---------------------------------------------------------------------------------------
+# Needs a C compiler that targets wasm32-wasi, e.g. zig:  pip install ziglang  &&  make wasm ZIG="python3 -m ziglang"
+# Interpreter only (no machine-code JIT, ffi or native windows); run with: node tools/wasm/run.js run FILE.sp
+ZIG        ?= zig
+WASM_FLAGS := -target wasm32-wasi -O2 -std=gnu11 -Isrc -DNDEBUG_SP -DSP_NO_JIT -mexception-handling -mllvm -wasm-enable-sjlj \
+              -Wl,-z,stack-size=4194304 -Wl,--max-memory=2147483648
+.PHONY: wasm test-wasm
+wasm: $(BUILD)/sprint.wasm
+$(BUILD)/sprint.wasm: $(ALLSRC) src/runtime/wasm_eh.c
+	$(ZIG) cc $(WASM_FLAGS) -o $@ $(filter %.c,$^)
+test-wasm: $(BUILD)/sprint.wasm
+	@tools/wasm/test.sh

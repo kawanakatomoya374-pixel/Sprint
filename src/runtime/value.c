@@ -1,6 +1,8 @@
 /* Values, objects, strings, arrays, equality and ordering. */
 #include "value_int.h"
+#if !defined(__wasi__)
 #include <sys/mman.h>
+#endif
 
 /* ---------------------------------------------------------------- */
 /* error names                                                       */
@@ -388,15 +390,24 @@ static char *co_block_alloc(VM *vm, size_t sz) {
     }
     if (vm->bytes + sz > vm->lim.max_heap_bytes)
         vm_fatal(vm, RS_MEMORY, "heap limit exceeded (%llu bytes)", (unsigned long long)vm->lim.max_heap_bytes);
+#if defined(__wasi__)
+    void *m = calloc(1, sz); /* no mmap on WASI */
+    if (!m) vm_fatal(vm, RS_MEMORY, "out of memory");
+#else
     void *m = mmap(NULL, sz, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (m == MAP_FAILED) vm_fatal(vm, RS_MEMORY, "out of memory");
+#endif
     vm->bytes += sz;
     return (char *)m;
 }
 void co_block_free(char *blk, size_t sz) {
     if (blk == NULL) return;
     if (sz < CO_MAP_MIN) free(blk);
+#if defined(__wasi__)
+    else free(blk);
+#else
     else (void)munmap(blk, sz);
+#endif
 }
 
 SCoroutine *vm_new_coroutine(VM *vm, SFunc *fn, int64_t slots) {

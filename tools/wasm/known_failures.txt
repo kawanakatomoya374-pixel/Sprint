@@ -1,0 +1,10 @@
+FAIL image tests/cases/lang/mathfast.sp
+FAIL tests/cases/lang/mathfast.sp
+FAIL tests/cases/stdlib/fs.sp
+FAIL tests/ffi/ffi_basic.sp
+FAIL tests/ffi/ffi_byvalue.sp
+FAIL tests/ffi/ffi_callback.sp
+FAIL tests/ffi/ffi_cxx.sp
+FAIL tests/ffi/ffi_jit.sp
+FAIL tests/ffi/ffi_prep.sp
+FAIL tests/ffi/ffi_struct.sp

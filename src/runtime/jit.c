@@ -46,7 +46,9 @@ void jit_configure(VM *vm) { vm->jit_on = 0; }
 
 #include <math.h>
 #include <stddef.h>
+#if !defined(__wasi__)
 #include <sys/mman.h>
+#endif
 #include <unistd.h>
 #include "jit/layout.h"
 #include "jit/stencils.h"

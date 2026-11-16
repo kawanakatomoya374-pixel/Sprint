@@ -11,11 +11,39 @@
  * a wrong prototype or address crashes the process. It is never available in deterministic mode. */
 #define _POSIX_C_SOURCE 200809L
 #include "sp.h"
+#if !defined(__wasi__)
 #include <dlfcn.h>
+#endif
 #include <stdlib.h>
 #include <string.h>
+#if !defined(__wasi__)
 #include <sys/mman.h>
+#endif
 #include <unistd.h>
+
+#if defined(__wasi__)
+/* WebAssembly has neither dlopen nor executable memory: the ffi module is present but every call reports that. */
+static int ffi_unsupported(VM *vm, int argc, SpValue *argv, SpValue *ret) {
+    (void)argc; (void)argv; (void)ret;
+    if (!(vm->caps & CAP_FFI) || vm->deterministic)
+        return vm_set_error(vm, E_PERM, "ffi is not permitted (run with --allow-ffi; it is never available with --deterministic)");
+    return vm_set_error(vm, E_RUNTIME, "ffi is not supported on WebAssembly");
+}
+static int asm_unsupported(VM *vm, int argc, SpValue *argv, SpValue *ret) {
+    (void)argc; (void)argv; (void)ret;
+    if (!(vm->caps & CAP_ASM) || vm->deterministic)
+        return vm_set_error(vm, E_PERM, "asm is not permitted (run with --allow-asm; it is never available with --deterministic)");
+    return vm_set_error(vm, E_RUNTIME, "asm is not supported on WebAssembly");
+}
+int ffi_jit_safe(const NativeDesc *d) { (void)d; return 0; }
+int ffi_jit_info(const NativeDesc *d, FfiJit *out) { (void)d; (void)out; return 0; }
+const NativeDesc lib_ffi_fns[] = {
+    {"open", 1, 1, ffi_unsupported}, {"sym", 2, 2, ffi_unsupported}, {"call", 3, 3, ffi_unsupported},
+    {"alloc", 1, 1, ffi_unsupported}, {"peek", 2, 2, ffi_unsupported}, {"poke", 3, 3, ffi_unsupported},
+    {"string_at", 1, 2, ffi_unsupported}, {"copy_in", 2, 2, ffi_unsupported}, {"callback", 2, 2, ffi_unsupported},
+    {"release_callback", 1, 1, ffi_unsupported}, {"abi", 0, 0, ffi_unsupported}, {"prep", 2, 2, ffi_unsupported},
+    {"asm", 2, 2, asm_unsupported}, {NULL, 0, 0, NULL}};
+#else
 
 #if defined(__x86_64__)
 #define FFI_STRUCT_BY_VALUE 1
@@ -830,3 +858,4 @@ const NativeDesc lib_ffi_fns[] = {
     {"callback", 2, 2, f_callback}, {"release_callback", 1, 1, f_release_callback}, {"abi", 0, 0, f_abi},
     {"prep", 2, 2, f_prep}, {"asm", 2, 2, f_asm},
     {NULL, 0, 0, NULL}};
+#endif /* !__wasi__ */

@@ -15,7 +15,9 @@
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
+#if !defined(__wasi__)
 #include <sys/mman.h>
+#endif
 #include <unistd.h>
 
 #if SP_JIT
