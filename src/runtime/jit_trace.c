@@ -63,6 +63,7 @@ struct TraceRegion {
     uint64_t signature_hash;
     uint64_t side_attempts[TRACE_SIDE_ATTEMPT_MAX];
     uint64_t ticks;               /* loop iterations run in this trace over its life (region-vs-trace policy) */
+    uint64_t entries, entry_iters; /* entries into the trace and loop iterations they ran, over the current window (a loop that runs only a few iterations per entry is faster in the region JIT) */
     uint64_t hops, hop_iters;     /* hops between path variants taken, and loop iterations run (a chain that is switched at every other iteration costs more than the region JIT) */
     uint64_t deopts, deopt_iters; /* deopt exits taken, and loop iterations completed between them (demotion policy) */
     uint8_t dead;                 /* demoted: the loop is left to the region JIT */
@@ -3971,6 +3972,22 @@ int jit_trace_site(VM *vm, Proto *p, const uint8_t *hdr, SpValue *base, SpValue 
     vm->trace_hops = 256U;
     result = first->entry(base, &vm->ileft);
     if (budget_before >= vm->ileft) first->ticks += budget_before - vm->ileft;
+    if (!root->is_side) {   /* region-vs-trace policy: entering and leaving a trace costs a snapshot restore, which a loop that runs only a few iterations per entry does not earn back */
+        static int min_iters = -1;
+        if (min_iters < 0) { const char *e = getenv("SPRINT_TRACE_MIN_ITERS"); min_iters = e && e[0] ? atoi(e) : 16; }
+        root->entries++;
+        if (budget_before >= vm->ileft) root->entry_iters += budget_before - vm->ileft;
+        if (root->entries >= 4096U) {
+            if (min_iters > 0 && root->entry_iters < root->entries * (uint64_t)min_iters && !root->dead) {
+                root->dead = 1;
+                if (trace_debug_env())
+                    (void)fprintf(stderr, "trace-jit: demoted %s@%u to the region JIT (%llu entries ran %llu iterations)\n",
+                                  p->name ? p->name : "?", root->header, (unsigned long long)root->entries, (unsigned long long)root->entry_iters);
+            }
+            root->entries = 0U;
+            root->entry_iters = 0U;
+        }
+    }
     if (first->nmod != 0U)
         for (unsigned k = 0U; k < first->nmod; k++) vm->slots[first->mod_idx[k]] = base[first->mod_slot0 + k];
     if (result == UINT32_MAX ||

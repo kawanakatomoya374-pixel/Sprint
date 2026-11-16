@@ -4196,6 +4196,15 @@ int jit_site(VM *vm, Proto *p, const uint8_t *hdr, SpValue *base, SpValue *sp) {
         r->hdr = h;
         r->state = JS_NEW;
     }
+    if (r->state == JS_OK && r->nbridged) {   /* a traced inner loop was demoted: the region has no code for its body, so it is compiled again with the loop in it */
+        for (int bi = 0; bi < r->nbridged; bi++)
+            if (!jit_trace_has(p, r->bridged[bi][0])) {
+                region_reset(r);
+                r->state = JS_NEW;
+                jp->nok--;
+                return 0;
+            }
+    }
     SpValue *stk = base + p->nlocals;
     if (r->state == JS_NEW) {
         if (++r->cnt < vm->jit_thresh) return 0;
