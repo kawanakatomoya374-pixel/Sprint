@@ -285,6 +285,7 @@ typedef struct {
     const SClass **vk;                   /* class of a variable whose type is TY_INST (fixed once chosen) */
     uint8_t *lt, *lvalid;                /* per-leader variable states */
     uint8_t *ldep;                       /* per-leader stack depth above d0 (0xff: not yet known); the values are in memory at a join */
+    const SpValue **lsample;             /* per local: a sample instance seen when an element was stored into it (a function compiled from its entry has no live values) */
     const SpValue **lhint;               /* per-leader hints of the stack entries (LH_MAX deep): kept when every edge into the join agrees on the type */
     int *lmap, nl;                       /* pc - hdr -> leader index or -1 */
     uint8_t *isins;                      /* pc - hdr -> instruction start */
@@ -2661,9 +2662,10 @@ static int do_for_next(JC *c, uint32_t pc, uint32_t *skip) {
     if (!flush_from(c, c->d0, c->dep)) return 0;
     const SpValue *hint = NULL;
     if (c->base[s].type == T_ARRAY) hint = array_hint_value(AS_ARRAY(c->base[s]));
+    else if (c->lsample[s] && c->lsample[s]->type == T_ARRAY) hint = array_hint_value(AS_ARRAY(*c->lsample[s]));
     int32_t lo = (int32_t)offsetof(SArray, len), io = (int32_t)offsetof(SArray, data);
     int dl = -1;
-    if (n == 1 && !fuse_store(c, pc + 8, c->dep, &dl)) return 0;
+    if (n == 1 && !(c->reg_on && c->unit && hint && hint->type == T_INSTANCE) && !fuse_store(c, pc + 8, c->dep, &dl)) return 0;   /* instances go through the guarded store */
     int32_t dst = dl >= 0 ? LOFF(c, dl) : soff(c, c->dep);
     if (!set_target(c, pc + 8 + (uint32_t)off, pc, 0)) return 0;
     c->xe = -1;
@@ -3048,8 +3050,9 @@ static int do_get_index(JC *c, uint32_t pc, int len, uint32_t *skip) {
     }
     if (!flush_regs(c)) return 0;
     a = &c->st[pa]; b = &c->st[pb];
-    int dl;
-    if (!fuse_store(c, pc + (uint32_t)len, pa, &dl)) return 0;
+    int dl = -1;
+    /* an element seen to be an instance goes through the ordinary store, which guards its class (do_store_local): the local then holds a known class */
+    if (!(c->reg_on && c->unit && hint && hint->type == T_INSTANCE) && !fuse_store(c, pc + (uint32_t)len, pa, &dl)) return 0;
     int32_t dst = dl >= 0 ? LOFF(c, dl) : soff(c, pa);
     c->xe = gexit(c);
     if (c->xe < 0) FAIL("out of memory");
@@ -3145,6 +3148,13 @@ static int do_store_local(JC *c, uint32_t pc) {
     int k = (int)rd16(c->code + pc + 1), p = c->dep - 1;
     if (p < c->d0) FAIL("stack underflow");
     if (k >= c->nloc) FAIL("bad local");
+    if (c->reg_on && c->unit) {   /* a function compiled from its entry has no live values: a value taken from a container that held instances of one class (bs[i]) gets its class guarded here, so the local is known to hold one */
+        const Ent *te = &c->st[p];
+        if (te->ty == TY_UNK && te->kind != EK_K && te->kind != EK_MOD && te->hint && te->hint->type == T_INSTANCE) {
+            const SClass *ik = AS_INSTANCE(*te->hint)->cls;
+            if ((!c->vk[k] || c->vk[k] == ik) && need_inst(c, p, ik)) c->lsample[k] = te->hint;
+        }
+    }
     Ent e = c->st[p];
     c->dep--;
     lc_drop(c, k);
@@ -3330,6 +3340,30 @@ static int do_range_prep(JC *c, uint32_t pc) {
     for (int i = 0; i < 3; i++) EM(ST_mov, LOFF(c, s + i), soff(c, pa + i), 0, 0, 0, 0);
     for (int i = 0; i < 3; i++) c->vt[s + i] = 0x80 | TY_INT;
     c->dep -= 3;
+    return 1;
+}
+
+/* for x in array: the loop state (array, cursor 0, version 0) goes into the locals s .. s+2, exactly as the interpreter's FOR_PREP does it. Anything but
+ * an array (a table's version, a typed array, an iterator, a coroutine) is left to the interpreter: the guard leaves before the instruction. */
+static int do_for_prep(JC *c, uint32_t pc) {
+    int s = (int)rd16(c->code + pc + 1);
+    int pa = c->dep - 1;
+    if (pa < c->d0 || s + 2 >= c->nloc) FAIL("for prep");
+    if (c->st[pa].kind == EK_K || c->st[pa].kind == EK_MOD) FAIL("for-in over a constant");
+    if (!need(c, pa, TY_ARR)) FAIL("for-in over a non-array");
+    int k0 = kadd(c, v_int(0));
+    if (k0 < 0) FAIL("too many constants");
+    if (!flush_from(c, c->d0, c->dep)) return 0;
+    c->xe = -1;
+    EM(ST_mov, LOFF(c, s), soff(c, pa), 0, 0, 0, 0);
+    EM(ST_movk, LOFF(c, s + 1), koff(k0), 0, 0, 0, 0);
+    EM(ST_movk, LOFF(c, s + 2), koff(k0), 0, 0, 0, 0);
+    c->rax_off = -1; c->xmm_off = -1; c->skip1 = 0; c->skipx = 0;
+    c->vt[s] = 0x80 | TY_ARR;
+    c->vt[s + 1] = 0x80 | TY_INT;
+    c->vt[s + 2] = 0x80 | TY_INT;
+    c->lsample[s] = c->st[pa].hint;            /* the array this loop runs over, for the type of its elements */
+    c->dep--;
     return 1;
 }
 
@@ -3710,7 +3744,7 @@ static int walk(JC *c) {
             if (!(c->vt[i] & 0x80)) c->vlive[i] = 1;
             Ent *e = push(c, EK_LOC, c->vt[i] & 0x7f, (int)i);
             ok = e != NULL;
-            if (ok) { e->hint = &c->base[i]; if (e->ty == TY_INST) e->cls = c->vk[i]; }
+            if (ok) { e->hint = (c->unit && c->lsample[i] && c->base[i].type == T_NIL) ? c->lsample[i] : &c->base[i]; if (e->ty == TY_INST) e->cls = c->vk[i]; }
             break;
         }
         case OP_STORE_LOCAL: ok = do_store_local(c, pc); break;
@@ -3775,6 +3809,7 @@ static int walk(JC *c) {
         case OP_GET_MEMBER: ok = do_get_member(c, pc, len, &skip); break;
         case OP_SET_MEMBER: ok = do_set_member(c, pc); break;
         case OP_RANGE_PREP: ok = do_range_prep(c, pc); break;
+        case OP_FOR_PREP: ok = do_for_prep(c, pc); break;
         case OP_RANGE_NEXT: ok = do_range_next(c, pc, &skip); break;
         case OP_FOR_NEXT: ok = do_for_next(c, pc, &skip); break;
         case OP_LOAD_LINK: ok = do_load_link(c, pc); break;
@@ -3814,7 +3849,7 @@ static int op_allowed(int op, int unit) {
     case OP_BAND: case OP_BOR: case OP_BXOR: case OP_SHL: case OP_SHR:
     case OP_LT: case OP_LE: case OP_GT: case OP_GE: case OP_JUMP: case OP_JUMP_IF_FALSE: case OP_JUMP_IF_TRUE:
     case OP_JUMP_IF_FALSE_OR_POP: case OP_JUMP_IF_TRUE_OR_POP: case OP_NOT:
-    case OP_GET_INDEX: case OP_SET_INDEX: case OP_INVOKE: case OP_RANGE_PREP: case OP_RANGE_NEXT: case OP_FOR_NEXT: case OP_CONCAT: case OP_NEW_ARRAY:
+    case OP_GET_INDEX: case OP_SET_INDEX: case OP_INVOKE: case OP_RANGE_PREP: case OP_RANGE_NEXT: case OP_FOR_PREP: case OP_FOR_NEXT: case OP_CONCAT: case OP_NEW_ARRAY:
     case OP_LOAD_LINK: case OP_CALL: case OP_LOAD_UPVAL: case OP_STORE_UPVAL: case OP_GET_MEMBER: case OP_SET_MEMBER:
         return 1;
     case OP_RETURN: case OP_RETURN_NIL:
@@ -3825,7 +3860,7 @@ static int op_allowed(int op, int unit) {
 }
 
 static void jc_free(JC *c) {
-    free(c->vt); free(c->vk); free(c->vlive); free(c->lt); free(c->lhint); free(c->lvalid); free(c->ldep); free(c->lmap); free(c->isins); free(c->rnext_unit); free(c->st);
+    free(c->vt); free(c->vk); free(c->vlive); free(c->lt); free(c->lhint); free(c->lsample); free(c->lvalid); free(c->ldep); free(c->lmap); free(c->isins); free(c->rnext_unit); free(c->st);
     free(c->lrd); free(c->cb); free(c->fx); free(c->pcaddr); free(c->ex); free(c->kt); free(c->ic);
     pics_free(c->pics, c->npics);
 }
@@ -3953,10 +3988,11 @@ static int compile_region(VM *vm, Proto *p, JRegion *r, SFunc *fn, SpValue *base
     c->vk = calloc((size_t)c->nvars, sizeof *c->vk);
     c->lt = calloc((size_t)c->nl * (size_t)c->nvars, 1);
     c->lhint = calloc((size_t)(c->nl > 0 ? c->nl : 1) * LH_MAX, sizeof *c->lhint);
+    c->lsample = calloc((size_t)(c->nvars > 0 ? c->nvars : 1), sizeof *c->lsample);
     c->lvalid = calloc((size_t)c->nl, 1);
     c->ldep = malloc((size_t)c->nl);
     if (c->ldep) memset(c->ldep, 0xff, (size_t)c->nl);
-    if (!c->vt || !c->vlive || !c->vk || !c->lt || !c->lhint || !c->lvalid || !c->ldep) { c->why = "out of memory"; goto done; }
+    if (!c->vt || !c->vlive || !c->vk || !c->lt || !c->lhint || !c->lsample || !c->lvalid || !c->ldep) { c->why = "out of memory"; goto done; }
     for (int i = 0; i < c->nloc; i++) {
         if (c->unit && i >= p->nparams) { lstate(c, 0)[i] = TY_UNK; continue; }
         if (base[i].type == T_INSTANCE) { lstate(c, 0)[i] = TY_INST; c->vk[i] = AS_INSTANCE(base[i])->cls; continue; }
