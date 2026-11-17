@@ -1780,7 +1780,9 @@ static TraceRegion *trace_find(struct JitProto *jp, uint32_t header) {
 }
 
 static void trace_mark_used(struct JitProto *jp, TraceRegion *tr) {
-    uint64_t used = __atomic_add_fetch(&jp->trace_clock, UINT64_C(1), __ATOMIC_RELAXED);
+    /* a recency stamp, not a counter: a plain load and store (no locked read-modify-write on every trace entry) */
+    uint64_t used = __atomic_load_n(&jp->trace_clock, __ATOMIC_RELAXED) + UINT64_C(1);
+    __atomic_store_n(&jp->trace_clock, used, __ATOMIC_RELAXED);
     __atomic_store_n(&tr->runtime.last_used, used, __ATOMIC_RELAXED);
 }
 
