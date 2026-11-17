@@ -1163,6 +1163,9 @@ static int ta_alloc_regs(const SpTraceIR *ir, const int32_t *phi_local, uint8_t 
         if (in->a > 0U && in->a <= ir->nvalues && !pinned[in->a] &&
             regs[in->a] != UINT8_MAX && regs[in->a] != TA_MEMREG && last[in->a] == (uint32_t)i && isf[in->a] == isf[in->dst]) {
             chosen = regs[in->a];
+        } else if ((in->op == SP_TIR_FADD || in->op == SP_TIR_FMUL) && in->b > 0U && in->b <= ir->nvalues && !pinned[in->b] &&
+                   regs[in->b] != UINT8_MAX && regs[in->b] != TA_MEMREG && last[in->b] == (uint32_t)i && isf[in->b] && isf[in->dst]) {
+            chosen = regs[in->b];     /* the right operand dies here: the commutative op writes into it (emitted as dst == rb) */
         } else {
             chosen = jit_ra_alloc(isf[in->dst] ? &xbank : &bank, (int32_t)in->dst);
         }
