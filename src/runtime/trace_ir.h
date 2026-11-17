@@ -51,6 +51,10 @@ typedef struct {
     uint64_t imm;
 } SpTIRInst;
 
+/* ASTORE: imm & 3 is the kind (0 boxed, 1 append, 2 packed); the high bits mark checks proven once at the loop entry */
+#define TIR_ST_RANGE 0x100U   /* the index is in range (a range loop's bound was checked against the array length) */
+#define TIR_ST_TAG 0x200U     /* the array's note equals the stored type (checked at the entry) */
+
 typedef struct {
     SpTIRInst *inst;
     SpTIRType *value_types;

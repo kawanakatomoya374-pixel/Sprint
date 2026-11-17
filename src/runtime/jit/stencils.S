@@ -2173,6 +2173,16 @@ ST tr_pk_store                  # [r10] = src: HB0 = REX.W+B(+R src), HB1 = modr
 ST tr_sse_r10_0                 # movsd xmm, [r10] / movsd [r10], xmm: HB0 = f2, HB1 = REX, HB2 = opcode, HB3 = modrm (mod 00)
     .byte HB0, HB1, 0x0f, HB2, HB3
 
+ST tr_pk_ldp                    # r10 = [ra + items]: HB0 = REX.W+B(ra), HB1 = modrm (mod 10, reg r10, rm ra)
+    .byte HB0, 0x8b, HB1
+    .long L_SARRAY_ITEMS
+
+ST tr_sse_r10x8                 # movsd xmm, [r10 + rb*8] / movsd [r10 + rb*8], xmm: HB0 = f2, HB1 = REX, HB2 = opcode, HB3 = modrm (mod 00, rm 100), HB4 = SIB
+    .byte HB0, HB1, 0x0f, HB2, HB3, HB4
+
+ST tr_pk_x8                     # mov reg, [r10 + rb*8] (8b) / mov [r10 + rb*8], reg (89): HB0 = REX, HB1 = opcode, HB2 = modrm, HB3 = SIB
+    .byte HB0, HB1, HB2, HB3
+
 ST tr_xt_notpacked              # leave (JIT_T) when the array in ra is packed (its note is 1..3): HB0 = REX (+R r10, +B ra), HB1 = modrm (mod 01, reg r10, rm ra)
     .byte HB0, 0x0f, 0xb6, HB1, L_OBJ_XT
     dec %r10d

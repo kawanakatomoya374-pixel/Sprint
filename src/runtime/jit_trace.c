@@ -596,33 +596,22 @@ static int ta_ab_load(TraceAsm *a, uint8_t dst) {
     return ta_stencil(a, ST_tr_ab_load, &p);
 }
 /* packed arrays (see SArray): bool / int / float elements are 8-byte payloads and the array's note is their type */
-static int ta_pk_addr(TraceAsm *a, uint8_t ra, uint8_t rb) {
-    TracePatch p = ta_patch();
-    p.b[0] = (uint8_t)(0x49U | (rb >= 8U ? 0x04U : 0U));
-    p.b[1] = (uint8_t)(0xc0U | ((rb & 7U) << 3) | 2U);
-    p.b[2] = (uint8_t)(0x4cU | (ra >= 8U ? 0x01U : 0U));
-    p.b[3] = (uint8_t)(0x90U | (ra & 7U));
-    return ta_stencil(a, ST_tr_pk_addr, &p);
-}
-static int ta_pk_load(TraceAsm *a, uint8_t dst) {   /* dst = the payload at [r10] */
-    TracePatch p = ta_patch();
-    if (ta_isx(dst)) {
-        p.b[0] = 0xf2U; p.b[1] = (uint8_t)(0x41U | (dst - TA_XBASE >= 8U ? 4U : 0U)); p.b[2] = 0x10U; p.b[3] = (uint8_t)(0x02U | (((dst - TA_XBASE) & 7U) << 3));
-        return ta_stencil(a, ST_tr_sse_r10_0, &p);
+/* dst / src <-> items[rb] of the packed array in ra: r10 = the data pointer, then one scaled-index access */
+static int ta_pk_access(TraceAsm *a, uint8_t ra, uint8_t rb, uint8_t reg, int store) {
+    TracePatch p = ta_patch(), q = ta_patch();
+    p.b[0] = (uint8_t)(0x4cU | (ra >= 8U ? 0x01U : 0U));
+    p.b[1] = (uint8_t)(0x90U | (ra & 7U));
+    if (!ta_stencil(a, ST_tr_pk_ldp, &p)) return 0;
+    const uint8_t sib = (uint8_t)(0xc0U | ((rb & 7U) << 3) | 2U);
+    if (ta_isx(reg)) {
+        const uint8_t x = (uint8_t)(reg - TA_XBASE);
+        q.b[0] = 0xf2U; q.b[1] = (uint8_t)(0x41U | (x >= 8U ? 4U : 0U) | (rb >= 8U ? 2U : 0U)); q.b[2] = store ? 0x11U : 0x10U;
+        q.b[3] = (uint8_t)(((x & 7U) << 3) | 4U); q.b[4] = sib;
+        return ta_stencil(a, ST_tr_sse_r10x8, &q);
     }
-    p.b[0] = (uint8_t)(0x49U | (dst >= 8U ? 0x04U : 0U));
-    p.b[1] = (uint8_t)(0x02U | ((dst & 7U) << 3));
-    return ta_stencil(a, ST_tr_pk_load, &p);
-}
-static int ta_pk_store(TraceAsm *a, uint8_t src) {   /* [r10] = the payload in src */
-    TracePatch p = ta_patch();
-    if (ta_isx(src)) {
-        p.b[0] = 0xf2U; p.b[1] = (uint8_t)(0x41U | (src - TA_XBASE >= 8U ? 4U : 0U)); p.b[2] = 0x11U; p.b[3] = (uint8_t)(0x02U | (((src - TA_XBASE) & 7U) << 3));
-        return ta_stencil(a, ST_tr_sse_r10_0, &p);
-    }
-    p.b[0] = (uint8_t)(0x49U | (src >= 8U ? 0x04U : 0U));
-    p.b[1] = (uint8_t)(0x02U | ((src & 7U) << 3));
-    return ta_stencil(a, ST_tr_pk_store, &p);
+    q.b[0] = (uint8_t)(0x49U | (reg >= 8U ? 4U : 0U) | (rb >= 8U ? 2U : 0U)); q.b[1] = store ? 0x89U : 0x8bU;
+    q.b[2] = (uint8_t)(((reg & 7U) << 3) | 4U); q.b[3] = sib;
+    return ta_stencil(a, ST_tr_pk_x8, &q);
 }
 /* leave (deoptimise) when the array in ra is packed / when its note is not `tag` */
 static int ta_xt_notpacked(TraceAsm *a, uint8_t ra) {
@@ -802,10 +791,12 @@ static int ta_emit_pending_stores(const SpTraceIR *ir, const uint8_t *regs, cons
     for (size_t k = 0U; k < npending; k++) {
         const SpTIRInst *st = &ir->inst[pending[k]];
         uint8_t tg;
-        if (st->op == SP_TIR_FSTORE || st->imm == 1U) continue;
-        if (regs[st->a] >= 16U || regs[st->b] >= 16U || !ta_ab_bounds(a, regs[st->a], regs[st->b]) || !ta_jcc(a, 0x83U, TA_DEOPT)) return 0;
+        if (st->op == SP_TIR_FSTORE || (st->imm & 3U) == 1U) continue;
+        if (regs[st->a] >= 16U || regs[st->b] >= 16U) return 0;
+        if (!(st->imm & TIR_ST_RANGE) && (!ta_ab_bounds(a, regs[st->a], regs[st->b]) || !ta_jcc(a, 0x83U, TA_DEOPT))) return 0;
         /* the layout checks also precede every store: a deoptimisation after one of them would apply it twice */
-        if (st->imm == 2U ? !ta_store_tag(ir, st, &tg) || !ta_xt_is(a, regs[st->a], tg) : !ta_xt_notpacked(a, regs[st->a])) return 0;
+        if ((st->imm & 3U) == 2U) { if (!ta_store_tag(ir, st, &tg) || (!(st->imm & TIR_ST_TAG) && !ta_xt_is(a, regs[st->a], tg))) return 0; }
+        else if (!ta_xt_notpacked(a, regs[st->a])) return 0;
     }
     for (size_t k = 0U; k < npending; k++) {
         const SpTIRInst *st = &ir->inst[pending[k]];
@@ -815,7 +806,7 @@ static int ta_emit_pending_stores(const SpTraceIR *ir, const uint8_t *regs, cons
                 !ta_field_store(a, regs[st->aux], regs[st->a], (uint32_t)st->imm, tag)) return 0;
             continue;
         }
-        if (st->imm == 1U) {   /* an append: the array and the payload go to two scratch slots, the helper does the rest */
+        if ((st->imm & 3U) == 1U) {   /* an append: the array and the payload go to two scratch slots, the helper does the rest */
             if (!ta_store_tag(ir, st, &tag) || regs[st->a] >= 16U || (regs[st->aux] >= 16U && !ta_isx(regs[st->aux])) ||
                 !ta_local_store_reg(a, scratch, regs[st->a]) || !ta_local_store_reg(a, scratch + 1U, regs[st->aux])) return 0;
             {   /* room in the array: appended inline; otherwise (r10d == 0) the helper grows it */
@@ -834,8 +825,8 @@ static int ta_emit_pending_stores(const SpTraceIR *ir, const uint8_t *regs, cons
             }
             continue;
         }
-        if (st->imm == 2U) {   /* a packed array holding this type: store the payload */
-            if ((regs[st->aux] >= 16U && !ta_isx(regs[st->aux])) || !ta_pk_addr(a, regs[st->a], regs[st->b]) || !ta_pk_store(a, regs[st->aux])) return 0;
+        if ((st->imm & 3U) == 2U) {   /* a packed array holding this type: store the payload */
+            if ((regs[st->aux] >= 16U && !ta_isx(regs[st->aux])) || !ta_pk_access(a, regs[st->a], regs[st->b], regs[st->aux], 1)) return 0;
             continue;
         }
         if ((regs[st->aux] >= 16U && !ta_isx(regs[st->aux])) || !ta_store_tag(ir, st, &tag) || !ta_note_store(a, regs[st->a], tag) ||
@@ -977,7 +968,7 @@ static int ta_store_to_fresh(const SpTraceIR *ir, const SpTIRInst *st) {
 }
 static int ta_has_alloc(const SpTraceIR *ir) {
     for (size_t i = 0U; i < ir->count; i++)
-        if (ir->inst[i].op == SP_TIR_NEWINST || (ir->inst[i].op == SP_TIR_ASTORE && ir->inst[i].imm == 1U)) return 1;
+        if (ir->inst[i].op == SP_TIR_NEWINST || (ir->inst[i].op == SP_TIR_ASTORE && (ir->inst[i].imm & 3U) == 1U)) return 1;
     return 0;
 }
 static int ta_has_div(const SpTraceIR *ir) {
@@ -1463,7 +1454,7 @@ static int ta_emit_trace_ir(const SpTraceIR *ir, const int32_t *phi_local, unsig
             if (!(in->aux & 1U) && (!ta_ab_bounds(a, ra, rb) || !ta_jcc(a, 0x83U, TA_DEOPT))) goto done;   /* aux bit 0: range proven at entry */
             if (in->aux & 4U) {   /* a packed array: the note is the element type (bit 1: settled on entry), the payload is all there is */
                 if (!(in->aux & 2U) && !ta_xt_is(a, ra, (uint8_t)in->imm)) goto done;
-                if (!ta_pk_addr(a, ra, rb) || !ta_pk_load(a, dst)) goto done;
+                if (!ta_pk_access(a, ra, rb, dst, 0)) goto done;
                 break;
             }
             if (!(in->aux & 2U) && !ta_xt_notpacked(a, ra)) goto done;   /* a boxed array must not have become packed (bit 1: its note is a reference type) */

@@ -484,14 +484,15 @@ int sp_tir_elide_bounds(SpTraceIR *ir) {
     for (size_t i = fc + 2U; i < n; i++) {
         SpTIRInst *in = &ir->inst[i];
         int invariant = 0;
-        if (in->op != SP_TIR_ALOAD || in->b != cur || (in->aux & 1U)) continue;
+        const int is_st = in->op == SP_TIR_ASTORE && (in->imm & 3U) == 2U && !(in->imm & TIR_ST_RANGE);   /* a store into a packed array (same proof) */
+        if (!((in->op == SP_TIR_ALOAD && !(in->aux & 1U)) || is_st) || in->b != cur) continue;
         for (size_t k = 0U; k < fc && !invariant; k++) {
             const SpTIRInst *d = &ir->inst[k];
             if (d->dst != in->a) continue;
             invariant = (d->op == SP_TIR_PHI && d->b == d->dst) || d->op == SP_TIR_ALOAD;
         }
         if (!invariant) continue;
-        in->aux |= 1U;
+        if (is_st) in->imm |= TIR_ST_RANGE; else in->aux |= 1U;
         found++;
         {
             unsigned u;
@@ -526,7 +527,8 @@ int sp_tir_elide_tags(SpTraceIR *ir) {
     SpTIRValue arrays[8];
     uint8_t tags[8];
     unsigned narr = 0U;
-    for (size_t i = 0U; i < n; i++) if (ir->inst[i].op == SP_TIR_ASTORE) return 0;
+    /* a trace whose only array writes are stores into packed arrays (each keeps its array's note) leaves every note as it was */
+    for (size_t i = 0U; i < n; i++) if (ir->inst[i].op == SP_TIR_ASTORE && (ir->inst[i].imm & 3U) != 2U) return 0;
     for (size_t i = 0U; i + 1U < n; i++) {
         const SpTIROp o = ir->inst[i].op;
         if (o >= SP_TIR_ICMP_EQ && o <= SP_TIR_ICMP_GE && !(ir->inst[i + 1U].op == SP_TIR_GUARD_TRUE && (ir->inst[i + 1U].imm & SP_TIR_GUARD_ENTRY))) { fc = i; break; }
@@ -535,6 +537,25 @@ int sp_tir_elide_tags(SpTraceIR *ir) {
     for (size_t i = fc + 2U; i < n; i++) {
         SpTIRInst *in = &ir->inst[i];
         int invariant = 0;
+        if (in->op == SP_TIR_ASTORE) {
+            uint8_t stag;
+            if (in->imm & TIR_ST_TAG) continue;
+            if (in->type == SP_TIR_T_F64) stag = 3U; else if (in->type == SP_TIR_T_I64) stag = 2U; else if (in->type == SP_TIR_T_BOOL) stag = 1U; else continue;
+            for (size_t k = 0U; k < fc && !invariant; k++) {
+                const SpTIRInst *d = &ir->inst[k];
+                if (d->dst != in->a) continue;
+                invariant = (d->op == SP_TIR_PHI && d->b == d->dst && d->aux == 0U) || d->op == SP_TIR_ALOAD;
+            }
+            if (!invariant) continue;
+            {
+                unsigned u;
+                for (u = 0U; u < narr && !(arrays[u] == in->a && tags[u] == stag); u++) {}
+                if (u == narr) { if (narr == 8U) continue; arrays[narr] = in->a; tags[narr] = stag; narr++; }
+            }
+            in->imm |= TIR_ST_TAG;
+            found++;
+            continue;
+        }
         if (in->op != SP_TIR_ALOAD || (in->aux & 2U)) continue;
         for (size_t k = 0U; k < fc && !invariant; k++) {
             const SpTIRInst *d = &ir->inst[k];
