@@ -139,3 +139,11 @@ Trace の deopt 出口は「反復の先頭状態を復元してインタプリ�
 
 ### 実装済みの足場（2026-11）
 - 領域 JIT: 内側ループの float ローカルを固定 xmm レジスタにループをまたいで保持（`pin_*`）。mandel 0.66s → 0.38s。
+
+## AArch64（Arm64）対応の状況（2026-11）
+
+- 環境: `apt install qemu-user libc6-arm64-cross`、`make test-arm64 ZIG="python3 -m ziglang"`（zig で aarch64-linux-gnu へクロスビルドし、QEMU 上で `tests/cases/{jit,lang,syntax,class}` を JIT しきい値 1 と 40 で実行。230 件通過）。
+- 実装済み: インタプリタ（全機能）と、純粋な再帰整数関数の JIT（`src/runtime/jit_pure_a64.c`、fib / tak / ackermann。x86-64 の `jit_pure.c` と同じ設計で、x19-x21 にパラメータ、x23 に予算、x24 に再帰の下限）。QEMU 上で fib(35) 5.5s → 0.8s、tak+ack 19s → 2.2s。
+- 同時に、`tak` / `ackermann` のようなネストした自己呼び出し（`f(f(..), f(..))`）を x86-64 の純粋 JIT でも許可（呼び出し側マーカーはレジスタを持たない）: tak 0.60s → 0.25s。
+- 未実装（x86-64 のみ）: 領域 JIT（193 個のステンシル、`stencils.S`）、TraceJIT（`jit_trace.c` のエミッタ）、リーフ述語 JIT。AArch64 版を作るには、ステンシルの AArch64 アセンブリ版、パッチ穴の適用（`movz/movk`、`adrp`、分岐オフセット）、生バイト出力関数群（`x_*`、`ta_*`）の AArch64 版が必要。
+- 注意: libm の結果（`exp` の最終桁など）は glibc の x86-64 と aarch64 で異なる（`mathfast.sp` は arm64 では除外）。

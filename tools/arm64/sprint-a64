@@ -1,0 +1,4 @@
+#!/bin/sh
+# Runs an aarch64 build of sprint under qemu-user (apt: qemu-user libc6-arm64-cross).
+# usage: SPRINT_A64=/path/to/aarch64/sprint tools/arm64/sprint-a64 run file.sp
+exec env QEMU_LD_PREFIX=/usr/aarch64-linux-gnu qemu-aarch64 "${SPRINT_A64:-build/sprint-a64}" "$@"

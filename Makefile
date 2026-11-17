@@ -91,7 +91,7 @@ RUNTIME_SRC := src/runtime/value.c src/runtime/table.c src/runtime/format.c \
                src/runtime/vm/trace_record.c src/runtime/image.c \
                src/runtime/sha256.c src/runtime/verify.c src/runtime/embed.c \
                src/runtime/trace_ir.c src/runtime/jit/regalloc.c src/runtime/jit/snapshot.c \
-               src/runtime/jit.c src/runtime/jit_trace.c src/runtime/jit_pure.c
+               src/runtime/jit.c src/runtime/jit_trace.c src/runtime/jit_pure.c src/runtime/jit_pure_a64.c
 LIB_SRC     := src/lib/lib.c src/lib/lib_math.c src/lib/lib_str.c src/lib/lib_array.c src/lib/lib_table.c src/lib/lib_sys.c src/lib/lib_co.c src/lib/lib_ext.c src/lib/lib_gfx.c src/lib/font_ja.c src/lib/lib_ffi.c src/lib/lib_x11.c src/lib/lib_win32.c src/lib/lib_typed.c
 LIBSRC := $(FRONT_SRC) $(RUNTIME_SRC) $(LIB_SRC) $(GEN)/bundled.c
 CLISRC := cli/main.c cli/tool_fmt.c cli/tool_lint.c cli/repl.c
@@ -406,3 +406,13 @@ test-wasm: $(BUILD)/sprint.wasm
 windows: $(BUILD)/sprint.exe
 $(BUILD)/sprint.exe: $(ALLSRC)
 	$(ZIG) cc -target x86_64-windows-gnu -O2 -std=gnu11 -Isrc -DNDEBUG_SP -Wl,--stack,8388608 -o $@ $(filter %.c,$^)
+
+# ---- AArch64 Linux (cross build, run under qemu-user) ------------------------------------------------------------------
+# apt install qemu-user libc6-arm64-cross;  make test-arm64 ZIG="python3 -m ziglang"
+# The AArch64 build has the interpreter plus the pure-function JIT (jit_pure_a64.c); the region and trace JITs are x86-64 only.
+.PHONY: arm64 test-arm64
+arm64: $(BUILD)/sprint-a64
+$(BUILD)/sprint-a64: $(ALLSRC)
+	$(ZIG) cc -target aarch64-linux-gnu -O2 -std=gnu11 -Isrc -DNDEBUG_SP -o $@ $(filter %.c,$^) -lm -ldl
+test-arm64: $(BUILD)/sprint-a64
+	@SPRINT_A64=$(BUILD)/sprint-a64 sh tools/arm64/test.sh

@@ -296,7 +296,7 @@ JitPure *jit_pure_compile(VM *vm, Proto *p) {
             m = depth - nargs - 1;
             if (st[m].k != E_SELF) goto fail;
             for (int i = m + 1; i < depth; i++) if (st[i].k == E_SELF) goto fail;
-            for (int i = 0; i < m; i++) { if (st[i].k == E_SELF) goto fail; if (st[i].k == E_REG) push_r(&c, SREG[i]); }
+            for (int i = 0; i < m; i++) if (st[i].k == E_REG) push_r(&c, SREG[i]);   /* a pending callee marker (E_SELF) of an enclosing call has no register to save */
             if (nargs == 1) {
                 Ent a = st[m + 1];
                 if (a.k == E_IMM) mov_ri(&c, R_DI, a.v);
@@ -628,7 +628,7 @@ int jit_pure_enter(VM *vm, Proto *p, const SpValue *args, uint64_t *left, int64_
     return 1;
 }
 
-#else
+#elif !SP_JIT_A64
 
 JitPure *jit_pure_compile(VM *vm, Proto *p) { (void)vm; (void)p; return NULL; }
 struct JitLeaf *jit_leaf_compile(VM *vm, Proto *p) { (void)vm; (void)p; return NULL; }

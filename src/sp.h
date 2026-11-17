@@ -980,6 +980,12 @@ void prog_quicken(Program *pg);
 #else
 #define SP_JIT 0
 #endif
+/* AArch64 Linux: the pure-function JIT (jit_pure_a64.c) only, for now; the region and trace JITs are x86-64 */
+#if defined(__aarch64__) && defined(__linux__) && !defined(SP_NO_JIT) && !defined(SP_OS) && !defined(SP_OS_USER)
+#define SP_JIT_A64 1
+#else
+#define SP_JIT_A64 0
+#endif
 /* A function compiled as a whole: compiled callers call `entry` directly (r12 = base, r13 = kt). The layout is shared
  * with src/runtime/jit/stencils.S through jit/layout.h. */
 typedef struct JitUnit {

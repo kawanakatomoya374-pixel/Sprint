@@ -19,7 +19,7 @@ static int q_cmp_index(int op) {
 }
 
 void vm_proto_quicken(Proto *p) {
-    if (!p->ocode && SP_JIT && p->code_len > 0) {
+    if (!p->ocode && (SP_JIT || SP_JIT_A64) && p->code_len > 0) {
         p->ocode = malloc(p->code_len);   /* the JIT compiles from the pristine bytecode */
         if (p->ocode) memcpy(p->ocode, p->code, p->code_len);
     }

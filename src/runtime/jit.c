@@ -34,14 +34,38 @@ int jit_trace_site(VM *vm, Proto *p, const uint8_t *hdr, SpValue *base, SpValue 
     (void)vm; (void)p; (void)hdr; (void)base; (void)sp; (void)side_parent_slot_out;
     return 0;
 }
+#if SP_JIT_A64
+/* AArch64: a hot function that is a pure recursive integer function gets a native version (jit_pure_a64.c); nothing else is compiled yet */
+JitUnit *jit_call_hot(VM *vm, SFunc *fn, SpValue *base) {
+    (void)base;
+    Proto *p = fn->proto;
+    if (!p->jcall) p->jcall = vm->jit_on ? vm->jit_thresh : 0x3fffffff;
+    if (!vm->jit_on || p->jcall > 1) return NULL;
+    p->jcall = 0x3fffffff;
+    if (!p->pure) p->pure = jit_pure_compile(vm, p);
+    if (getenv("SPRINT_PURE_DEBUG")) (void)fprintf(stderr, "pure %s: %s\n", p->name ? p->name : "?", p->pure ? "compiled" : "no");
+    return NULL;
+}
+void jit_free_proto(Proto *p) { jit_pure_free(p); }
+void jit_configure(VM *vm) {
+    vm->jit_on = 1;
+    vm->jit_thresh = 40;
+    vm->jit_dbg = 0;
+    const char *e = getenv("SPRINT_JIT");
+    if (e && e[0] == '0') vm->jit_on = 0;
+    e = getenv("SPRINT_JIT_THRESHOLD");
+    if (e && atoi(e) > 0) vm->jit_thresh = atoi(e);
+}
+#else
 JitUnit *jit_call_hot(VM *vm, SFunc *fn, SpValue *base) {
     (void)vm; (void)fn; (void)base;
     return NULL;
 }
-void jit_run(VM *vm, JitUnit *u, SpValue *base) { (void)vm; (void)u; (void)base; }
 void jit_free_proto(Proto *p) { (void)p; }
-void jit_roots(Proto *p, void (*mark)(VM *, SpValue), VM *vm) { (void)p; (void)mark; (void)vm; }
 void jit_configure(VM *vm) { vm->jit_on = 0; }
+#endif
+void jit_run(VM *vm, JitUnit *u, SpValue *base) { (void)vm; (void)u; (void)base; }
+void jit_roots(Proto *p, void (*mark)(VM *, SpValue), VM *vm) { (void)p; (void)mark; (void)vm; }
 
 #else
 
