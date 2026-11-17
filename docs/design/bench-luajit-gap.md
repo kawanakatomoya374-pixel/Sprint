@@ -81,3 +81,12 @@
 - GUI の時間の約 6 割は C のラスタライザ (text / fill / blend / 丸角)。JIT で縮むインタプリタ分は残りの 3 割程度で、効果は約 5%。
 - coro: INVOKE のモジュールメンバ参照と文字列比較の高速パス (約 5%)。
 - 全 76 本 geomean 0.940 (出力不一致 0)。
+
+## 2026-11 追記 3: 領域 JIT の float レジスタ固定、パック配列の書き込み、文字列 slice
+
+- 領域 JIT: 呼び出しを含まない最内ループの float ローカル（最大 3 個）を xmm5-7 にループ越しで保持 (`pin_*`)。メモリが常に最新なので出口は変更なし。mandel 0.66s → 0.38s（LuaJIT 比 1.25）。tests/cases/jit/jit_float_pin.sp。
+- TraceJIT: パック配列への書き込みが、範囲検査（`TIR_ST_RANGE`）と要素型検査（`TIR_ST_TAG`）をループ入口の検査と共有。配列アクセスは `mov r10,[arr+items]; movsd x,[r10+idx*8]`。lu 0.112s → 0.104s。tests/cases/jit/jit_packed_store.sp。
+- JIT: `s.slice(a, b)` を専用ヘルパーに、`t[k] = t[k] + 1` の get→set で検索を 1 回に。knuc 0.183s → 0.150s。tests/cases/jit/jit_slice_table.sp。
+- トレース: `to_float` と準備済み libm `sqrt` を IR 命令に（ffi_sqrt 0.145s → 0.048s）。
+- 全 76 本 geomean 0.898、出力不一致 0。
+- 残り（比 1.7 以上）: knuc 2.4、coro 2.8、hashint 2.0、hof 2.0、tokenize 1.9、base64 1.8、hanoi 1.8、lu 1.75。
