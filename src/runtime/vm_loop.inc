@@ -404,13 +404,13 @@ static RunStatus RUN_LOOP_NAME(VM *vm, VMTraceCapture **capp, RunCold *ccold, in
         case OP_EQ: L_OP_EQ: {
             SpValue a = sp[-2], b = sp[-1];
             sp--;
-            sp[-1] = v_bool(a.type == T_INT && b.type == T_INT ? a.as.i == b.as.i : value_eq(a, b));
+            sp[-1] = v_bool(a.type == T_INT && b.type == T_INT ? a.as.i == b.as.i : EQ_SLOW(a, b));
             NEXT();
         }
         case OP_NE: L_OP_NE: {
             SpValue a = sp[-2], b = sp[-1];
             sp--;
-            sp[-1] = v_bool(a.type == T_INT && b.type == T_INT ? a.as.i != b.as.i : !value_eq(a, b));
+            sp[-1] = v_bool(a.type == T_INT && b.type == T_INT ? a.as.i != b.as.i : !EQ_SLOW(a, b));
             NEXT();
         }
         case OP_LT: case OP_LE: case OP_GT: case OP_GE: L_OP_LT: {
@@ -666,7 +666,7 @@ static RunStatus RUN_LOOP_NAME(VM *vm, VMTraceCapture **capp, RunCold *ccold, in
                 }
                 SpValue fv;
                 if (recv.type == T_TABLE || recv.type == T_MODULE) {
-                    if (get_member(vm, recv, mname, &fv)) RAISE();
+                    if (recv.type == T_MODULE ? !mc_get(vm, AS_MODULE(recv)->exports, mname, &fv) && get_member(vm, recv, mname, &fv) : get_member(vm, recv, mname, &fv)) RAISE();
                     *ov = fv;
                 } else if (recv.type == T_INSTANCE) {
                     SInstance *in = AS_INSTANCE(recv);

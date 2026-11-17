@@ -228,6 +228,9 @@ static const ICEnt *ic_fill(VM *vm, ICEnt *e, const SClass *k, const SString *na
     return e;
 }
 
+/* equality with the cheap string cases inline (same object / different length) */
+#define EQ_SLOW(a, b) (((a).type == T_STRING && (b).type == T_STRING) ? (AS_STR(a) == AS_STR(b) || (AS_STR(a)->len == AS_STR(b)->len && value_eq((a), (b)))) : value_eq((a), (b)))
+
 /* table lookup through the member cache; 0 when the key is absent */
 static inline int mc_get(VM *vm, const STable *t, const SString *name, SpValue *out) {
     MCEnt *e = &vm->mc[(((uintptr_t)t >> 4) ^ ((uintptr_t)name >> 4)) & (MC_SIZE - 1)];
