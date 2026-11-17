@@ -498,7 +498,7 @@ static RunStatus run_loop(VM *vm) {
         es = (te && te[0] && te[0] != '0' ? 1 : 0) | (tj && tj[0] == '0' ? 0 : 2);
         env_state = es;
     }
-    const int trace_jit_enabled = vm->jit_on && (es & 2);
+    const int trace_jit_enabled = SP_JIT_X86 && vm->jit_on && (es & 2);
     const int trace_record_enabled = es & 1;
     VMTraceCapture *trace_cap = NULL; /* created lazily by the variants at the first loop back edge */
     RunCold cold;

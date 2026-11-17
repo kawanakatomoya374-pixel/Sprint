@@ -20,7 +20,7 @@
 #endif
 #include <unistd.h>
 
-#if SP_JIT
+#if SP_JIT_X86
 
 enum { R_AX = 0, R_CX = 1, R_DX = 2, R_BX = 3, R_SP = 4, R_BP = 5, R_SI = 6, R_DI = 7, R_8 = 8, R_9 = 9, R_12 = 12, R_13 = 13, R_14 = 14, R_15 = 15 };
 

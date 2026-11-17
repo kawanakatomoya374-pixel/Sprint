@@ -1,5 +1,5 @@
 #include "../sp.h"
-#if SP_JIT
+#if SP_JIT_X86
 #include "trace_ir.h"
 #include "jit/internal.h"
 #include "jit/snapshot.h"
@@ -4136,6 +4136,21 @@ void jit_trace_free_all(struct JitProto *jp) {
     free(jp->trace_index);
     jp->trace_index = NULL;
 }
+#elif SP_JIT
+/* the region JIT without the TraceJIT (AArch64): the trace entry points do nothing */
+#include "jit/internal.h"
+int jit_trace_compile(VM *vm, Proto *p, uint32_t header, const TraceStep *steps, unsigned count,
+                      uint32_t stack_depth, int is_side, uint8_t parent_slot) {
+    (void)vm; (void)p; (void)header; (void)steps; (void)count; (void)stack_depth; (void)is_side; (void)parent_slot;
+    return 0;
+}
+int jit_trace_site(VM *vm, Proto *p, const uint8_t *hdr, SpValue *base, SpValue *sp, uint8_t *side_parent_slot_out) {
+    (void)vm; (void)p; (void)hdr; (void)base; (void)sp; (void)side_parent_slot_out;
+    return 0;
+}
+int jit_trace_has(const Proto *p, uint32_t header) { (void)p; (void)header; return 0; }
+uint64_t jit_trace_inner_ticks(const Proto *p, uint32_t header, uint32_t here) { (void)p; (void)header; (void)here; return 0; }
+void jit_trace_free_all(struct JitProto *jp) { (void)jp; }
 #else
 typedef int sprint_jit_trace_disabled_translation_unit;
 #endif

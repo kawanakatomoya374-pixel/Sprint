@@ -974,17 +974,22 @@ void prog_quicken(Program *pg);
 #if defined(__wasi__) || defined(_WIN32)
 #define SP_NO_MMAP 1
 #endif
-/* copy-and-patch loop JIT (x86-64 Linux only; elsewhere these are no-ops) */
+/* copy-and-patch loop JIT. SP_JIT_X86: the x86-64 Linux backend (region JIT + TraceJIT). SP_JIT_A64: AArch64 Linux, where the pure-function JIT
+ * (jit_pure_a64.c) is always built and the region JIT (stencils_a64.S) is built with -DSP_A64_REGION. SP_JIT: the region JIT is available. */
 #if defined(__x86_64__) && defined(__linux__) && !defined(SP_NO_JIT) && !defined(SP_OS) && !defined(SP_OS_USER)
-#define SP_JIT 1
+#define SP_JIT_X86 1
 #else
-#define SP_JIT 0
+#define SP_JIT_X86 0
 #endif
-/* AArch64 Linux: the pure-function JIT (jit_pure_a64.c) only, for now; the region and trace JITs are x86-64 */
 #if defined(__aarch64__) && defined(__linux__) && !defined(SP_NO_JIT) && !defined(SP_OS) && !defined(SP_OS_USER)
 #define SP_JIT_A64 1
 #else
 #define SP_JIT_A64 0
+#endif
+#if SP_JIT_X86 || (SP_JIT_A64 && defined(SP_A64_REGION))
+#define SP_JIT 1
+#else
+#define SP_JIT 0
 #endif
 /* A function compiled as a whole: compiled callers call `entry` directly (r12 = base, r13 = kt). The layout is shared
  * with src/runtime/jit/stencils.S through jit/layout.h. */

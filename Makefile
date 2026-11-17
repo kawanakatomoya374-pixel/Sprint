@@ -412,7 +412,17 @@ $(BUILD)/sprint.exe: $(ALLSRC)
 # The AArch64 build has the interpreter plus the pure-function JIT (jit_pure_a64.c); the region and trace JITs are x86-64 only.
 .PHONY: arm64 test-arm64
 arm64: $(BUILD)/sprint-a64
-$(BUILD)/sprint-a64: $(ALLSRC)
-	$(ZIG) cc -target aarch64-linux-gnu -O2 -std=gnu11 -Isrc -DNDEBUG_SP -o $@ $(filter %.c,$^) -lm -ldl
+$(BUILD)/sprint-a64: $(ALLSRC) src/runtime/jit/stencils_a64.h src/runtime/jit/layout_a64.h
+	$(ZIG) cc -target aarch64-linux-gnu -O2 -std=gnu11 -Isrc -DNDEBUG_SP -DSP_A64_REGION -o $@ $(filter %.c,$^) -lm -ldl
+
+# regenerate the AArch64 stencil header (needs zig and qemu-user): layout_a64.h from a target build of tools/jitlayout.c, stencils_a64.h from
+# stencils_a64.S (the stencil list and order come from the x86-64 stencils.h; stencils not yet ported are empty)
+.PHONY: jit-regen-a64
+jit-regen-a64: tools/jitgen.c tools/jitlayout.c src/runtime/jit/stencils_a64.S
+	$(CC) -O1 -o $(GEN)/jitgen tools/jitgen.c
+	$(ZIG) cc -target aarch64-linux-gnu -O1 -Isrc -DNDEBUG_SP -DSP_A64_REGION -o $(GEN)/jitlayout_a64 tools/jitlayout.c
+	QEMU_LD_PREFIX=/usr/aarch64-linux-gnu qemu-aarch64 $(GEN)/jitlayout_a64 > src/runtime/jit/layout_a64.h
+	$(ZIG) cc -target aarch64-linux-gnu -c -x assembler-with-cpp -Isrc/runtime/jit -o $(GEN)/stencils_a64.o src/runtime/jit/stencils_a64.S
+	$(GEN)/jitgen $(GEN)/stencils_a64.o src/runtime/jit/stencils.h > src/runtime/jit/stencils_a64.h
 test-arm64: $(BUILD)/sprint-a64
 	@SPRINT_A64=$(BUILD)/sprint-a64 sh tools/arm64/test.sh
