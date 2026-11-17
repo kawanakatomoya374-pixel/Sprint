@@ -10,6 +10,9 @@
 #include <errno.h>
 #include <limits.h>
 #include <unistd.h>
+#if defined(__SSE2__)
+#include <emmintrin.h>
+#endif
 
 typedef struct Canvas {
     int w, h;
@@ -83,6 +86,23 @@ static void fill32(uint32_t *p, uint32_t col, size_t n) {
         for (size_t i = 0; i < n; i++) p[i] = col;
         return;
     }
+#if defined(__SSE2__)
+    {
+        const __m128i v4 = _mm_set1_epi32((int)col);
+        while (((uintptr_t)p & 15) != 0 && n > 0) { *p++ = col; n--; }
+        while (n >= 16) {
+            _mm_store_si128((__m128i *)(void *)p, v4);
+            _mm_store_si128((__m128i *)(void *)(p + 4), v4);
+            _mm_store_si128((__m128i *)(void *)(p + 8), v4);
+            _mm_store_si128((__m128i *)(void *)(p + 12), v4);
+            p += 16;
+            n -= 16;
+        }
+        while (n >= 4) { _mm_store_si128((__m128i *)(void *)p, v4); p += 4; n -= 4; }
+        while (n > 0) { *p++ = col; n--; }
+        return;
+    }
+#endif
     uint64_t v = ((uint64_t)col << 32) | col;
     if (((uintptr_t)p & 4) != 0) { *p++ = col; n--; }
     while (n >= 8) {
@@ -107,7 +127,27 @@ static void hline(Canvas *c, int x0, int x1, int y, uint32_t col) {
     } else {
         uint32_t *p = &c->px[(size_t)y * (size_t)c->w];
         uint32_t a = (uint32_t)c->alpha;
-        for (int x = x0; x <= x1; x++) p[x] = blend_px(col, p[x], a);
+        int x = x0;
+#if defined(__SSE2__)
+        /* four pixels per step: (col*a + d*(255-a) + 127) / 255 in 16-bit lanes (x*0x8081 >> 23 is exact for x < 65536) */
+        {
+            const __m128i zero = _mm_setzero_si128();
+            const __m128i ca = _mm_mullo_epi16(_mm_unpacklo_epi8(_mm_set1_epi32((int)col), zero), _mm_set1_epi16((short)a));
+            const __m128i bias = _mm_add_epi16(ca, _mm_set1_epi16(127));
+            const __m128i ia = _mm_set1_epi16((short)(255 - a));
+            const __m128i m24 = _mm_set1_epi32(0x00FFFFFF);
+            const __m128i mul = _mm_set1_epi16((short)0x8081);
+            for (; x + 3 <= x1; x += 4) {
+                __m128i d = _mm_loadu_si128((const __m128i *)(const void *)&p[x]);
+                __m128i lo = _mm_add_epi16(_mm_mullo_epi16(_mm_unpacklo_epi8(d, zero), ia), bias);
+                __m128i hi = _mm_add_epi16(_mm_mullo_epi16(_mm_unpackhi_epi8(d, zero), ia), bias);
+                lo = _mm_srli_epi16(_mm_mulhi_epu16(lo, mul), 7);
+                hi = _mm_srli_epi16(_mm_mulhi_epu16(hi, mul), 7);
+                _mm_storeu_si128((__m128i *)(void *)&p[x], _mm_and_si128(_mm_packus_epi16(lo, hi), m24));
+            }
+        }
+#endif
+        for (; x <= x1; x++) p[x] = blend_px(col, p[x], a);
     }
 }
 
@@ -150,7 +190,20 @@ static int isqrt_i(int64_t v) {
 }
 
 /* horizontal inset of row i (0 = outermost) of a rounded corner with radius r */
+static int rr_inset_calc(int r, int i);
 static int rr_inset(int r, int i) {
+    static int8_t tab[65][64];
+    static unsigned char init[65];
+    if (r <= 64 && i >= 0 && i < r) {
+        if (!init[r]) {
+            for (int k = 0; k < r; k++) tab[r][k] = (int8_t)rr_inset_calc(r, k);
+            init[r] = 1;
+        }
+        return tab[r][i];
+    }
+    return rr_inset_calc(r, i);
+}
+static int rr_inset_calc(int r, int i) {
     int64_t dy2 = 2 * (int64_t)r - 2 * i - 1; /* twice the distance from the row centre to the arc centre */
     int hw = (isqrt_i(4 * (int64_t)r * r - dy2 * dy2) + 1) / 2;
     return r - hw;
