@@ -2800,7 +2800,7 @@ static int jh_getidx(VM *vm, const SpValue *o, const SpValue *k, SpValue *dst) {
     case T_TABLE: {
         const STable *t = AS_TABLE(*o);
         int64_t e;
-        if (k->type == T_INT) e = table_find_int(t, k->as.i);
+        if (k->type == T_INT) { e = table_find_int(t, k->as.i); vm->lk_t = t; vm->lk_e = e; }
         else if (k->type == T_STRING) { e = table_find_sstr(t, AS_STR(*k)); vm->lk_t = t; vm->lk_e = e; }
         else return 0;
         r = e >= 0 ? t->ents[e].val : v_nil();
@@ -2897,7 +2897,10 @@ static int jh_setidx(VM *vm, const SpValue *o, const SpValue *k, const SpValue *
         if (k->type != T_STRING && k->type != T_INT) return 0;
         if (v->type != T_NIL) {   /* the key is already there: overwrite the value in place (the common case of t[k] = t[k] + 1) */
             int64_t e;
-            if (k->type == T_INT) e = table_find_int(t, k->as.i);
+            if (k->type == T_INT) {
+                if (t == vm->lk_t && vm->lk_e >= 0 && vm->lk_e < t->nent && t->ents[vm->lk_e].key.type == T_INT && t->ents[vm->lk_e].key.as.i == k->as.i) e = vm->lk_e;   /* just looked up (t[k] = t[k] + 1) */
+                else e = table_find_int(t, k->as.i);
+            }
             else if (t == vm->lk_t && vm->lk_e >= 0 && vm->lk_e < t->nent && t->ents[vm->lk_e].key.type == T_STRING && AS_STR(t->ents[vm->lk_e].key) == AS_STR(*k)) e = vm->lk_e;   /* just looked up (t[k] = t[k] + 1) */
             else e = table_find_sstr(t, AS_STR(*k));
             if (e >= 0) {
