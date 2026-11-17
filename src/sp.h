@@ -934,6 +934,9 @@ void gc_mark(VM *vm, SpValue v); /* for NativeClass.trace */
 /* running */
 RunStatus vm_run_program(VM *vm, Program *prog, int argc, char **argv);
 int vm_call(VM *vm, SpValue fn, int argc, const SpValue *argv, SpValue *ret); /* 0 ok, 1 error pending */
+typedef struct VmCallPrep { SpValue fn; int ok; } VmCallPrep;
+void vm_call_prep(VM *vm, SpValue fnv, int argc, VmCallPrep *cp);
+int vm_call_prepped(VM *vm, const VmCallPrep *cp, int argc, const SpValue *argv, SpValue *ret);
 RunStatus vm_run_chunk(VM *vm, Program *prog); /* REPL: run the modules added since the last call */
 void vm_print_uncaught(VM *vm, int use_json);
 

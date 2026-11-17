@@ -521,6 +521,68 @@ static RunStatus run_loop(VM *vm) {
 /* ---------------------------------------------------------------- */
 /* program start                                                     */
 /* ---------------------------------------------------------------- */
+#if SP_JIT
+/* A callback that a native calls many times in a row (array.map / filter / reduce / sort): the checks vm_call makes on every call
+ * (is it a plain function with exactly argc parameters, no rest / defaults) are made once; each call then only builds the frame and
+ * runs the compiled unit. The unit is read again every call (it can be dropped), and anything unusual goes through vm_call. */
+void vm_call_prep(VM *vm, SpValue fnv, int argc, VmCallPrep *cp) {
+    cp->fn = fnv;
+    cp->ok = 0;
+    if (fnv.type != T_FUNCTION || !vm->jit_on) return;
+    const Proto *jp = AS_FUNC(fnv)->proto;
+    if (jp && argc == jp->nparams && argc == jp->nrequired && !jp->has_rest && jp->ndefaults == 0) cp->ok = 1;
+}
+
+int vm_call_prepped(VM *vm, const VmCallPrep *cp, int argc, const SpValue *argv, SpValue *ret) {
+    if (cp->ok) {
+        SFunc *jf = AS_FUNC(cp->fn);
+        Proto *jp = jf->proto;
+        JitUnit *ju = jp->junit;
+        if (ju && vm->native_depth < vm->max_reentry && vm->nframes < vm->max_frames) {
+            SpValue *fv = vm->sp;
+            SpValue *nb = fv + 1;
+            if ((char *)nb + ju->need + 8 * sizeof(SpValue) <= (char *)vm->stack_end) {
+                fv[0] = cp->fn;
+                for (int i = 0; i < argc; i++) nb[i] = argv[i];
+                for (int i = argc; i < jp->nlocals; i++) nb[i] = v_nil();
+                const int depth = vm->nframes;
+                Frame *nf = &vm->frames[vm->nframes++];
+                nf->fn = jf;
+                nf->base = nb;
+                nf->kind = FK_NORMAL;
+                nf->dbase = vm->ndr;
+                nf->uev = v_nil();
+                nf->pc = jp->code;
+                vm->sp = nb + jp->nlocals;
+                vm->native_depth++;
+                jit_run(vm, ju, nb);
+                vm->native_depth--;
+                if (vm->nframes == depth) {
+                    *ret = fv[0];
+                    vm->sp = fv;
+                    return 0;
+                }
+                vm->frames[depth].kind = FK_BOUNDARY;
+                vm->native_depth++;
+                RunStatus jst = run_loop(vm);
+                vm->native_depth--;
+                vm->sp = fv;
+                if (jst == RS_OK) {
+                    *ret = vm->bret;
+                    vm->bret = v_nil();
+                    return 0;
+                }
+                return 1;
+            }
+        }
+    }
+    return vm_call(vm, cp->fn, argc, argv, ret);
+}
+#else
+void vm_call_prep(VM *vm, SpValue fnv, int argc, VmCallPrep *cp) { (void)vm; (void)argc; cp->fn = fnv; cp->ok = 0; }
+int vm_call_prepped(VM *vm, const VmCallPrep *cp, int argc, const SpValue *argv, SpValue *ret) { return vm_call(vm, cp->fn, argc, argv, ret); }
+#endif
+
 /* Call a Sprint value from a native (SPEC 20.5). The only C recursion in the
  * VM; bounded by max_native_reentry. Returns 1 with the error pending. */
 int vm_call(VM *vm, SpValue fnv, int argc, const SpValue *argv, SpValue *ret) {

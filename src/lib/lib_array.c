@@ -294,12 +294,14 @@ static int hof(VM *vm, SpValue *argv, SpValue *ret, int mode) {
     if (mode == H_ANY) *ret = v_bool(0);
     if (mode == H_ALL) *ret = v_bool(1);
     int err = 0;
+    VmCallPrep cp;
+    vm_call_prep(vm, fn, mode == H_REDUCE ? 2 : 1, &cp);
     for (int64_t i = 0; i < a->len && !err; i++) {
         SpValue item = array_get(a, i), args[2], r;
         int n = 1;
         args[0] = item;
         if (mode == H_REDUCE) { args[0] = acc; args[1] = item; n = 2; }
-        if (vm_call(vm, fn, n, args, &r)) { err = 1; break; }
+        if (vm_call_prepped(vm, &cp, n, args, &r)) { err = 1; break; }
         switch (mode) {
         case H_EACH: break;
         case H_MAP: err = array_push(vm, out, r); break;
