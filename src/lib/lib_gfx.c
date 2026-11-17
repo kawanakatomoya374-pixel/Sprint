@@ -371,6 +371,19 @@ static void draw_text(Canvas *c, int x, int y, const SString *s, uint32_t col, i
         if (cx + 5 * scale <= c->cx0 || cx >= c->cx1 || y + 7 * scale <= c->cy0 || y >= c->cy1) { cx += 6 * scale; continue; }
         if (cx >= c->cx0 && cx + 5 * scale <= c->cx1 && y >= c->cy0 && y + 7 * scale <= c->cy1) {
             /* the whole cell is inside the clip: no per-pixel tests */
+            if (scale == 1) {
+                /* row-major, branch-free: a pixel is written when its glyph bit is set (the select compiles to a conditional move) */
+                const uint32_t a = (uint32_t)c->alpha;
+                uint32_t *row = &c->px[(size_t)y * (size_t)c->w + (size_t)cx];
+                for (int gy = 0; gy < 7; gy++, row += c->w) {
+                    for (int gx = 0; gx < 5; gx++) {
+                        uint32_t nv = a == 255 ? col : blend_px(col, row[gx], a);
+                        row[gx] = (((unsigned)g[gx] >> gy) & 1u) ? nv : row[gx];
+                    }
+                }
+                cx += 6;
+                continue;
+            }
             for (int gx = 0; gx < 5; gx++)
                 for (int gy = 0; gy < 7; gy++)
                     if (g[gx] & (1u << gy))

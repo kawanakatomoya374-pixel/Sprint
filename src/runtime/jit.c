@@ -1194,10 +1194,37 @@ static int branch_info(const uint8_t *code, uint32_t n, uint32_t pc, int *jop, u
     return 1;
 }
 
+/* `a == b` / `a != b` on values that are not both numbers (strings, nil, bools, objects): value_eq through the table helper stencil */
+static int jh_eqv(VM *vm, const SpValue *a, const SpValue *b, SpValue *dst);
+static int jh_nev(VM *vm, const SpValue *a, const SpValue *b, SpValue *dst);
+static int do_eq_helper(JC *c, int cop, uint32_t pc, int inv) {
+    int pb = c->dep - 1, pa = c->dep - 2;
+    if (pa < c->d0) FAIL("stack underflow");
+    if (!flush_regs(c)) return 0;
+    for (int q = pa; q <= pb; q++) if (c->st[q].kind != EK_MEM && c->st[q].kind != EK_LOC && !materialize(c, q)) return 0;
+    Ent *a = &c->st[pa], *b = &c->st[pb];
+    c->xe = gexit(c);
+    if (c->xe < 0) FAIL("out of memory");
+    int ne = (cop == OP_NE) != (inv != 0);
+    EM(ST_hget, soff(c, pa), roff(c, a, pa), roff(c, b, pb), 0, 0, (uint64_t)(uintptr_t)(ne ? jh_nev : jh_eqv));
+    c->dep -= 2;
+    Ent *r = push(c, EK_MEM, TY_BOOL, 0);
+    if (!r) return 0;
+    r->ppc = pc;
+    c->rax_off = -1; c->xmm_off = -1; c->skip1 = 0; c->skipx = 0;
+    return 1;
+}
+static int jump_if(JC *c, int op, uint32_t tpc, uint32_t pc);
+
 static int do_cmp_branch(JC *c, int cop, int jop, uint32_t tpc, uint32_t jpc, uint32_t extra, uint32_t *skip) {
     int pb = c->dep - 1, pa = c->dep - 2;
     if (pa < c->d0) FAIL("stack underflow");
-    if (!num_types(c, pa, pb)) FAIL("non-numeric comparison");
+    if (!num_types(c, pa, pb)) {
+        if (cop != OP_EQ && cop != OP_NE) FAIL("non-numeric comparison");
+        if (!flush_from(c, c->d0, pa) || !do_eq_helper(c, cop, jpc, 0) || !jump_if(c, jop, tpc, jpc)) return 0;
+        *skip = extra;
+        return 1;
+    }
     if (!flush_from(c, c->d0, pa)) return 0;
     Ent *a = &c->st[pa], *b = &c->st[pb];
     int ta = a->ty, tb = b->ty;
@@ -1372,6 +1399,7 @@ static int field_slot(const SClass *k, const SString *name) {
     return sv.as.i >= 0 && sv.as.i < 4096 ? (int)sv.as.i : -1;
 }
 
+static int do_get_index_h(JC *c, uint32_t pc);
 static int do_get_member(JC *c, uint32_t pc, int len, uint32_t *skip) {
     unsigned kix = rd16(c->code + pc + 1);
     int pa = c->dep - 1;
@@ -1395,6 +1423,15 @@ static int do_get_member(JC *c, uint32_t pc, int len, uint32_t *skip) {
         e->hint = method;
         e->ppc = pc;
         return 1;
+    }
+    if (!k && a->hint && a->hint->type == T_TABLE && a->ty != TY_ARR) {
+        /* `table.name` is a lookup of the constant key (nil when absent): the table helper does it and re-checks the type */
+        int ki = kadd(c, c->p->consts[kix]);
+        if (ki < 0) FAIL("too many constants");
+        Ent *e = push(c, EK_K, ty_of(&c->p->consts[kix], 0), ki);
+        if (!e) return 0;
+        e->hint = &c->p->consts[kix];
+        return do_get_index_h(c, pc);
     }
     if (!k) FAIL("member of a non-instance");
     int slot = field_slot(k, name);
@@ -1689,6 +1726,9 @@ static int jh_nat(VM *vm, SpValue *argv, unsigned argc, SpValue *dst, NativeFn f
 static int emit_nat(JC *c, uint32_t pc, int pf, int argc, const NativeDesc *nd, int rty);
 static int nat_result_ty(const NativeDesc *nd, JC *c, int pf, int argc);
 static int jh_strmethod(VM *vm, SpValue *argv, unsigned argc, SpValue *dst, NativeFn fn, unsigned want);
+static int jh_natmethod(VM *vm, SpValue *argv, unsigned argc, SpValue *dst, NativeFn fn, unsigned want);
+static const NativeClass *jh_cls[16];
+static unsigned jh_ncls;
 static int emit_invoke_strmethod(JC *c, uint32_t pc, int pm, int argc, const NativeDesc *nd, int returns_string);
 
 /* INVOKE with one argument: math.sqrt / sin / cos / exp / tan / atan (LOAD_MODULE m; arg; INVOKE name) and
@@ -1739,6 +1779,32 @@ static int do_invoke(JC *c, uint32_t pc, int len, uint32_t *skip) {
             const NativeDesc *sd = lib_string_method(name);
             if (sd && argc + 1 >= sd->min_args && argc + 1 <= sd->max_args)
                 return emit_invoke_strmethod(c, pc, pm, argc, sd, string_method_returns_string(sd));
+        }
+        if (m->hint && m->hint->type == T_NATIVE && AS_NATIVE(*m->hint)->cls->methods) {
+            /* a native object (canvas): its methods run through the GC-aware native stencil; the helper re-checks the class */
+            const NativeClass *nc = AS_NATIVE(*m->hint)->cls;
+            const NativeDesc *nd = NULL;
+            for (const NativeDesc *q = nc->methods; q->name; q++)
+                if (strlen(q->name) == name->len && memcmp(q->name, name->dp, name->len) == 0) { nd = q; break; }
+            if (nd && strncmp(nd->name, "save_", 5) != 0 && argc + 1 >= nd->min_args && argc + 1 <= nd->max_args) {
+                unsigned ci = 0;
+                while (ci < jh_ncls && jh_cls[ci] != nc) ci++;
+                if (ci == jh_ncls) {
+                    if (jh_ncls >= 16) FAIL("invoke: too many native classes");
+                    jh_cls[jh_ncls++] = nc;
+                }
+                if (!flush_regs(c) || !flush_from(c, pm, c->dep)) return 0;
+                c->xe = gexit(c);
+                if (c->xe < 0) FAIL("out of memory");
+                c->hq2 = (uint64_t)(uintptr_t)nd->fn;
+                EM(ST_hnat, soff(c, pm), soff(c, pm), argc + 1, soff(c, c->dep), (int32_t)ci, (uint64_t)(uintptr_t)jh_natmethod);
+                c->dep -= argc + 1;
+                Ent *r = push(c, EK_MEM, TY_UNK, 0);
+                if (!r) return 0;
+                r->ppc = pc;
+                c->rax_off = -1; c->xmm_off = -1; c->skip1 = 0; c->skipx = 0;
+                return 1;
+            }
         }
         if (argc != 1) FAIL("invoke: nonmodule arity");
         if (!flush_regs(c)) return 0;
@@ -2769,6 +2835,14 @@ static int jh_strmethod(VM *vm, SpValue *argv, unsigned argc, SpValue *dst, Nati
     if (argc == 0 || argv[0].type != T_STRING) return 0;
     return jh_nat(vm, argv, argc, dst, fn, want);
 }
+/* A method of a native object (the canvas drawing calls): the receiver's class is re-checked on every call, a failed check or an
+ * error leaves through the exit so the interpreter repeats the call (these methods validate their arguments before drawing). */
+static int jh_natmethod(VM *vm, SpValue *argv, unsigned argc, SpValue *dst, NativeFn fn, unsigned want) {
+    if (argc == 0 || argv[0].type != T_NATIVE || want >= jh_ncls || AS_NATIVE(argv[0])->cls != jh_cls[want]) return 0;
+    return jh_nat(vm, argv, argc, dst, fn, 0xffu);
+}
+static int jh_eqv(VM *vm, const SpValue *a, const SpValue *b, SpValue *dst) { (void)vm; *dst = v_bool(value_eq(*a, *b)); return 1; }
+static int jh_nev(VM *vm, const SpValue *a, const SpValue *b, SpValue *dst) { (void)vm; *dst = v_bool(!value_eq(*a, *b)); return 1; }
 static int jh_setidx(VM *vm, const SpValue *o, const SpValue *k, const SpValue *v) {
     if (vm->bytes >= vm->gc_next) vm_gc(vm);
     if (o->type == T_TABLE) {
@@ -3474,7 +3548,11 @@ static int do_cmp_value(JC *c, int cop, uint32_t pc, int inv) {
     (void)pc;
     int pb = c->dep - 1, pa = c->dep - 2;
     if (pa < c->d0) FAIL("stack underflow");
-    if (!c->reg_on || !num_types(c, pa, pb)) FAIL("comparison used as a value");
+    if (!c->reg_on || !num_types(c, pa, pb)) {
+        if (cop != OP_EQ && cop != OP_NE) FAIL("comparison used as a value");
+        if (!flush_from(c, c->d0, pa)) return 0;
+        return do_eq_helper(c, cop, pc, inv);
+    }
     int ci = cond_index(cop);
     {
         const Ent *a0 = &c->st[pa], *b0 = &c->st[pb];
