@@ -49,6 +49,23 @@
     str x9, [x20, :lo12:\hole]
 .endm
 
+// The generational write barrier (gc_wb in sp.h): storing a reference (type word between T_STRING and T_CELL) into an OLD object (mark bits & 6 == 2)
+// that is not yet remembered tells the collector through vm->jit_wb(vm, object). The call clobbers every caller-saved register: stencils reload.
+.macro WB_CALL objreg, tyreg            // objreg / tyreg hold the object and the value's type word; clobbers x10, x11 (and the rest if the barrier runs)
+    ldrb w10, [\objreg, #L_OBJ_MARKED]
+    and w10, w10, #6
+    cmp w10, #2
+    b.ne 70f
+    sub x11, \tyreg, #T_STRING
+    cmp x11, #(T_CELL - T_STRING)
+    b.hi 70f
+    mov x1, \objreg
+    mov x0, x19
+    ldr x16, [x19, #L_VM_JITWB]
+    blr x16
+70:
+.endm
+
 // ---- frame: entry, exit ---------------------------------------------------------------------------------
 ST entry                                // loop region: x0 = VM, x1 = frame base, x2 = constants, x3 = current Frame
     stp x29, x30, [sp, #-96]!
@@ -641,9 +658,11 @@ ST getidx_rk                            // index is the constant H2
     str x2, [x20, :lo12:H0]
     str x3, [x20, :lo12:H0+8]
 
-// stores: only into a packed array holding the value's own type (a boxed array, or a value of another type, is the interpreter's: it
-// needs the write barrier / unpacks)
-.macro SETIDX_BODY bv                   // x0 = array, x1 = index, value slot at \bv + H2
+// array stores, as in the x86-64 stencils: a packed array (note T_BOOL / T_INT / T_FLOAT) takes only a value of its own type (anything else is the
+// interpreter's: it unpacks); a boxed array takes any value, its element-type note drops to "unknown" when the type differs, and the write barrier runs
+.macro SETIDX bv                        // array(H0)[int(H1)] <- the value slot at \bv + H2
+    ldr x0, [x20, :lo12:H0+8]
+    ldr x1, [x20, :lo12:H1+8]
     ldr x5, [x0, :lo12:H3]
     cmp x1, x5
     b.hs JIT_X
@@ -651,25 +670,94 @@ ST getidx_rk                            // index is the constant H2
     ldrb w7, [x0, #L_OBJ_XT]
     sub w8, w7, #1
     cmp w8, #2
-    b.hi JIT_X                          // a boxed array
-    cmp w7, w6
-    b.ne JIT_X                          // a different type
+    b.ls 3f
+    cmp w7, w6                          // a boxed array: the note drops to "unknown" when the value's type differs
+    b.eq 1f
+    strb wzr, [x0, #L_OBJ_XT]
+1:  WB_CALL x0, x6
+    ldr x0, [x20, :lo12:H0+8]           // the barrier may have called C: reload
+    ldr x1, [x20, :lo12:H1+8]
+    ldr x6, [\bv, :lo12:H2]
+    ldr x3, [\bv, :lo12:H2+8]
+    ldr x0, [x0, :lo12:H4]
+    add x4, x0, x1, lsl #4
+    str x6, [x4]
+    str x3, [x4, #8]
+    b 9f
+3:  cmp w7, w6                          // a packed array: only a value of its own type fits
+    b.ne JIT_X
     ldr x0, [x0, :lo12:H4]
     ldr x3, [\bv, :lo12:H2+8]
     cmp w6, #T_BOOL
-    b.ne 1f
+    b.ne 5f
     cmp w3, #0
     cset x3, ne
-1:  str x3, [x0, x1, lsl #3]
+5:  str x3, [x0, x1, lsl #3]
+9:
 .endm
-ST setidx_rr                            // array(H0)[int(H1)] <- slot H2
-    ldr x0, [x20, :lo12:H0+8]
-    ldr x1, [x20, :lo12:H1+8]
-    SETIDX_BODY x20
-ST setidx_rk                            // value is the constant H2
-    ldr x0, [x20, :lo12:H0+8]
-    ldr x1, [x20, :lo12:H1+8]
-    SETIDX_BODY x21
+ST setidx_rr
+    SETIDX x20
+ST setidx_rk
+    SETIDX x21
+
+// a.append(v): no growth here (len < cap), else the interpreter's. H1 = the array slot, H2 = the value (slot / constant), H3 = len offset, H4 = data,
+// H5 = cap offset. The result slot H0 is nil.
+.macro AAPPEND bv
+    ldr x0, [x20, :lo12:H1+8]
+    ldr x1, [x0, :lo12:H3]              // len
+    ldr x2, [x0, :lo12:H5]              // cap
+    cmp x1, x2
+    b.ge JIT_X
+    ldr x6, [\bv, :lo12:H2]             // the value's type word
+    ldrb w7, [x0, #L_OBJ_XT]
+    sub w8, w7, #1
+    cmp w8, #2
+    b.ls 5f
+    cbnz x1, 6f                         // a boxed array: an empty one takes the value's type (a numeric value would switch it to packed storage: the interpreter's job)
+    sub w8, w6, #1
+    cmp w8, #2
+    b.ls JIT_X
+    strb w6, [x0, #L_OBJ_XT]
+    b 1f
+6:  cmp w7, w6
+    b.eq 1f
+    strb wzr, [x0, #L_OBJ_XT]
+1:  WB_CALL x0, x6
+    ldr x0, [x20, :lo12:H1+8]
+    ldr x1, [x0, :lo12:H3]
+    ldr x6, [\bv, :lo12:H2]
+    ldr x3, [\bv, :lo12:H2+8]
+    add x2, x1, #1
+    str x2, [x0, :lo12:H3]
+    ldr x0, [x0, :lo12:H4]
+    add x4, x0, x1, lsl #4
+    str x6, [x4]
+    str x3, [x4, #8]
+    b 9f
+5:  cbz x1, 7f                          // a packed array: only a numeric value of its own type (the note is set when it is empty)
+    cmp w7, w6
+    b.ne JIT_X
+    b 8f
+7:  sub w8, w6, #1
+    cmp w8, #2
+    b.hi JIT_X
+    strb w6, [x0, #L_OBJ_XT]
+8:  add x2, x1, #1
+    str x2, [x0, :lo12:H3]
+    ldr x0, [x0, :lo12:H4]
+    ldr x3, [\bv, :lo12:H2+8]
+    cmp w6, #T_BOOL
+    b.ne 4f
+    cmp w3, #0
+    cset x3, ne
+4:  str x3, [x0, x1, lsl #3]
+9:  str xzr, [x20, :lo12:H0]
+    str xzr, [x20, :lo12:H0+8]
+.endm
+ST aappend_r
+    AAPPEND x20
+ST aappend_k
+    AAPPEND x21
 
 ST alen                                 // slot H0 <- len(array(H1))
     ldr x0, [x20, :lo12:H1+8]
@@ -731,3 +819,789 @@ ST hset                                 // HQ(vm, slot H1, slot H2, slot H3) sto
     LDI64 16, HQ
     blr x16
     cbz w0, JIT_X
+
+// ---- function units: entered from the interpreter by utramp, called by compiled code with bl --------------------------------------------
+// The callee gets a Frame (x23 advances, the callee's return steps it back), its own frame base in x20 and constants in x21 (the caller's are
+// saved around the call); returns put the result in the callee slot below the base.
+ST utramp                               // function unit, entered from the interpreter: same arguments as entry; JIT_T = ufn
+    stp x29, x30, [sp, #-96]!
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+    stp x25, x26, [sp, #64]
+    mov x19, x0
+    mov x20, x1
+    mov x21, x2
+    mov x23, x3
+    mov x4, sp
+    str x4, [x19, #L_VM_JRSP]
+    ldr x22, [x19, #L_VM_SLOTS]
+    bl JIT_T
+    ldp x25, x26, [sp, #64]             // the unit returned normally: its frame is popped, the result is below the base
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #96
+    movn w0, #0
+    ret
+
+ST ufn                                  // function unit body entry, called by utramp and by ucall
+    stp x29, x30, [sp, #-16]!
+
+.macro RET_TAIL                         // x0:x1 = the value
+    ldr w2, [x23, #L_FR_KIND]
+    cbz w2, 1f
+    ldr x0, [x23, #L_FR_UEV]
+    ldr x1, [x23, #L_FR_UEV+8]
+1:  stur x0, [x20, #-16]
+    stur x1, [x20, #-8]
+    sub x23, x23, #L_FRAME
+    ldr w2, [x19, #L_VM_NFRAMES]
+    sub w2, w2, #1
+    str w2, [x19, #L_VM_NFRAMES]
+    ldp x29, x30, [sp], #16
+    ret
+.endm
+
+ST ret_r                                // return slot H0
+    ldr x0, [x20, :lo12:H0]
+    ldr x1, [x20, :lo12:H0+8]
+    RET_TAIL
+
+ST ret_k                                // return constant H0
+    ldr x0, [x21, :lo12:H0]
+    ldr x1, [x21, :lo12:H0+8]
+    RET_TAIL
+
+ST ret_nil
+    mov x0, xzr
+    mov x1, xzr
+    RET_TAIL
+
+// Calls of a Sprint function. The checks all happen first (a failed one leaves through JIT_X before anything has happened); the effect then
+// pushes the Frame the interpreter would push and calls the callee's compiled entry. On entry: x0 = SFunc *, x2 = JitUnit * (or Proto *).
+.macro UC_CHECKS argc                   // leaves x8 = the new base
+    ldr w4, [x2, #L_JU_NPARAMS]
+    LDU32 5, \argc
+    cmp w4, w5
+    b.ne JIT_X
+    ldr x4, [x19, #L_VM_ILEFT]
+    cbz x4, JIT_X
+    ldr w5, [x19, #L_VM_NFRAMES]
+    ldr w6, [x19, #L_VM_JFMAX]
+    cmp w5, w6
+    b.ge JIT_X
+    LDI32 7, H0
+    add x7, x20, x7
+    add x8, x7, #16
+    ldr x9, [x2, #L_JU_NEED]
+    add x9, x9, x8
+    ldr x10, [x19, #L_VM_STACK_END]
+    cmp x9, x10
+    b.hi JIT_X
+.endm
+
+.macro UC_EFFECT argc, kind, retq, uevt=xzr, uevp=xzr       // frame->uev = uevt:uevp (0:0 by default)
+    ldr x4, [x19, #L_VM_ILEFT]
+    sub x4, x4, #1
+    str x4, [x19, #L_VM_ILEFT]
+    ldrsw x9, [x2, #L_JU_NLOCALS]       // locals beyond the arguments start out nil
+    LDU32 10, \argc
+    cmp x10, x9
+    b.ge 2f
+1:  add x12, x8, x10, lsl #4
+    stp xzr, xzr, [x12]
+    add x10, x10, #1
+    cmp x10, x9
+    b.lt 1b
+2:  LDI64 9, \retq
+    str x9, [x23, #L_FR_PC]
+    add x23, x23, #L_FRAME
+    add w5, w5, #1
+    str w5, [x19, #L_VM_NFRAMES]
+    str x0, [x23, #L_FR_FN]
+    str x8, [x23, #L_FR_BASE]
+    mov w9, #\kind
+    str w9, [x23, #L_FR_KIND]
+    ldr w9, [x19, #L_VM_NDR]
+    str w9, [x23, #L_FR_DBASE]
+    stp \uevt, \uevp, [x23, #L_FR_UEV]
+    ldr x9, [x2, #L_JU_CODE]
+    str x9, [x23, #L_FR_PC]
+    stp x20, x21, [sp, #-16]!
+    mov x20, x8
+    ldr x21, [x2, #L_JU_KT]
+    ldr x9, [x2, #L_JU_ENTRY]
+    blr x9
+    ldp x20, x21, [sp], #16
+.endm
+
+// CALL with H1 arguments; the callee value is slot H0, the arguments follow.
+ST ucall
+    ldr x0, [x20, :lo12:H0]
+    cmp x0, #T_FUNCTION
+    b.ne JIT_X
+    ldr x0, [x20, :lo12:H0+8]           // SFunc *
+    ldr x1, [x0, #L_SFUNC_PROTO]
+    cbz x1, JIT_X
+    ldr x2, [x1, #L_PROTO_JUNIT]        // JitUnit *
+    cbz x2, JIT_X
+    UC_CHECKS H1
+    UC_EFFECT H1, 0, HQ
+
+// method call on an instance: slot H0 = receiver, H1 more arguments, the method value is constant H2 (kt)
+ST uinvoke
+    ldr x0, [x21, :lo12:H2+8]
+    ldr x1, [x0, #L_SFUNC_PROTO]
+    cbz x1, JIT_X
+    ldr x2, [x1, #L_PROTO_JUNIT]
+    cbz x2, JIT_X
+    UC_CHECKS H1+1
+    LDU32 10, H1                        // shift slots H1 .. 0 up by one
+3:  LDI32 11, H0
+    add x11, x20, x11
+    add x11, x11, x10, lsl #4
+    ldp x9, x12, [x11]
+    stp x9, x12, [x11, #16]
+    subs x10, x10, #1
+    b.pl 3b
+    ldr x9, [x21, :lo12:H2]
+    str x9, [x20, :lo12:H0]
+    str x0, [x20, :lo12:H0+8]
+    UC_EFFECT H1+1, 0, HQ
+
+// calls whose callee proto the compiler knew when it compiled: everything about the callee is an immediate. H0 = callee slot, H1 = arguments,
+// H2 = callee locals, H3 = bytes of stack the callee needs, HQ = pc to resume the caller at, HQ2 = the callee's JitUnit (ucall_k) / Proto (ucall_s)
+.macro UCK_BODY self
+    ldr x4, [x19, #L_VM_ILEFT]
+    cbz x4, JIT_X
+    ldr w5, [x19, #L_VM_NFRAMES]
+    ldr w6, [x19, #L_VM_JFMAX]
+    cmp w5, w6
+    b.ge JIT_X
+    LDI32 7, H0
+    add x7, x20, x7
+    add x8, x7, #16                     // the new base
+    LDI32 9, H3
+    add x9, x8, x9
+    ldr x10, [x19, #L_VM_STACK_END]
+    cmp x9, x10
+    b.hi JIT_X
+    sub x4, x4, #1
+    str x4, [x19, #L_VM_ILEFT]
+    LDU32 10, H1                        // locals beyond the arguments start out nil
+    LDU32 11, H2
+    cmp w10, w11
+    b.ge 2f
+1:  add x12, x8, x10, lsl #4
+    stp xzr, xzr, [x12]
+    add w10, w10, #1
+    cmp w10, w11
+    b.lt 1b
+2:  LDI64 9, HQ
+    str x9, [x23, #L_FR_PC]
+    add x23, x23, #L_FRAME
+    add w5, w5, #1
+    str w5, [x19, #L_VM_NFRAMES]
+    str x0, [x23, #L_FR_FN]
+    str x8, [x23, #L_FR_BASE]
+    str wzr, [x23, #L_FR_KIND]
+    ldr w9, [x19, #L_VM_NDR]
+    str w9, [x23, #L_FR_DBASE]
+    stp xzr, xzr, [x23, #L_FR_UEV]
+.if \self
+    ldr x9, [x2, #L_PROTO_CODE]
+.else
+    ldr x9, [x2, #L_JU_CODE]
+.endif
+    str x9, [x23, #L_FR_PC]
+    stp x20, x21, [sp, #-16]!
+    mov x20, x8
+.if \self
+    bl JIT_T
+.else
+    ldr x21, [x2, #L_JU_KT]
+    ldr x9, [x2, #L_JU_ENTRY]
+    blr x9
+.endif
+    ldp x20, x21, [sp], #16
+.endm
+
+ST ucall_k
+    ldr x0, [x20, :lo12:H0]
+    cmp x0, #T_FUNCTION
+    b.ne JIT_X
+    ldr x0, [x20, :lo12:H0+8]
+    ldr x1, [x0, #L_SFUNC_PROTO]
+    LDI64 2, HQ2
+    ldr x3, [x2, #L_JU_PROTO]
+    cmp x1, x3
+    b.ne JIT_X
+    UCK_BODY 0
+
+ST ucall_s
+    ldr x0, [x20, :lo12:H0]
+    cmp x0, #T_FUNCTION
+    b.ne JIT_X
+    ldr x0, [x20, :lo12:H0+8]
+    ldr x1, [x0, #L_SFUNC_PROTO]
+    LDI64 2, HQ2
+    cmp x1, x2
+    b.ne JIT_X
+    UCK_BODY 1
+
+// a function calling itself with no locals beyond its parameters (fib): no nil fill; the callee returns with x20 at its own base
+ST ucall_s0
+    ldr x0, [x20, :lo12:H0]
+    cmp x0, #T_FUNCTION
+    b.ne JIT_X
+    ldr x0, [x20, :lo12:H0+8]
+    ldr x1, [x0, #L_SFUNC_PROTO]
+    LDI64 2, HQ2
+    cmp x1, x2
+    b.ne JIT_X
+    ldr x4, [x19, #L_VM_ILEFT]
+    cbz x4, JIT_X
+    ldr w5, [x19, #L_VM_NFRAMES]
+    ldr w6, [x19, #L_VM_JFMAX]
+    cmp w5, w6
+    b.ge JIT_X
+    LDI32 7, H0
+    add x7, x20, x7
+    add x8, x7, #16
+    LDI32 9, H3
+    add x9, x8, x9
+    ldr x10, [x19, #L_VM_STACK_END]
+    cmp x9, x10
+    b.hi JIT_X
+    sub x4, x4, #1
+    str x4, [x19, #L_VM_ILEFT]
+    LDI64 9, HQ
+    str x9, [x23, #L_FR_PC]
+    add x23, x23, #L_FRAME
+    add w5, w5, #1
+    str w5, [x19, #L_VM_NFRAMES]
+    str x0, [x23, #L_FR_FN]
+    str x8, [x23, #L_FR_BASE]
+    str wzr, [x23, #L_FR_KIND]
+    ldr w9, [x19, #L_VM_NDR]
+    str w9, [x23, #L_FR_DBASE]
+    stp xzr, xzr, [x23, #L_FR_UEV]
+    ldr x9, [x2, #L_PROTO_CODE]
+    str x9, [x23, #L_FR_PC]
+    mov x20, x8
+    bl JIT_T
+    LDI32 7, H0
+    sub x20, x20, x7
+    sub x20, x20, #16
+
+// ---- instances: class guard, field loads / stores (no write barrier: a reference store into an old instance is left to the interpreter) ------
+ST gcls                                 // slot H0 must hold an instance of the class HQ
+    ldr x0, [x20, :lo12:H0]
+    cmp x0, #T_INSTANCE
+    b.ne JIT_X
+    ldr x0, [x20, :lo12:H0+8]
+    ldr x1, [x0, #L_INST_CLS]
+    LDI64 2, HQ
+    cmp x1, x2
+    b.ne JIT_X
+
+ST ldfld                                // slot H0 <- field (byte offset H2 into the instance) of the instance in slot H1
+    ldr x0, [x20, :lo12:H1+8]
+    ldr x1, [x0, :lo12:H2]
+    ldr x2, [x0, :lo12:H2+8]
+    str x1, [x20, :lo12:H0]
+    str x2, [x20, :lo12:H0+8]
+
+ST ldfld_i                              // as ldfld, the field must be an int
+    ldr x0, [x20, :lo12:H1+8]
+    ldr x1, [x0, :lo12:H2]
+    cmp x1, #T_INT
+    b.ne JIT_X
+    ldr x0, [x0, :lo12:H2+8]
+    SETT H0, T_INT
+    str x0, [x20, :lo12:H0+8]
+
+ST ldfld_f                              // as ldfld, the field must be a float
+    ldr x0, [x20, :lo12:H1+8]
+    ldr x1, [x0, :lo12:H2]
+    cmp x1, #T_FLOAT
+    b.ne JIT_X
+    ldr x0, [x0, :lo12:H2+8]
+    SETT H0, T_FLOAT
+    str x0, [x20, :lo12:H0+8]
+
+ST stfld                                // field H2 of the instance in slot H0 <- slot H1
+    ldr x0, [x20, :lo12:H0+8]
+    ldr x1, [x20, :lo12:H1]
+    WB_CALL x0, x1
+    ldr x0, [x20, :lo12:H0+8]
+    ldr x1, [x20, :lo12:H1]
+    ldr x3, [x20, :lo12:H1+8]
+    str x1, [x0, :lo12:H2]
+    str x3, [x0, :lo12:H2+8]
+
+ST stfldk                               // field H2 of the instance in slot H0 <- constant H1
+    ldr x0, [x20, :lo12:H0+8]
+    ldr x1, [x21, :lo12:H1]
+    WB_CALL x0, x1
+    ldr x0, [x20, :lo12:H0+8]
+    ldr x1, [x21, :lo12:H1]
+    ldr x3, [x21, :lo12:H1+8]
+    str x1, [x0, :lo12:H2]
+    str x3, [x0, :lo12:H2+8]
+
+// ---- upvalues: the current closure is frame->fn ------------------------------------------------------------------------
+ST ldup                                 // slot H0 <- upvalue (byte offset H1 into up[])
+    ldr x0, [x23, #L_FR_FN]
+    ldr x0, [x0, #L_SFUNC_UP]
+    ldr x0, [x0, :lo12:H1]
+    ldr x1, [x0, #L_CELL_V]
+    ldr x2, [x0, #L_CELL_V+8]
+    str x1, [x20, :lo12:H0]
+    str x2, [x20, :lo12:H0+8]
+
+ST stup                                 // upvalue (byte offset H1) <- slot H0
+    ldr x0, [x23, #L_FR_FN]
+    ldr x0, [x0, #L_SFUNC_UP]
+    ldr x0, [x0, :lo12:H1]
+    ldr x1, [x20, :lo12:H0]
+    WB_CALL x0, x1
+    ldr x0, [x23, #L_FR_FN]
+    ldr x0, [x0, #L_SFUNC_UP]
+    ldr x0, [x0, :lo12:H1]
+    ldr x1, [x20, :lo12:H0]
+    ldr x2, [x20, :lo12:H0+8]
+    str x1, [x0, #L_CELL_V]
+    str x2, [x0, #L_CELL_V+8]
+
+// ---- polymorphic method call (see pinvoke in stencils.S): slot H0 = receiver, H1 more arguments, constant H2 (kt, an int) = the site's cache
+// {cls[4], fn[4]}, HQ = pc to resume the caller at, HQ2 = jh_pic(vm, cache, cls) -> SFunc* or 0
+ST pinvoke
+    ldr x0, [x20, :lo12:H0]
+    cmp x0, #T_INSTANCE
+    b.ne JIT_X
+    ldr x0, [x20, :lo12:H0+8]
+    ldr x0, [x0, #L_INST_CLS]           // the receiver's class
+    ldr x3, [x21, :lo12:H2+8]           // the cache
+    ldr x4, [x3]
+    cmp x0, x4
+    b.ne 5f
+    ldr x0, [x3, #32]
+    b 9f
+5:  ldr x4, [x3, #8]
+    cmp x0, x4
+    b.ne 6f
+    ldr x0, [x3, #40]
+    b 9f
+6:  ldr x4, [x3, #16]
+    cmp x0, x4
+    b.ne 7f
+    ldr x0, [x3, #48]
+    b 9f
+7:  ldr x4, [x3, #24]
+    cmp x0, x4
+    b.ne 8f
+    ldr x0, [x3, #56]
+    b 9f
+8:  mov x2, x0                          // miss: resolve and remember
+    mov x1, x3
+    mov x0, x19
+    LDI64 16, HQ2
+    blr x16
+    cbz x0, JIT_X
+9:  ldr x1, [x0, #L_SFUNC_PROTO]
+    cbz x1, JIT_X
+    ldr x2, [x1, #L_PROTO_JUNIT]
+    cbz x2, JIT_X
+    UC_CHECKS H1+1
+    LDU32 10, H1                        // shift slots H1 .. 0 up by one
+3:  LDI32 11, H0
+    add x11, x20, x11
+    add x11, x11, x10, lsl #4
+    ldp x9, x12, [x11]
+    stp x9, x12, [x11, #16]
+    subs x10, x10, #1
+    b.pl 3b
+    SETT H0, T_FUNCTION
+    str x0, [x20, :lo12:H0+8]
+    UC_EFFECT H1+1, 0, HQ
+
+// ---- inlined calls: the guards (the callee's frame is not pushed) ---------------------------------------------------------
+ST ginl                                 // slot H0 holds a function whose proto is HQ; budget, frame count and stack room
+    ldr x0, [x20, :lo12:H0]
+    cmp x0, #T_FUNCTION
+    b.ne JIT_X
+    ldr x0, [x20, :lo12:H0+8]
+    ldr x1, [x0, #L_SFUNC_PROTO]
+    LDI64 2, HQ
+    cmp x1, x2
+    b.ne JIT_X
+    ldr x4, [x19, #L_VM_ILEFT]
+    cbz x4, JIT_X
+    ldr w5, [x19, #L_VM_NFRAMES]
+    ldr w6, [x19, #L_VM_JFMAX]
+    cmp w5, w6
+    b.ge JIT_X
+    LDI32 7, H0
+    add x7, x20, x7
+    add x8, x7, #16
+    LDI32 9, H1
+    add x8, x8, x9
+    ldr x10, [x19, #L_VM_STACK_END]
+    cmp x8, x10
+    b.hi JIT_X
+    sub x4, x4, #1
+    str x4, [x19, #L_VM_ILEFT]
+
+ST ginlr                                // the same checks for a method call (the callee is a constant)
+    ldr x4, [x19, #L_VM_ILEFT]
+    cbz x4, JIT_X
+    ldr w5, [x19, #L_VM_NFRAMES]
+    ldr w6, [x19, #L_VM_JFMAX]
+    cmp w5, w6
+    b.ge JIT_X
+    LDI32 7, H0
+    add x7, x20, x7
+    add x8, x7, #16
+    LDI32 9, H1
+    add x8, x8, x9
+    ldr x10, [x19, #L_VM_STACK_END]
+    cmp x8, x10
+    b.hi JIT_X
+    sub x4, x4, #1
+    str x4, [x19, #L_VM_ILEFT]
+
+ST ginln                                // loop region: frame and stack room were checked when the region was entered; only the budget is left
+    ldr x0, [x20, :lo12:H0]
+    cmp x0, #T_FUNCTION
+    b.ne JIT_X
+    ldr x0, [x20, :lo12:H0+8]
+    ldr x1, [x0, #L_SFUNC_PROTO]
+    LDI64 2, HQ
+    cmp x1, x2
+    b.ne JIT_X
+    ldr x4, [x19, #L_VM_ILEFT]
+    cbz x4, JIT_X
+    sub x4, x4, #1
+    str x4, [x19, #L_VM_ILEFT]
+
+ST ginlrn
+    ldr x4, [x19, #L_VM_ILEFT]
+    cbz x4, JIT_X
+    sub x4, x4, #1
+    str x4, [x19, #L_VM_ILEFT]
+
+// upvalue access in an inlined callee: the closure is the function value in slot H2
+ST ldupi                                // slot H0 <- upvalue (byte offset H1 into up[]) of the closure in slot H2
+    ldr x0, [x20, :lo12:H2+8]
+    ldr x0, [x0, #L_SFUNC_UP]
+    ldr x0, [x0, :lo12:H1]
+    ldr x1, [x0, #L_CELL_V]
+    ldr x2, [x0, #L_CELL_V+8]
+    str x1, [x20, :lo12:H0]
+    str x2, [x20, :lo12:H0+8]
+
+ST stupi                                // upvalue (byte offset H1) of the closure in slot H2 <- slot H0
+    ldr x0, [x20, :lo12:H2+8]
+    ldr x0, [x0, #L_SFUNC_UP]
+    ldr x0, [x0, :lo12:H1]
+    ldr x1, [x20, :lo12:H0]
+    WB_CALL x0, x1
+    ldr x0, [x20, :lo12:H2+8]
+    ldr x0, [x0, #L_SFUNC_UP]
+    ldr x0, [x0, :lo12:H1]
+    ldr x1, [x20, :lo12:H0]
+    ldr x2, [x20, :lo12:H0+8]
+    str x1, [x0, #L_CELL_V]
+    str x2, [x0, #L_CELL_V+8]
+
+ST stupk                                // upvalue (byte offset H1) <- constant H0
+    ldr x0, [x23, #L_FR_FN]
+    ldr x0, [x0, #L_SFUNC_UP]
+    ldr x0, [x0, :lo12:H1]
+    ldr x1, [x21, :lo12:H0]
+    WB_CALL x0, x1
+    ldr x0, [x23, #L_FR_FN]
+    ldr x0, [x0, #L_SFUNC_UP]
+    ldr x0, [x0, :lo12:H1]
+    ldr x1, [x21, :lo12:H0]
+    ldr x2, [x21, :lo12:H0+8]
+    str x1, [x0, #L_CELL_V]
+    str x2, [x0, #L_CELL_V+8]
+
+ST stupki                               // upvalue (byte offset H1) of the closure in slot H2 <- constant H0
+    ldr x0, [x20, :lo12:H2+8]
+    ldr x0, [x0, #L_SFUNC_UP]
+    ldr x0, [x0, :lo12:H1]
+    ldr x1, [x21, :lo12:H0]
+    WB_CALL x0, x1
+    ldr x0, [x20, :lo12:H2+8]
+    ldr x0, [x0, #L_SFUNC_UP]
+    ldr x0, [x0, :lo12:H1]
+    ldr x1, [x21, :lo12:H0]
+    ldr x2, [x21, :lo12:H0+8]
+    str x1, [x0, #L_CELL_V]
+    str x2, [x0, #L_CELL_V+8]
+
+// ---- new instances ---------------------------------------------------------------------------------------------------
+// new instance of the class in x2 -> x0. The fast path is jit_new_inst / new_obj / pool_alloc spelled out (no collection due, the size class has a
+// free block, the heap limit is not reached, 14 fields at most); otherwise the C helper runs with the stack top \spo (a frame offset) published to
+// the GC. Clobbers x1, x3 .. x14 (and the rest if the helper runs).
+.macro NEWINST spo
+    ldr w3, [x2, #L_CLS_NF]
+    cmp w3, #14
+    b.hi 88f
+    ldr x0, [x19, #L_VM_BYTES]
+    ldr x4, [x19, #L_VM_GCNEXT]
+    cmp x0, x4
+    b.hs 88f
+    lsl x4, x3, #4
+    add x4, x4, #L_INST_SLOTS
+    add x0, x0, x4
+    ldr x5, [x19, #L_VM_MAXHEAP]
+    cmp x0, x5
+    b.hi 88f
+    add x6, x3, #2                      // size class (L_INST_SLOTS = 32 = 2 * 16)
+    add x7, x19, x6, lsl #3
+    ldr x8, [x7, #L_VM_POOLFREE]
+    cbz x8, 88f
+    ldr x9, [x8]
+    str x9, [x7, #L_VM_POOLFREE]
+    str x0, [x19, #L_VM_BYTES]
+    ldr w0, [x19, #L_VM_NEXTID]
+    add w0, w0, #1
+    str w0, [x19, #L_VM_NEXTID]
+    lsl x0, x0, #32
+    movz x9, #9                         // T_INSTANCE
+    orr x0, x0, x9
+    str x0, [x8]                        // type, marked, id
+    ldr x0, [x19, #L_VM_OBJS]
+    str x0, [x8, #8]                    // next
+    str x8, [x19, #L_VM_OBJS]
+    str x2, [x8, #L_INST_CLS]
+    str x3, [x8, #L_INST_NSLOTS]        // nslots (the padding word is zeroed with it)
+    ldr x9, [x2, #L_CLS_DFLT]
+    mov x10, #0
+    cbz x9, 86f
+85: cmp x3, x10                         // copy the default slot values
+    b.ge 87f
+    lsl x11, x10, #4
+    add x12, x9, x11
+    ldp x13, x14, [x12]
+    add x12, x8, x11
+    stp x13, x14, [x12, #L_INST_SLOTS]
+    add x10, x10, #1
+    b 85b
+86: cmp x3, x10                         // all nil
+    b.ge 87f
+    lsl x11, x10, #4
+    add x12, x8, x11
+    stp xzr, xzr, [x12, #L_INST_SLOTS]
+    add x10, x10, #1
+    b 86b
+87: mov x0, x8
+    b 89f
+88: LDI32 0, \spo                       // slow path: the helper may collect
+    add x0, x20, x0
+    str x0, [x19, #L_VM_SP]
+    mov x1, x2
+    mov x0, x19
+    ldr x16, [x19, #L_VM_JNEW]
+    blr x16
+89:
+.endm
+
+ST ucls                                 // inlined construction: slot H0 must hold the class HQ
+    ldr x0, [x20, :lo12:H0]
+    cmp x0, #8                          // T_CLASS
+    b.ne JIT_X
+    ldr x1, [x20, :lo12:H0+8]
+    LDI64 2, HQ
+    cmp x1, x2
+    b.ne JIT_X
+
+ST unewc                                // a new instance of the class HQ in x0, header only (the compiler stores the default slot values)
+    LDI64 2, HQ                         // H1 = number of slots (14 at most), H2 = its size in bytes, H0 = stack top (a frame offset)
+    LDU32 3, H1
+    ldr x0, [x19, #L_VM_BYTES]
+    ldr x4, [x19, #L_VM_GCNEXT]
+    cmp x0, x4
+    b.hs 8f
+    LDU32 5, H2
+    add x0, x0, x5
+    ldr x6, [x19, #L_VM_MAXHEAP]
+    cmp x0, x6
+    b.hi 8f
+    add x6, x3, #2
+    add x7, x19, x6, lsl #3
+    ldr x8, [x7, #L_VM_POOLFREE]
+    cbz x8, 8f
+    ldr x9, [x8]
+    str x9, [x7, #L_VM_POOLFREE]
+    str x0, [x19, #L_VM_BYTES]
+    ldr w0, [x19, #L_VM_NEXTID]
+    add w0, w0, #1
+    str w0, [x19, #L_VM_NEXTID]
+    lsl x0, x0, #32
+    movz x9, #9
+    orr x0, x0, x9
+    str x0, [x8]
+    ldr x0, [x19, #L_VM_OBJS]
+    str x0, [x8, #8]
+    str x8, [x19, #L_VM_OBJS]
+    str x2, [x8, #L_INST_CLS]
+    str x3, [x8, #L_INST_NSLOTS]
+    mov x0, x8
+    b 9f
+8:  LDI32 0, H0
+    add x0, x20, x0
+    str x0, [x19, #L_VM_SP]
+    mov x1, x2
+    mov x0, x19
+    ldr x16, [x19, #L_VM_JNEW]
+    blr x16
+9:
+
+ST unew0                                // class (no init, no arguments) in slot H0 -> new instance; H3 = stack top, HQ = class
+    ldr x0, [x20, :lo12:H0]
+    cmp x0, #8
+    b.ne JIT_X
+    ldr x1, [x20, :lo12:H0+8]
+    LDI64 2, HQ
+    cmp x1, x2
+    b.ne JIT_X
+    ldr x4, [x19, #L_VM_ILEFT]
+    cbz x4, JIT_X
+    sub x4, x4, #1
+    str x4, [x19, #L_VM_ILEFT]
+    ldr x2, [x20, :lo12:H0+8]
+    NEWINST H3
+    SETT H0, T_INSTANCE
+    str x0, [x20, :lo12:H0+8]
+
+// construction through the fast path (class in slot H0 with H1 arguments after it, init method = constant H2, H3 = byte offset of the stack top,
+// HQ = the class, HQ2 = pc to resume the caller at): checks everything first, then allocates (the one step that cannot fail), then calls init with
+// the new instance as `self`; the frame is a constructor frame (kind 4) that returns the instance.
+ST uctor
+    ldr x0, [x20, :lo12:H0]
+    cmp x0, #8                          // T_CLASS
+    b.ne JIT_X
+    ldr x1, [x20, :lo12:H0+8]
+    LDI64 2, HQ
+    cmp x1, x2
+    b.ne JIT_X
+    ldr x0, [x21, :lo12:H2+8]           // the init method
+    ldr x1, [x0, #L_SFUNC_PROTO]
+    cbz x1, JIT_X
+    ldr x2, [x1, #L_PROTO_JUNIT]
+    cbz x2, JIT_X
+    UC_CHECKS H1+1
+    ldr x2, [x20, :lo12:H0+8]
+    NEWINST H3                          // x0 = the new instance (the GC scans the stack up to H3 if the helper runs)
+    mov x14, x0
+    LDU32 10, H1                        // arguments move up one slot: slots H1 .. 1
+4:  cbz x10, 5f
+    LDI32 11, H0
+    add x11, x20, x11
+    add x11, x11, x10, lsl #4
+    ldp x9, x12, [x11]
+    stp x9, x12, [x11, #16]
+    sub x10, x10, #1
+    b 4b
+5:  SETT H0+16, T_INSTANCE              // self
+    str x14, [x20, :lo12:H0+24]
+    ldr x9, [x21, :lo12:H2]             // init
+    str x9, [x20, :lo12:H0]
+    ldr x0, [x21, :lo12:H2+8]
+    str x0, [x20, :lo12:H0+8]
+    ldr x1, [x0, #L_SFUNC_PROTO]
+    ldr x2, [x1, #L_PROTO_JUNIT]
+    LDI32 7, H0
+    add x7, x20, x7
+    add x8, x7, #16
+    ldr w5, [x19, #L_VM_NFRAMES]
+    movz x13, #9
+    UC_EFFECT H1+1, 4, HQ2, x13, x14
+
+// ---- C helpers, continued -----------------------------------------------------------------------------------------------------------------
+ST hnat                                 // slot H0 <- HQ2(vm, the H2 args from slot H1) through the helper HQ: a pure native; H3 = stack top, H4 = expected result tag (0xff: any)
+    LDI32 6, H3
+    add x6, x20, x6
+    str x6, [x19, #L_VM_SP]
+    mov x0, x19
+    LDI32 1, H1
+    add x1, x20, x1
+    LDU32 2, H2
+    LDI32 3, H0
+    add x3, x20, x3
+    LDI64 4, HQ2
+    LDU32 5, H4
+    LDI64 16, HQ
+    blr x16
+    cbz w0, JIT_X
+
+ST hconcat                              // slot H0 <- HQ(vm, the H2 slots from slot H1): string concatenation / array / table literal; H3 = stack top for the collector
+    LDI32 6, H3
+    add x6, x20, x6
+    str x6, [x19, #L_VM_SP]
+    mov x0, x19
+    LDI32 1, H1
+    add x1, x20, x1
+    LDU32 2, H2
+    LDI32 3, H0
+    add x3, x20, x3
+    LDI64 16, HQ
+    blr x16
+    cbz w0, JIT_X
+
+ST sget                                 // s[i] on a string: slot H0 <- the byte at int slot H2 of string slot H1
+    ldr x0, [x20, :lo12:H1]
+    cmp x0, #T_STRING
+    b.ne JIT_X
+    ldr x1, [x20, :lo12:H2]
+    cmp x1, #T_INT
+    b.ne JIT_X
+    ldr x0, [x20, :lo12:H1+8]
+    ldr x1, [x20, :lo12:H2+8]
+    ldr w2, [x0, #L_SSTR_LEN]
+    cmp x1, x2
+    b.hs JIT_X
+    ldr x0, [x0, #L_SSTR_DP]
+    ldrb w0, [x0, x1]
+    SETT H0, T_INT
+    str x0, [x20, :lo12:H0+8]
+
+ST fcall1                               // slot H0 <- HQ(float slot H1) for a libm function of one double
+    ldr d0, [x20, :lo12:H1+8]
+    LDI64 16, HQ
+    blr x16
+    SETT H0, T_FLOAT
+    str d0, [x20, :lo12:H0+8]
+
+ST tnext                                // HQ(vm, state slot H1, dest slot H0, H2) -> 1: element delivered, 0: the interpreter's, else: done (JIT_T)
+    mov x0, x19
+    LDI32 1, H1
+    add x1, x20, x1
+    LDI32 2, H0
+    add x2, x20, x2
+    LDU32 3, H2
+    LDI64 16, HQ
+    blr x16
+    cmp w0, #1
+    b.eq 1f
+    cbz w0, JIT_X
+    b JIT_T
+1:
+
+// ---- AArch64-only helpers (the x86-64 code writes these bytes itself) --------------------------------------------------------------------
+ST a64_stdflt                           // field at byte offset H0 of the new instance in x0 <- the default value (type word H1, payload HQ)
+    LDI32 1, H1
+    LDI64 2, HQ
+    str x1, [x0, :lo12:H0]
+    str x2, [x0, :lo12:H0+8]
+ST a64_stself                           // slot H0 <- the instance in x0
+    SETT H0, T_INSTANCE
+    str x0, [x20, :lo12:H0+8]
+ST a64_nilt                             // the type word of slot H0 <- 0 (nil)
+    str xzr, [x20, :lo12:H0]

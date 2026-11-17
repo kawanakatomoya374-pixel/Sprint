@@ -621,6 +621,11 @@ static Ent *push(JC *c, int kind, int ty, int idx) {
 enum { R_R12 = 12, R_R13 = 13, R_R14 = 14, R_R15 = 15, R_RAX = 0, R_RCX = 1, R_RDX = 2, R_RBP = 5, R_RSI = 6, R_RDI = 7 };
 
 static int xput(JC *c, const uint8_t *b, size_t n) {
+#if !SP_JIT_X86
+    (void)b; (void)n;
+    if (!c->why) { (void)snprintf(c->whybuf, sizeof c->whybuf, "raw x86 emit at op 0x%02x", c->code[c->cur_pc]); c->why = c->whybuf; }   /* a path that is not yet ported to stencils: the region is not compiled */
+    return 0;
+#else
     if (!cb_room(c, n)) { if (!c->why) c->why = "out of memory"; return 0; }
     memcpy(c->cb + c->cn, b, n);
     c->cn += n;
@@ -630,6 +635,7 @@ static int xput(JC *c, const uint8_t *b, size_t n) {
     c->skip1 = 0;
     c->skipx = 0;
     return 1;
+#endif
 }
 /* [legacy prefix] [REX] opcode [0F-escape second byte] modrm [sib] disp32 : reg field `reg`, memory operand [base+disp] */
 static int x_mem(JC *c, int pfx, int w, int op1, int op2, int reg, int base, int32_t disp) {
@@ -2210,8 +2216,13 @@ static int do_construct(JC *c, uint32_t pc, int len, int argc, SClass *k) {
                 } else EM(ST_mov, dst, soff(c, pf + 1 + i), 0, 0, 0, 0);
             }
             int32_t selfo = soff(c, pf + 1);
+#if SP_JIT_X86
             if (!x_sti(c, R_R12, selfo, 0)) return 0;          /* valid for the collector until the instance is stored */
+#else
+            EM(ST_a64_nilt, selfo, 0, 0, 0, 0, 0);              /* valid for the collector until the instance is stored */
+#endif
             EM(ST_unewc, soff(c, pf + 2 + argc), k->nfields, 32 + 16 * k->nfields, 0, 0, (uint64_t)(uintptr_t)k);
+#if SP_JIT_X86
             for (int i = 0; i < k->nfields; i++) {
                 uint64_t w = k->dflt ? k->dflt[i].w : 0;
                 int64_t pay = k->dflt ? k->dflt[i].as.i : 0;
@@ -2221,6 +2232,14 @@ static int do_construct(JC *c, uint32_t pc, int len, int argc, SClass *k) {
                 else if (!x_movi(c, R_RCX, pay) || !x_st(c, R_RAX, fo + 8, R_RCX)) return 0;
             }
             if (!x_sti(c, R_R12, selfo, 9) || !x_st(c, R_R12, selfo + 8, R_RAX)) return 0;
+#else
+            for (int i = 0; i < k->nfields; i++) {
+                uint64_t w = k->dflt ? k->dflt[i].w : 0;
+                int64_t pay = k->dflt ? k->dflt[i].as.i : 0;
+                EM(ST_a64_stdflt, 32 + 16 * i, (int32_t)w, 0, 0, 0, (uint64_t)pay);
+            }
+            EM(ST_a64_stself, selfo, 0, 0, 0, 0, 0);
+#endif
             EM(ST_movk, soff(c, pf), koff(fk), 0, 0, 0, 0);
             int ic = ictx_add(c, (Proto *)(uintptr_t)kp, pc + (uint32_t)len, soff(c, pf + 1) / 16);
             if (ic < 0) FAIL("out of memory");
@@ -4736,7 +4755,9 @@ __asm__(".text\n"
 extern void sp_jit_wb_stub(void);
 void *sp_jit_wb_addr(void) { return (void *)(uintptr_t)sp_jit_wb_stub; }
 #elif SP_JIT
-void *sp_jit_wb_addr(void) { return NULL; }   /* the AArch64 region JIT has no write-barrier stub: stores into boxed arrays are left to the interpreter */
+/* AArch64: the barrier's slow path is an ordinary C function; the stencils call vm->jit_wb(vm, object) and reload their registers afterwards */
+static void a64_wb(VM *vm, Obj *o) { gc_remember(vm, o); }
+void *sp_jit_wb_addr(void) { return (void *)(uintptr_t)a64_wb; }
 #endif
 
 struct JitProto *jit_proto(Proto *p) {

@@ -69,7 +69,11 @@ int main(int argc, char **argv) {
             if (strncmp(n, ".text.", 6) != 0 || sh[i].type != 1) continue;
             int found = 0;
             for (int k = 0; k < ns; k++) if (strcmp(mnames[k], n + 6) == 0) { sec_of[k] = i; found = 1; break; }
-            if (!found) fprintf(stderr, "jitgen: warning: stencil '%s' is not in the master list\n", n + 6);
+            if (!found) {   /* a stencil only this target has: appended after the master's list */
+                if (ns >= 2000) { fprintf(stderr, "jitgen: too many stencils\n"); return 1; }
+                snprintf(mnames[ns], sizeof mnames[ns], "%s", n + 6);
+                sec_of[ns++] = i;
+            }
         }
     } else {
         for (int i = 0; i < eh->shnum; i++) {

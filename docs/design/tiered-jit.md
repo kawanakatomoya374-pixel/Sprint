@@ -147,3 +147,11 @@ Trace の deopt 出口は「反復の先頭状態を復元してインタプリ�
 - 同時に、`tak` / `ackermann` のようなネストした自己呼び出し（`f(f(..), f(..))`）を x86-64 の純粋 JIT でも許可（呼び出し側マーカーはレジスタを持たない）: tak 0.60s → 0.25s。
 - 未実装（x86-64 のみ）: 領域 JIT（193 個のステンシル、`stencils.S`）、TraceJIT（`jit_trace.c` のエミッタ）、リーフ述語 JIT。AArch64 版を作るには、ステンシルの AArch64 アセンブリ版、パッチ穴の適用（`movz/movk`、`adrp`、分岐オフセット）、生バイト出力関数群（`x_*`、`ta_*`）の AArch64 版が必要。
 - 注意: libm の結果（`exp` の最終桁など）は glibc の x86-64 と aarch64 で異なる（`mathfast.sp` は arm64 では除外）。
+
+### AArch64 領域 JIT（2026-11、ステンシルのみ）
+
+- 構成: `src/runtime/jit/stencils_a64.S`（AArch64 のステンシル、マクロで族ごとに生成）→ `tools/jitgen.c`（AArch64 の ELF 再配置 `LDST*_ABS_LO12_NC` / `MOVW_UABS_G*` / `JUMP26` / `CONDBR19` を扱う）→ `stencils_a64.h`。ステンシルの一覧と順序は x86-64 の `stencils.h` が親で、未移植のものは長さ 0（領域は「ステンシルが無い」ので拒否され、インタプリタが実行する）。`layout_a64.h` は構造体オフセット（aarch64 では `jmp_buf` が大きく、x86-64 と 112 バイトずれる）。
+- レジスタ: x19 = VM、x20 = フレームベース、x21 = 定数表、x22 = vm->slots、x23 = Frame*。ホール値は `movz/movk`、メモリオフセットは `:lo12:`（imm12 を jit.c が全オフセットで埋める。8 バイトアクセスで 32760 まで）。
+- 移植済み（約 290 個）: entry/exit/utramp/ufn、tick、ガード、mov 系、整数・浮動小数の算術と比較分岐、range、配列の読み書き・append・arr_next（書き込みバリア付き）、sget、ユニット呼び出し（ucall*、uinvoke、pinvoke）、インスタンス（new、ctor、フィールド、upvalue、ginl*）、C ヘルパー（hget/hset/hnat/hconcat/tnext/fcall1）。
+- 未対応: レジスタ一時値とピン（x86-64 では生の機械語として出力しているため、AArch64 では `reg_on = 0`）、TraceJIT、リーフ述語、ffi 直接呼び出し。生の x86 出力に入った領域は `raw x86 emit` として拒否される。
+- 検証: `tools/arm64/test.sh`（QEMU で tests/cases の jit・lang・class・syntax を JIT しきい値 1 で実行して .out と比較）、`tools/arm64/bench.sh`（x86-64 版との出力一致と JIT あり・なしの時間）。QEMU 上で richards ×4.8、nbody ×5.2、mandel ×6.4、sieve ×3.2（--no-jit 比）。
