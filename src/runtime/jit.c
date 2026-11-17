@@ -3147,7 +3147,7 @@ static int do_get_index(JC *c, uint32_t pc, int len, uint32_t *skip) {
         int ra = ae.kind == EK_REG ? ae.idx : reg_alloc(c, 0, pa, pb);
         if (ra < 0) FAIL("no register");
         if (ae.kind != EK_REG && !x_ldop(c, ra, &ae, pa)) return 0;
-        int32_t ed = 0;
+        int32_t ed = 0, scaled = 0;
         /* a packed array (the sample's layout): 8-byte payloads and the element type is the array's note; otherwise 16-byte boxed slots, and the
          * array must not have become packed */
         const int packed = a->hint && a->hint->type == T_ARRAY && array_packed(AS_ARRAY(*a->hint)) && (ety == TY_INT || ety == TY_FLT);
@@ -3162,8 +3162,12 @@ static int do_get_index(JC *c, uint32_t pc, int len, uint32_t *skip) {
             if (!x_mem(c, 0, 1, 0x3b, -1, R_RCX, ra, so) || !x_jx(c, 3, c->xe)) return 0;
             if (packed ? !x_xt_cmp(c, ra, (int)tag_of(ety)) || !x_jx(c, 5, c->xe) : !x_xt_not_packed(c, ra, c->xe)) return 0;
             if (!x_ld(c, R_RAX, ra, io)) return 0;
-            uint8_t sh = (uint8_t)esh;
-            if (!x_rr(c, 0, 1, 0xc1, -1, 4, R_RCX) || !xput(c, &sh, 1) || !x_rr(c, 0, 1, 0x03, -1, R_RAX, R_RCX)) return 0;
+            if (packed) {
+                scaled = 1;                         /* 8-byte elements: the load below uses [rax + rcx*8] */
+            } else {
+                uint8_t sh = (uint8_t)esh;
+                if (!x_rr(c, 0, 1, 0xc1, -1, 4, R_RCX) || !xput(c, &sh, 1) || !x_rr(c, 0, 1, 0x03, -1, R_RAX, R_RCX)) return 0;
+            }
         }
         if (!packed && (!x_cmpi(c, R_RAX, ed, (int32_t)tag_of(ety)) || !x_jx(c, 5, c->xe))) return 0;
         const int32_t po = packed ? 0 : 8;   /* where the payload sits in the element */
@@ -3171,8 +3175,14 @@ static int do_get_index(JC *c, uint32_t pc, int len, uint32_t *skip) {
         if (ety == TY_FLT) {
             rr = reg_alloc(c, 1, pa, pb);
             if (rr < 0) FAIL("no register");
-            if (!x_sd_ld(c, rr, R_RAX, ed + po)) return 0;
+            if (scaled) {
+                const uint8_t sb[5] = {0xf2, 0x0f, 0x10, (uint8_t)(((rr & 7) << 3) | 4), 0xc8};   /* movsd xmm_rr, [rax + rcx*8] (rr < 8) */
+                if (rr >= 8 || !xput(c, sb, 5)) return 0;
+            } else if (!x_sd_ld(c, rr, R_RAX, ed + po)) return 0;
             reg_put(c, 0, ra);
+        } else if (scaled) {
+            const uint8_t ib[4] = {(uint8_t)(0x48 | (ra >= 8 ? 4 : 0)), 0x8b, (uint8_t)(((ra & 7) << 3) | 4), 0xc8};   /* mov ra, [rax + rcx*8] */
+            if (!xput(c, ib, 4)) return 0;
         } else if (!x_ld(c, ra, R_RAX, ed + po)) return 0;
         if (be.kind == EK_REG) reg_put(c, 0, be.idx);
         c->dep -= 2;
@@ -3228,7 +3238,7 @@ static int do_set_index(JC *c, uint32_t pc) {
         Ent ae = *a, ie = *i, ve = *v;
         int rp = ae.kind == EK_REG ? ae.idx : R_RDX;
         if (ae.kind != EK_REG && !x_ld(c, R_RDX, R_R12, roff(c, &ae, pa) + 8)) return 0;
-        int32_t ed = 0;
+        int32_t ed = 0, sscaled = 0;
         const int esh = packed_set ? 3 : 4;
         if (!packed_set && !emit_wb(c, rp, &ve, pv)) return 0;
         if (ie.kind == EK_K) {
@@ -3241,10 +3251,20 @@ static int do_set_index(JC *c, uint32_t pc) {
             uint8_t sh = (uint8_t)esh;
             if (!x_mem(c, 0, 1, 0x3b, -1, R_RCX, rp, so) || !x_jx(c, 3, c->xe)) return 0;
             if (packed_set ? !x_xt_cmp(c, rp, (int)tag_of(ve.ty)) || !x_jx(c, 5, c->xe) : !x_xt_not_packed(c, rp, c->xe)) return 0;
-            if (!x_ld(c, R_RAX, rp, io) || !x_rr(c, 0, 1, 0xc1, -1, 4, R_RCX) || !xput(c, &sh, 1) || !x_rr(c, 0, 1, 0x03, -1, R_RAX, R_RCX)) return 0;
+            if (!x_ld(c, R_RAX, rp, io)) return 0;
+            if (packed_set) sscaled = 1;            /* 8-byte elements: stored through [rax + rcx*8] below */
+            else if (!x_rr(c, 0, 1, 0xc1, -1, 4, R_RCX) || !xput(c, &sh, 1) || !x_rr(c, 0, 1, 0x03, -1, R_RAX, R_RCX)) return 0;
         }
         int ok;
-        if (packed_set) {
+        if (packed_set && sscaled) {
+            if (reg_is_x(&ve)) {
+                const uint8_t sb[5] = {0xf2, 0x0f, 0x11, (uint8_t)(((ve.idx & 7) << 3) | 4), 0xc8};   /* movsd [rax + rcx*8], xmm (idx < 8) */
+                ok = ve.idx < 8 && xput(c, sb, 5);
+            } else {
+                const uint8_t ib[4] = {(uint8_t)(0x48 | (ve.idx >= 8 ? 4 : 0)), 0x89, (uint8_t)(((ve.idx & 7) << 3) | 4), 0xc8};   /* mov [rax + rcx*8], reg */
+                ok = xput(c, ib, 4);
+            }
+        } else if (packed_set) {
             ok = reg_is_x(&ve) ? x_sd_st(c, R_RAX, ed, ve.idx) : x_st(c, R_RAX, ed, ve.idx);
         } else {
             if (ve.kind == EK_REG ? !x_note_store(c, rp, (int)tag_of(ve.ty), 0, 0)
