@@ -1974,7 +1974,8 @@ static int emit_ffcall(JC *c, uint32_t pc, int pf, int argc, const NativeDesc *n
         if (fi->cls[i] == 'i') EM(ST_ff_ia0 + ni++, soff(c, pf + 1 + i), 0, 0, 0, 0, 0);
         else EM(ST_ff_fa0 + nf++, soff(c, pf + 1 + i), 0, 0, 0, 0, 0);
     }
-    EM(ST_ff_call, 0, 0, 0, 0, 0, (uint64_t)(uintptr_t)fi->fn);
+    if (argc == 1 && fi->cls[0] == 'd' && fi->ret == FFJ_F64 && fi->fn == (void *)(uintptr_t)(double (*)(double))sqrt) EM(ST_ff_sqrt, 0, 0, 0, 0, 0, 0);
+    else EM(ST_ff_call, 0, 0, 0, 0, 0, (uint64_t)(uintptr_t)fi->fn);
     int32_t dst = soff(c, pf);
     int rty = TY_INT;
     switch (fi->ret) {

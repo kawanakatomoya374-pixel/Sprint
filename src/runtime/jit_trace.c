@@ -3314,6 +3314,26 @@ walked:
             fv = stack[--depth];
             if (po->native) {   /* len(array) */
                 const SFunc *nf = fv < (uint32_t)slot_total * 2U + (uint32_t)np * 3U + 16U ? fhint[fv] : NULL;
+                if (nf != NULL && nf->nat != NULL && n == 1U && strcmp(nf->nat->name, "to_float") == 0 &&
+                    (ir->value_types[args[0]] == SP_TIR_T_I64 || ir->value_types[args[0]] == SP_TIR_T_F64)) {   /* to_float(number) */
+                    r = args[0];
+                    if (ir->value_types[r] == SP_TIR_T_I64 && !sp_tir_emit_unary(ir, SP_TIR_I2F, r, &r)) goto done;
+                    stack[depth++] = r;
+                    break;
+                }
+                if (nf != NULL && nf->nat != NULL && n == 1U && ffi_jit_safe(nf->nat)) {   /* a prepared libm sqrt(double): the instruction */
+                    FfiJit fi;
+                    if (ffi_jit_info(nf->nat, &fi) && fi.nargs == 1 && fi.cls[0] == 'd' && fi.ret == FFJ_F64 &&
+                        fi.fn == (void *)(uintptr_t)(double (*)(double))sqrt && ir->value_types[fv] == SP_TIR_T_REF &&
+                        trace_ir_runtime_type(ir, fv) == (uint8_t)T_FUNCTION) {
+                        SpTIRValue av = args[0];
+                        if (ir->value_types[av] == SP_TIR_T_I64 && !sp_tir_emit_unary(ir, SP_TIR_I2F, av, &av)) goto done;
+                        if (ir->value_types[av] != SP_TIR_T_F64) { why = "native call: argument type"; goto done; }
+                        if (!trace_guard_once(ir, &gs, 1, fv, (uint64_t)(uintptr_t)nf) || !sp_tir_emit_fcall(ir, SP_TIR_FSQRT, 0U, 0U, av, &r)) goto done;
+                        stack[depth++] = r;
+                        break;
+                    }
+                }
                 if (nf == NULL || nf->nat == NULL || n != 1U || strcmp(nf->nat->name, "len") != 0 ||
                     ir->value_types[args[0]] != SP_TIR_T_REF || trace_ir_runtime_type(ir, args[0]) != (uint8_t)T_ARRAY) { why = "native call: not len(array)"; goto done; }
                 if (array_stored) { why = "len after an append / array write in the same iteration"; goto done; }   /* writes are deferred to the iteration's end */

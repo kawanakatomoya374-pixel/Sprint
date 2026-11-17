@@ -1916,6 +1916,9 @@ ST ff_call                      # HQ = the C function
     movabs $HQ,%rax
     call *%rax
 
+ST ff_sqrt                      # libm sqrt(double): the instruction itself (the result for a negative argument is the same NaN)
+    sqrtsd %xmm0,%xmm0
+
 ST ff_sx32
     movslq %eax,%rax
 ST ff_zx32
