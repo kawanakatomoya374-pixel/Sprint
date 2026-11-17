@@ -34,6 +34,7 @@ void jit_ra_reset(JitRegBank *bank);
 uint32_t jit_ra_mask(const JitRegBank *bank);
 int jit_ra_alloc(JitRegBank *bank, int32_t owner);
 int jit_ra_reassign(JitRegBank *bank, int reg, int32_t owner);
+int jit_ra_take(JitRegBank *bank, int reg, int32_t owner);
 int32_t jit_ra_owner(const JitRegBank *bank, int reg);
 void jit_ra_release(JitRegBank *bank, int reg);
 

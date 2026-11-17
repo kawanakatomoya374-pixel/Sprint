@@ -49,3 +49,11 @@ void jit_ra_release(JitRegBank *bank, int reg) {
         bank->owner[reg] = -1;
     }
 }
+
+/* reserve a specific register (the loop-carried float mirrors of the region JIT) */
+int jit_ra_take(JitRegBank *bank, int reg, int32_t owner) {
+    if (bank == NULL || reg < 0 || reg >= 32) return 0;
+    bank->used |= UINT32_C(1) << (unsigned)reg;
+    bank->owner[reg] = owner;
+    return 1;
+}

@@ -336,6 +336,12 @@ typedef struct {
     int32_t egv[256];
     int nbridge;                         /* traced inner loops this region calls the trace of (see bridge_scan) */
     struct { uint32_t hdr, exit; } bridge[4];
+    /* loop-carried float locals: in an innermost loop made of simple operations (no helper call clobbers xmm), up to three float
+     * locals keep a copy in fixed xmm registers across the iterations. Memory stays authoritative (every store writes it), so exits
+     * need nothing; each edge into a label of the loop re-establishes the registers (pin_sync). */
+    struct { uint32_t hdr, end; int set, n, k[3]; } pl[4];
+    int npl, pl_cur;
+    unsigned fixmask;                    /* xmm registers reserved for the active loop's mirrors */
     int changed;
     const char *why;
     char whybuf[48];
@@ -648,12 +654,19 @@ static int reg_spill(JC *c, int pos) {
     e->kind = EK_MEM;
     return ok;
 }
+static void ra_reset(JC *c);
 static int flush_regs(JC *c) {
     if (jit_ra_mask(&c->gpr_bank) == 0U && jit_ra_mask(&c->xmm_bank) == 0U) return 1;
     if (g_jit_stats) c->nflushed++;
     if (c->vm->jit_dbg > 2) (void)fprintf(stderr, "jit: flush regs at op 0x%02x\n", (unsigned)c->code[c->cur_pc]);
     for (int i = c->pos0; i < c->dep; i++) if (c->st[i].kind == EK_REG && !reg_spill(c, i)) return 0;
-    jit_ra_reset(&c->gpr_bank); jit_ra_reset(&c->xmm_bank); c->nlc = 0;
+    {   /* the mirrors in the active loop's fixed registers survive (stencils never touch those registers) */
+        int fk[3], fr[3], nf = 0;
+        for (int i = 0; i < c->nlc && nf < 3; i++)
+            if (c->lc[i].x == 1 && !c->lc[i].up && (c->fixmask >> c->lc[i].reg & 1U)) { fk[nf] = c->lc[i].k; fr[nf] = c->lc[i].reg; nf++; }
+        ra_reset(c);
+        for (int i = 0; i < nf; i++) { c->lc[c->nlc].k = fk[i]; c->lc[c->nlc].reg = fr[i]; c->lc[c->nlc].x = 1; c->lc[c->nlc].up = 0; c->lc[c->nlc].ty = 0; c->nlc++; }
+    }
     return 1;
 }
 /* mirrors of an inlined body's locals live in the same table under keys of their own (one range per inlined call) */
@@ -663,22 +676,32 @@ static int lc_find(const JC *c, int k, int x) {
     for (int i = 0; i < c->nlc; i++) if (!c->lc[i].up && c->lc[i].k == k && c->lc[i].x == x) return c->lc[i].reg;
     return -1;
 }
+static int lc_fixed(const JC *c, int i) { return c->lc[i].x == 1 && (c->fixmask >> c->lc[i].reg & 1U); }
+static void lc_free_entry(JC *c, int i) {
+    if (!lc_fixed(c, i)) reg_put(c, c->lc[i].x, c->lc[i].reg);   /* a fixed loop register stays reserved */
+    c->lc[i] = c->lc[--c->nlc];
+}
 static void lc_drop(JC *c, int k) {
     k = lc_key(c, k);
     for (int i = 0; i < c->nlc;) {
-        if (!c->lc[i].up && c->lc[i].k == k) { reg_put(c, c->lc[i].x, c->lc[i].reg); c->lc[i] = c->lc[--c->nlc]; }
+        if (!c->lc[i].up && c->lc[i].k == k) lc_free_entry(c, i);
         else i++;
     }
 }
 static int lc_evict(JC *c, int x) {
     for (int i = 0; i < c->nlc; i++)
-        if (c->lc[i].x == x) { reg_put(c, x, c->lc[i].reg); c->lc[i] = c->lc[--c->nlc]; return 1; }
+        if (c->lc[i].x == x && !lc_fixed(c, i)) { lc_free_entry(c, i); return 1; }
     return 0;
+}
+/* reset both register banks; the active loop's fixed xmm registers stay reserved */
+static void ra_reset(JC *c) {
+    jit_ra_reset(&c->gpr_bank); jit_ra_reset(&c->xmm_bank); c->nlc = 0;
+    for (int r = 0; r < 16; r++) if (c->fixmask >> r & 1U) (void)jit_ra_take(&c->xmm_bank, r, -1);
 }
 /* the register (already marked busy) now also mirrors local k */
 static void lc_add(JC *c, int k, int x, int reg) {
     k = lc_key(c, k);
-    if (c->nlc == 8) { reg_put(c, c->lc[0].x, c->lc[0].reg); c->lc[0] = c->lc[--c->nlc]; }
+    if (c->nlc == 8) lc_free_entry(c, 0);
     c->lc[c->nlc].k = k; c->lc[c->nlc].reg = reg; c->lc[c->nlc].x = x; c->lc[c->nlc].up = 0; c->lc[c->nlc].ty = 0;
     c->nlc++;
 }
@@ -801,7 +824,12 @@ static int num_types(JC *c, int pa, int pb) {
 static uint8_t *lstate(JC *c, int li) { return c->lt + (size_t)li * (size_t)c->nvars; }
 enum { LH_MAX = 8 };
 
+static int merge_to_core(JC *c, uint32_t tpc);
+static int pin_sync(JC *c, uint32_t tpc);
 static int merge_to(JC *c, uint32_t tpc) {
+    return merge_to_core(c, tpc) && pin_sync(c, tpc);
+}
+static int merge_to_core(JC *c, uint32_t tpc) {
     int li = c->lmap[tpc - c->hdr];
     if (li < 0) return 0;
     int depth = c->dep - c->d0;
@@ -884,6 +912,7 @@ static int fuse_store(JC *c, uint32_t npc, int pa, int *dstlocal) {
             break;
         }
     }
+    lc_drop(c, k);                   /* the result is written straight into the local: a register copy of it is stale from here on */
     *dstlocal = k;
     return 1;
 }
@@ -2393,7 +2422,7 @@ out:
     c->p = sv.p; c->fn = sv.fn; c->code = sv.code; c->hdr = sv.hdr; c->end = sv.end; c->cur_pc = sv.cur_pc; c->nloc = sv.nloc;
     c->d0 = sv.d0; c->nvars = sv.nvars; c->nmv = sv.nmv; c->pin = sv.pin; c->cur_ic = sv.cur_ic; c->pos0 = sv.pos0; c->bias = sv.bias; c->nest--;
     c->base = sv.base; c->vt = sv.vt; c->vlive = sv.vlive; c->vk = sv.vk; c->lmap = sv.lmap; c->lrd = sv.lrd;
-    if (!ok) { c->dep = sv.dep; jit_ra_reset(&c->gpr_bank); jit_ra_reset(&c->xmm_bank); c->nlc = 0; }
+    if (!ok) { c->dep = sv.dep; ra_reset(c); }
     return ok ? 1 : -1;
 }
 
@@ -3247,6 +3276,17 @@ static int do_store_local(JC *c, uint32_t pc) {
     }
     Ent e = c->st[p];
     c->dep--;
+    if (c->pl_cur >= 0 && e.kind == EK_LOC && e.idx != k && (c->vt[e.idx] & 0x7f) == TY_FLT && lc_ok(c, k) && c->lrd[k] > 0) {
+        int mir = lc_find(c, e.idx, 1);          /* a float local copied inside a pinned loop (zr = t): copy register to register, not through memory */
+        if (mir >= 0) {
+            int r2 = reg_alloc(c, 1, -1, -1);
+            if (r2 >= 0) {
+                mir = lc_find(c, e.idx, 1);      /* reg_alloc may have evicted it */
+                if (mir < 0 || !x_rr(c, 0, 0, 0x0f, 0x28, r2, mir)) return 0;
+                e.kind = EK_REG; e.ty = TY_FLT; e.idx = r2;
+            }
+        }
+    }
     lc_drop(c, k);
     for (int i = c->pos0; i < c->dep; i++)   /* pending reads of this local must see the old value (a register chain may replay a read of it) */
         if (((c->st[i].kind == EK_LOC && c->st[i].idx == k) || c->st[i].kind == EK_REG) && !materialize(c, i)) return 0;
@@ -3712,6 +3752,117 @@ static int pick_pin(const JC *c) {
     return best;
 }
 
+/* ---- loop-carried float mirrors ---------------------------------------------------------------------------------------------- */
+static const uint8_t PIN_XREG[3] = {7, 6, 5};
+
+/* the operations a pinned loop may contain: none of them calls a C helper (a call clobbers every xmm register) */
+static int pin_op_ok(int op) {
+    switch (op) {
+    case OP_NOP: case OP_CONST: case OP_SMALLINT: case OP_NIL: case OP_TRUE: case OP_FALSE: case OP_POP: case OP_DUP:
+    case OP_LOAD_LOCAL: case OP_STORE_LOCAL: case OP_ADD: case OP_SUB: case OP_MUL: case OP_DIV: case OP_NEG:
+    case OP_EQ: case OP_NE: case OP_LT: case OP_LE: case OP_GT: case OP_GE: case OP_NOT:
+    case OP_JUMP: case OP_JUMP_IF_FALSE: case OP_JUMP_IF_TRUE: case OP_JUMP_IF_FALSE_OR_POP: case OP_JUMP_IF_TRUE_OR_POP:
+        return 1;
+    default: return 0;
+    }
+}
+
+/* innermost loops (a backward OP_JUMP) built only of pin_op_ok operations */
+static void pin_scan(JC *c) {
+    c->npl = 0;
+    if (!c->reg_on || !c->lrd || getenv("SPRINT_JIT_FPIN0")) return;
+    for (uint32_t pc = c->hdr; pc < c->end;) {
+        int op = c->code[pc], len = op_len(op);
+        if (len <= 0) return;
+        if (op == OP_JUMP && pc + 5 <= c->end) {
+            int32_t off = rd32s(c->code + pc + 1);
+            uint32_t tpc = pc + 5 + (uint32_t)off;
+            if (off < 0 && tpc >= c->hdr && c->lmap[tpc - c->hdr] >= 0 && c->npl < 4) {
+                int ok = 1;
+                for (uint32_t q = tpc; q < pc + 5 && ok;) {
+                    int qo = c->code[q], ql = op_len(qo);
+                    if (ql <= 0 || !pin_op_ok(qo)) { ok = 0; break; }
+                    if (qo == OP_JUMP && q != pc && rd32s(c->code + q + 1) < 0) ok = 0;   /* an inner loop of its own */
+                    q += (uint32_t)ql;
+                }
+                if (ok) { c->pl[c->npl].hdr = tpc; c->pl[c->npl].end = pc + 5; c->pl[c->npl].set = 0; c->npl++; }
+            }
+        }
+        pc += (uint32_t)len;
+    }
+}
+static int pin_loop_of(const JC *c, uint32_t pc) {
+    for (int j = 0; j < c->npl; j++) if (pc >= c->pl[j].hdr && pc < c->pl[j].end) return j;
+    return -1;
+}
+/* choose the mirrored locals of loop j from the types known right now: the most used float locals that the loop both reads and writes */
+static void pin_choose(JC *c, int j) {
+    int sc[3 * 64];
+    int n = c->nloc < 64 ? c->nloc : 64;
+    memset(sc, 0, sizeof sc);
+    for (uint32_t q = c->pl[j].hdr; q < c->pl[j].end;) {
+        int qo = c->code[q], ql = op_len(qo);
+        if ((qo == OP_LOAD_LOCAL || qo == OP_STORE_LOCAL) && ql >= 3) {
+            unsigned k = rd16(c->code + q + 1);
+            if (k < (unsigned)n) sc[k * 3 + (qo == OP_STORE_LOCAL)]++;
+        }
+        q += (uint32_t)ql;
+    }
+    c->pl[j].n = 0;
+    for (int r = 0; r < 3; r++) {
+        int best = -1, bs = 0;
+        for (int k = 0; k < n; k++) {
+            if (!sc[k * 3] || !sc[k * 3 + 1] || (c->vt[k] & 0x7f) != TY_FLT || k == c->pin) continue;
+            int s = sc[k * 3] + 2 * sc[k * 3 + 1];
+            if (s > bs) { bs = s; best = k; }
+        }
+        if (best < 0) break;
+        sc[best * 3] = 0;
+        c->pl[j].k[c->pl[j].n++] = best;
+    }
+}
+/* an edge into a label of a pinned loop: put the current value of each mirrored local into its fixed register (from the
+ * register that mirrors it right now, else from its memory slot, which is always current) */
+static int pin_sync(JC *c, uint32_t tpc) {
+    if (c->npl == 0 || c->cur_ic != 0) return 1;
+    int j = pin_loop_of(c, tpc);
+    if (j < 0) return 1;
+    if (!c->pl[j].set) {
+        if (tpc != c->pl[j].hdr || c->pl_cur >= 0) return 1;   /* entered other than by falling into the header: no pins this walk */
+        pin_choose(c, j);
+        c->pl[j].set = c->pl[j].n > 0 ? 1 : 2;
+    }
+    if (c->pl[j].set != 1) return 1;
+    const uint8_t *d = lstate(c, c->lmap[tpc - c->hdr]);
+    for (int i = 0; i < c->pl[j].n; i++) {
+        int k = c->pl[j].k[i], F = PIN_XREG[i];
+        if ((d[k] & 0x7f) != TY_FLT || (c->vt[k] & 0x7f) != TY_FLT) continue;
+        int r = lc_find(c, k, 1);
+        if (r == F) continue;
+        int ok = r >= 0 ? x_rr(c, 0, 0, 0x0f, 0x28, F, r) : x_sd_ld(c, F, R_R12, LOFF(c, k) + 8);
+        if (!ok) return 0;
+    }
+    return 1;
+}
+/* at a label (state just restored from the join): activate / deactivate the loop's reserved registers and their mirrors */
+static void pin_label(JC *c, uint32_t pc) {
+    if (c->npl == 0 || c->cur_ic != 0) return;
+    int j = pin_loop_of(c, pc);
+    if (j < 0 || c->pl[j].set != 1) { c->pl_cur = -1; c->fixmask = 0; return; }
+    c->pl_cur = j;
+    c->fixmask = 0;
+    for (int i = 0; i < c->pl[j].n; i++) c->fixmask |= 1U << PIN_XREG[i];
+}
+static void pin_entries(JC *c) {
+    if (c->pl_cur < 0) return;
+    int j = c->pl_cur;
+    const uint8_t *d = lstate(c, c->lmap[c->cur_pc - c->hdr]);
+    for (int i = 0; i < c->pl[j].n; i++) {
+        int k = c->pl[j].k[i];
+        if ((d[k] & 0x7f) == TY_FLT && (c->vt[k] & 0x7f) == TY_FLT) lc_add(c, k, 1, PIN_XREG[i]);
+    }
+}
+
 /* the instructions whose handlers understand register entries (every other one is preceded by flush_regs) */
 static int reg_aware(int op) {
     switch (op) {
@@ -3734,6 +3885,8 @@ static int walk(JC *c) {
     jit_ra_init(&c->gpr_bank, JIT_REGION_GPR_POOL, sizeof JIT_REGION_GPR_POOL / sizeof JIT_REGION_GPR_POOL[0]);
     jit_ra_init(&c->xmm_bank, JIT_REGION_XMM_POOL, sizeof JIT_REGION_XMM_POOL / sizeof JIT_REGION_XMM_POOL[0]);
     c->nlc = 0;
+    c->pl_cur = -1; c->fixmask = 0;
+    for (int j = 0; j < c->npl; j++) c->pl[j].set = 0;
     memset(c->rstep, 0, sizeof c->rstep);
     if (c->rnext_unit) memset(c->rnext_unit, 0, (size_t)(c->end - c->hdr));
     c->cn = 0;
@@ -3775,7 +3928,10 @@ static int walk(JC *c) {
                 je->ppc = pc;
                 if (k < LH_MAX) je->hint = c->lhint[(size_t)li * LH_MAX + (size_t)k];
             }
-            jit_ra_reset(&c->gpr_bank); jit_ra_reset(&c->xmm_bank); c->nlc = 0;
+            c->cur_pc = pc;
+            pin_label(c, pc);
+            ra_reset(c);
+            pin_entries(c);
             reach = 1;
             c->pcaddr[pc - c->hdr] = (uint32_t)c->cn;
         } else if (!reach) {
@@ -3806,7 +3962,7 @@ static int walk(JC *c) {
         uint32_t skip = 0;
         int ok = 1;
         if ((jit_ra_mask(&c->gpr_bank) != 0U || jit_ra_mask(&c->xmm_bank) != 0U) &&
-            !reg_aware(op) && !flush_regs(c)) return 0;
+            !reg_aware(op) && !(op == OP_JUMP && c->pl_cur >= 0) && !flush_regs(c)) return 0;
         switch (op) {
         case OP_NOP: break;
         case OP_CONST: {
@@ -4111,6 +4267,7 @@ static int compile_region(VM *vm, Proto *p, JRegion *r, SFunc *fn, SpValue *base
             q += (uint32_t)l;
         }
     }
+    pin_scan(c);
     { const char *np = getenv("SPRINT_JIT_PIN"); c->pin = (np && np[0] == '0') || c->nbridge > 0 ? -1 : pick_pin(c); }
     for (int round = 0;; round++) {
         if (round > 16) { c->why = "no fixpoint"; goto done; }
@@ -4180,6 +4337,12 @@ static int compile_region(VM *vm, Proto *p, JRegion *r, SFunc *fn, SpValue *base
     for (int si = 0; eok && si < 256; si++)
         if (c->eg[si]) eok = em(c, ST_gimm, (si + 2) * 16, c->egv[si], 0, 0, 0, 0);
     if (eok && c->pin >= 0) { c->xe = -1; eok = em(c, ST_ldp, c->pin * 16, 0, 0, 0, 0, 0); }
+    for (int j = 0; eok && j < c->npl; j++) {   /* a region that starts at a pinned loop's header: the entry jumps past the fall-in sync, so load the mirrors here */
+        if (c->pl[j].hdr != c->hdr || c->pl[j].set != 1) continue;
+        const uint8_t *d = lstate(c, 0);
+        for (int i = 0; eok && i < c->pl[j].n; i++)
+            if ((d[c->pl[j].k[i]] & 0x7f) == TY_FLT) eok = x_sd_ld(c, PIN_XREG[i], R_R12, LOFF(c, c->pl[j].k[i]) + 8);
+    }
     if (eok) {
         c->tk = 0;
         c->tt = (int)c->hdr;
