@@ -976,6 +976,8 @@ static int g_hsv(VM *vm, int argc, SpValue *argv, SpValue *ret) {
 
 const NativeDesc lib_gfx_fns[] = {
     {"canvas", 2, 3, g_canvas}, {"rgb", 3, 3, g_rgb}, {"hsv", 3, 3, g_hsv}, {"text_advance", 1, 2, g_text_advance}, {NULL, 0, 0, NULL}};
+/* module functions the JIT may call directly: no allocation, no VM state; an error leaves the call to the interpreter */
+int gfx_pure_native(const NativeDesc *d) { return d->fn == g_text_advance || d->fn == g_rgb; }
 
 /* pixels of a canvas value for host code (the OS kernel blits them to the framebuffer); NULL if v is not a canvas */
 const uint32_t *gfx_canvas_pixels(SpValue v, int *w, int *h) {

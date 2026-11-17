@@ -884,6 +884,7 @@ typedef struct FfiJit {
 } FfiJit;
 int ffi_jit_info(const NativeDesc *d, FfiJit *out);
 int math_pure_native(const NativeDesc *d);
+int gfx_pure_native(const NativeDesc *d);
 int table_get_sstr(const STable *t, const SString *key, SpValue *out);
 int64_t table_find_int(const STable *t, int64_t k);   /* entry index of an integer key, or -1 */
 int64_t table_find_sstr(const STable *t, const SString *key); /* entry index or -1 */

@@ -1836,7 +1836,7 @@ static int do_invoke(JC *c, uint32_t pc, int len, uint32_t *skip) {
     int is_sqrt = strcmp(nd->name, "sqrt") == 0;
     double (*lf)(double) = is_sqrt ? NULL : libm_fn(nd->name);
     if (argc != 1 || !math_fast1(nd, 4.0, &o) || (!is_sqrt && !lf)) {
-        if (!math_pure_native(nd) || argc < nd->min_args || (nd->max_args >= 0 && argc > nd->max_args)) FAIL("invoke: native not pure");
+        if (!(math_pure_native(nd) || gfx_pure_native(nd)) || argc < nd->min_args || (nd->max_args >= 0 && argc > nd->max_args)) FAIL("invoke: native not pure");
         return emit_nat(c, pc, pm, argc, nd, nat_result_ty(nd, c, pm, argc));
     }
     if (is_sqrt && (o < 1.999 || o > 2.001)) FAIL("invoke: sqrt guard");
@@ -1924,7 +1924,7 @@ static int do_load_link(JC *c, uint32_t pc) {
 /* result type of a pure native, predicted from its name and the operand types (the helper checks the prediction) */
 static int nat_result_ty(const NativeDesc *nd, JC *c, int pf, int argc) {
     const char *n = nd->name;
-    if (!strcmp(n, "len") || !strcmp(n, "floor") || !strcmp(n, "ceil") || !strcmp(n, "trunc") || !strcmp(n, "round")) return TY_INT;
+    if (!strcmp(n, "text_advance") || !strcmp(n, "rgb") || !strcmp(n, "len") || !strcmp(n, "floor") || !strcmp(n, "ceil") || !strcmp(n, "trunc") || !strcmp(n, "round")) return TY_INT;
     if (!strcmp(n, "log") || !strcmp(n, "atan2") || !strcmp(n, "asin") || !strcmp(n, "acos")) return TY_FLT;
     if (!strncmp(n, "is_", 3)) return TY_BOOL;
     if (!strcmp(n, "abs") || !strcmp(n, "min") || !strcmp(n, "max") || !strcmp(n, "clamp")) {
