@@ -784,6 +784,8 @@ struct VM {
     void *jit_wb;               /* machine-code write barrier (jit.c): called with the object in rax, preserves every register */
     int gc_trace;               /* SPRINT_GC_TRACE=1: totals at exit, 2: one line per collection */
     double gc_trace_ms;
+    const struct STable *lk_t;  /* the last string-key lookup of the JIT's table helper (a following store to the same key skips the search) */
+    int64_t lk_e;
 };
 
 

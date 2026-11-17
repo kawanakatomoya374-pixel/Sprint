@@ -1756,6 +1756,7 @@ static int emit_nat(JC *c, uint32_t pc, int pf, int argc, const NativeDesc *nd, 
 static int nat_result_ty(const NativeDesc *nd, JC *c, int pf, int argc);
 static int jh_strmethod(VM *vm, SpValue *argv, unsigned argc, SpValue *dst, NativeFn fn, unsigned want);
 static int jh_natmethod(VM *vm, SpValue *argv, unsigned argc, SpValue *dst, NativeFn fn, unsigned want);
+static int jh_slice(VM *vm, SpValue *argv, unsigned argc, SpValue *dst, NativeFn fn, unsigned want);
 static const NativeClass *jh_cls[16];
 static unsigned jh_ncls;
 static int emit_invoke_strmethod(JC *c, uint32_t pc, int pm, int argc, const NativeDesc *nd, int returns_string);
@@ -1768,7 +1769,7 @@ static int emit_invoke_strmethod(JC *c, uint32_t pc, int pm, int argc, const Nat
     c->xe = gexit(c);
     if (c->xe < 0) FAIL("out of memory");
     c->hq2 = (uint64_t)(uintptr_t)nd->fn;
-    EM(ST_hnat, soff(c, pm), soff(c, pm), argc + 1, soff(c, c->dep), 0xff, (uint64_t)(uintptr_t)jh_strmethod);
+    EM(ST_hnat, soff(c, pm), soff(c, pm), argc + 1, soff(c, c->dep), 0xff, (uint64_t)(uintptr_t)(!strcmp(nd->name, "slice") && argc == 2 ? jh_slice : jh_strmethod));
     c->dep -= argc + 1;
     Ent *r = push(c, EK_MEM, TY_UNK, 0);
     if (!r) return 0;
@@ -2789,14 +2790,13 @@ static int do_for_next(JC *c, uint32_t pc, uint32_t *skip) {
  * interpreter, which runs the instruction (and raises its errors) as always. The collector may run inside them: the stencil
  * publishes the stack top first. */
 static int jh_getidx(VM *vm, const SpValue *o, const SpValue *k, SpValue *dst) {
-    (void)vm;
     SpValue r;
     switch (o->type) {
     case T_TABLE: {
         const STable *t = AS_TABLE(*o);
         int64_t e;
         if (k->type == T_INT) e = table_find_int(t, k->as.i);
-        else if (k->type == T_STRING) e = table_find_sstr(t, AS_STR(*k));
+        else if (k->type == T_STRING) { e = table_find_sstr(t, AS_STR(*k)); vm->lk_t = t; vm->lk_e = e; }
         else return 0;
         r = e >= 0 ? t->ents[e].val : v_nil();
         break;
@@ -2873,13 +2873,28 @@ static int jh_natmethod(VM *vm, SpValue *argv, unsigned argc, SpValue *dst, Nati
 }
 static int jh_eqv(VM *vm, const SpValue *a, const SpValue *b, SpValue *dst) { (void)vm; *dst = v_bool(value_eq(*a, *b)); return 1; }
 static int jh_nev(VM *vm, const SpValue *a, const SpValue *b, SpValue *dst) { (void)vm; *dst = v_bool(!value_eq(*a, *b)); return 1; }
+/* s.slice(a, b) with plain in-range integer bounds on a character boundary: the string is built right here; anything else (an
+ * error, a one-argument call) is left to the interpreter */
+static int jh_slice(VM *vm, SpValue *argv, unsigned argc, SpValue *dst, NativeFn fn, unsigned want) {
+    (void)fn; (void)want;
+    if (argc != 3 || argv[0].type != T_STRING || argv[1].type != T_INT || argv[2].type != T_INT) return 0;
+    const SString *s = AS_STR(argv[0]);
+    const int64_t a = argv[1].as.i, b = argv[2].as.i, n = (int64_t)s->len;
+    if (a < 0 || b < a || b > n) return 0;
+    if ((a != 0 && a != n && (((unsigned char)s->dp[a]) & 0xC0) == 0x80) || (b != 0 && b != n && (((unsigned char)s->dp[b]) & 0xC0) == 0x80)) return 0;
+    *dst = v_obj(T_STRING, vm_new_string(vm, s->dp + a, (size_t)(b - a)));
+    return 1;
+}
 static int jh_setidx(VM *vm, const SpValue *o, const SpValue *k, const SpValue *v) {
     if (vm->bytes >= vm->gc_next) vm_gc(vm);
     if (o->type == T_TABLE) {
         STable *t = AS_TABLE(*o);
         if (k->type != T_STRING && k->type != T_INT) return 0;
         if (v->type != T_NIL) {   /* the key is already there: overwrite the value in place (the common case of t[k] = t[k] + 1) */
-            const int64_t e = k->type == T_INT ? table_find_int(t, k->as.i) : table_find_sstr(t, AS_STR(*k));
+            int64_t e;
+            if (k->type == T_INT) e = table_find_int(t, k->as.i);
+            else if (t == vm->lk_t && vm->lk_e >= 0 && vm->lk_e < t->nent && t->ents[vm->lk_e].key.type == T_STRING && AS_STR(t->ents[vm->lk_e].key) == AS_STR(*k)) e = vm->lk_e;   /* just looked up (t[k] = t[k] + 1) */
+            else e = table_find_sstr(t, AS_STR(*k));
             if (e >= 0) {
                 gc_wb(vm, &t->h, *v);
                 t->ents[e].val = *v;
