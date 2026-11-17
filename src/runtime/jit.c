@@ -2455,6 +2455,11 @@ static int do_call(JC *c, uint32_t pc, int len, uint32_t *skip) {
             }
             return emit_nat(c, pc, pf, 1, nd, TY_FLT);
         }
+        if (argc == 1 && strcmp(nd->name, "type") == 0) {   /* the name of the value's type: a preallocated string, nothing else */
+            if (!emit_nat(c, pc, pf, 1, nd, TY_UNK)) return 0;
+            c->st[c->dep - 1].hint = &g_hint_string;
+            return 1;
+        }
         if (argc == 1 && strcmp(nd->name, "to_int") == 0) return emit_nat(c, pc, pf, 1, nd, TY_INT);
         if (argc == 1 && strcmp(nd->name, "to_string") == 0) {
             if (!emit_nat_h(c, pc, pf, 1, nd, TY_UNK, jh_tostr)) return 0;
@@ -2919,6 +2924,21 @@ static int jh_newarr(VM *vm, const SpValue *ops, unsigned n, SpValue *dst) {
     *dst = v_obj(T_ARRAY, a);
     return 1;
 }
+static int jh_newtable(VM *vm, const SpValue *ops, unsigned n2, SpValue *dst) {
+    if (vm->bytes >= vm->gc_next) vm_gc(vm);
+    const unsigned n = n2 / 2;
+    STable *t = vm_new_table(vm, (int64_t)n);
+    if (table_init_small(t, ops, n)) {
+        t->nent = 0; t->count = 0;
+        for (unsigned i = 0; i < n; i++) {
+            const int pc = vm->pend_code;
+            const SpValue po = vm->pend_obj;
+            if (table_set(vm, t, ops[2 * i], ops[2 * i + 1])) { vm->pend_code = pc; vm->pend_obj = po; return 0; }
+        }
+    }
+    *dst = v_obj(T_TABLE, t);
+    return 1;
+}
 static int jh_concat(VM *vm, const SpValue *ops, unsigned n, SpValue *dst) {
     if (vm->bytes >= vm->gc_next) vm_gc(vm);
     SString *s = vm_concat_fast(vm, ops, n);
@@ -2991,6 +3011,25 @@ static int do_newarray(JC *c, uint32_t pc) {
     EM(ST_hconcat, soff(c, p0), soff(c, p0), n, soff(c, c->dep), 0, (uint64_t)(uintptr_t)jh_newarr);
     c->dep -= n;
     Ent *r = push(c, EK_MEM, TY_ARR, 0);
+    if (!r) return 0;
+    r->ppc = pc;
+    c->rax_off = -1; c->xmm_off = -1; c->skip1 = 0; c->skipx = 0;
+    return 1;
+}
+
+/* {k: v, ...}: the n key / value pairs sit in 2n consecutive stack slots; the helper builds the table like OP_NEW_TABLE (an error in the
+ * general path leaves the instruction to the interpreter, which raises it) */
+static int do_newtable(JC *c, uint32_t pc) {
+    int n = (int)rd16(c->code + pc + 1);
+    int p0 = c->dep - 2 * n;
+    if (n > 24 || p0 < c->d0) FAIL("table literal");
+    if (!flush_regs(c)) return 0;
+    if (!flush_from(c, c->d0, c->dep)) return 0;
+    c->xe = gexit(c);
+    if (c->xe < 0) FAIL("out of memory");
+    EM(ST_hconcat, soff(c, p0), soff(c, p0), 2 * n, soff(c, c->dep), 0, (uint64_t)(uintptr_t)jh_newtable);
+    c->dep -= 2 * n;
+    Ent *r = push(c, EK_MEM, TY_UNK, 0);
     if (!r) return 0;
     r->ppc = pc;
     c->rax_off = -1; c->xmm_off = -1; c->skip1 = 0; c->skipx = 0;
@@ -4086,6 +4125,7 @@ static int walk(JC *c) {
         case OP_GET_INDEX: ok = do_get_index(c, pc, len, &skip); break;
         case OP_CONCAT: ok = do_concat(c, pc); break;
         case OP_NEW_ARRAY: ok = do_newarray(c, pc); break;
+        case OP_NEW_TABLE: ok = do_newtable(c, pc); break;
         case OP_SET_INDEX: ok = do_set_index(c, pc); break;
         case OP_INVOKE:
             if (!c->unit && c->cur_ic == 0 && cold_tail(c, pc)) { ok = do_exit_here(c); reach = 0; break; }
@@ -4134,7 +4174,7 @@ static int op_allowed(int op, int unit) {
     case OP_BAND: case OP_BOR: case OP_BXOR: case OP_SHL: case OP_SHR:
     case OP_LT: case OP_LE: case OP_GT: case OP_GE: case OP_JUMP: case OP_JUMP_IF_FALSE: case OP_JUMP_IF_TRUE:
     case OP_JUMP_IF_FALSE_OR_POP: case OP_JUMP_IF_TRUE_OR_POP: case OP_NOT:
-    case OP_GET_INDEX: case OP_SET_INDEX: case OP_INVOKE: case OP_RANGE_PREP: case OP_RANGE_NEXT: case OP_FOR_PREP: case OP_FOR_NEXT: case OP_CONCAT: case OP_NEW_ARRAY:
+    case OP_GET_INDEX: case OP_SET_INDEX: case OP_INVOKE: case OP_RANGE_PREP: case OP_RANGE_NEXT: case OP_FOR_PREP: case OP_FOR_NEXT: case OP_CONCAT: case OP_NEW_ARRAY: case OP_NEW_TABLE:
     case OP_LOAD_LINK: case OP_CALL: case OP_LOAD_UPVAL: case OP_STORE_UPVAL: case OP_GET_MEMBER: case OP_SET_MEMBER:
         return 1;
     case OP_RETURN: case OP_RETURN_NIL:

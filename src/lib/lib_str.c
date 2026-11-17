@@ -86,18 +86,29 @@ static int s_from_codepoint(VM *vm, int argc, SpValue *argv, SpValue *ret) {
 
 int arr_join(VM *vm, SArray *a, SString *sep, SpValue *ret) {
     size_t total = 0;
-    for (int64_t i = 0; i < a->len; i++) {
-        if (array_get(a, i).type != T_STRING) return vm_set_error(vm, E_TYPE, "join() requires an array of strings");
-        total += AS_STR(array_get(a, i))->len;
-        if (i) total += sep->len;
+    const int64_t n = a->len;
+    if (array_packed(a)) {                       /* a packed array holds bools / ints / floats: no element is a string */
+        if (n > 0) return vm_set_error(vm, E_TYPE, "join() requires an array of strings");
     }
+    const SpValue *el = n > 0 ? array_boxed(a) : NULL;
+    for (int64_t i = 0; i < n; i++) {
+        if (el[i].type != T_STRING) return vm_set_error(vm, E_TYPE, "join() requires an array of strings");
+        total += AS_STR(el[i])->len;
+    }
+    if (n > 1) total += (size_t)(n - 1) * sep->len;
     SString *s = vm_alloc_string(vm, total);
-    size_t p = 0;
-    for (int64_t i = 0; i < a->len; i++) {
-        if (i) { memcpy(s->dp + p, sep->dp, sep->len); p += sep->len; }
-        SString *e = AS_STR(array_get(a, i));
-        memcpy(s->dp + p, e->dp, e->len);
-        p += e->len;
+    char *w = s->dp;
+    const size_t sl = sep->len;
+    for (int64_t i = 0; i < n; i++) {
+        if (i && sl) {
+            if (sl == 1) *w++ = sep->dp[0];
+            else { memcpy(w, sep->dp, sl); w += sl; }
+        }
+        const SString *e = AS_STR(el[i]);
+        const size_t l = e->len;
+        if (l <= 8) { for (size_t k = 0; k < l; k++) w[k] = e->dp[k]; }     /* short pieces (single characters...): no library call */
+        else memcpy(w, e->dp, l);
+        w += l;
     }
     string_finish(s);
     *ret = v_obj(T_STRING, s);
