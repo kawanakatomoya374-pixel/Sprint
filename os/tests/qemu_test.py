@@ -14,12 +14,16 @@ def check(cond, what):
     if not cond:
         fails.append(what)
 
+def disk(path):
+    """QEMU arguments that boot `path`: an ISO as a CD-ROM (GRUB), a raw .img as a hard disk (the Sprint bootloader)."""
+    return ["-drive", "format=raw,file=" + path] if path.endswith(".img") else ["-cdrom", path]
+
 def boot(cpus):
     ser = os.path.join(OUT, "serial%d.log" % cpus)
     if os.path.exists(ser):
         os.remove(ser)
     try:
-        subprocess.run(["qemu-system-x86_64", "-m", "256", "-smp", str(cpus), "-cdrom", ISO, "-display", "none", "-no-reboot",
+        subprocess.run(["qemu-system-x86_64", "-m", "256", "-smp", str(cpus)] + disk(ISO) + ["-display", "none", "-no-reboot",
                         "-serial", "file:" + ser, "-device", "isa-debug-exit,iobase=0xf4,iosize=4"],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120)
     except subprocess.TimeoutExpired:
@@ -43,6 +47,8 @@ for cpus in (1, 2):
     check(bool(pages) and pages == free, tag + "all physical pages are returned at exit")
     m = re.search(r"init: 4 burners took (\d+) ms", log)
     times[cpus] = int(m.group(1)) if m else None
+# the Sprint VMs (ring 0 and ring 3) run with the JIT: the interpreter alone needs ~7800 ms for these four jobs on one CPU (JIT: ~1800 ms)
+check(bool(times[1]) and times[1] < 4500, "ring-3 Sprint code is JIT-compiled (4 burners on 1 CPU: %s ms, interpreter alone ~7800 ms)" % times[1])
 check(all(times.values()) and times[2] < times[1] * 0.75,
       "2 processors finish 4 CPU-bound jobs sooner than 1 (%s ms vs %s ms)" % (times[2], times[1]))
 def desktop():
@@ -51,7 +57,7 @@ def desktop():
     for f in (ser, mon):
         if os.path.exists(f):
             os.remove(f)
-    q = subprocess.Popen(["qemu-system-x86_64", "-m", "512", "-smp", "2", "-cdrom", DESK, "-display", "none", "-no-reboot",
+    q = subprocess.Popen(["qemu-system-x86_64", "-m", "512", "-smp", "2"] + disk(DESK) + ["-display", "none", "-no-reboot",
                           "-serial", "file:" + ser, "-monitor", "unix:" + mon + ",server,nowait"],
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:

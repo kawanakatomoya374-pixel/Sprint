@@ -247,7 +247,8 @@ long ksyscall(long n, long a1, long a2, long a3, long a4, long a5, long a6) {
         if (!(a4 & 0x20)) return -ENODEV;
         void *p = page_alloc((uint64_t)a2);
         if (!p) return -ENOMEM;
-        memset(p, 0, (size_t)a2);
+        /* the whole page-rounded block must be zero: musl's malloc reads the bytes past the requested size (its end guards) */
+        memset(p, 0, (size_t)(((uint64_t)a2 + PAGE - 1) & ~(uint64_t)(PAGE - 1)));
         return (long)(uintptr_t)p;
     }
     case SYS_munmap:
@@ -258,7 +259,8 @@ long ksyscall(long n, long a1, long a2, long a3, long a4, long a5, long a6) {
         if (!p) return -ENOMEM;
         uint64_t keep = (uint64_t)a2 < (uint64_t)a3 ? (uint64_t)a2 : (uint64_t)a3;
         memcpy(p, (void *)a1, keep);
-        if ((uint64_t)a3 > keep) memset((char *)p + keep, 0, (size_t)((uint64_t)a3 - keep));
+        uint64_t newlen = ((uint64_t)a3 + PAGE - 1) & ~(uint64_t)(PAGE - 1);
+        if (newlen > keep) memset((char *)p + keep, 0, (size_t)(newlen - keep));
         range_free((uint64_t)a1, ((uint64_t)a2 + PAGE - 1) & ~(uint64_t)(PAGE - 1));
         return (long)(uintptr_t)p;
     }

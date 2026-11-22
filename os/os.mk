@@ -83,7 +83,13 @@ $(OSB)/sprintos-test.iso: $(OSB)/kernel.elf os/boot/grub-test.cfg
 	cp os/boot/grub-test.cfg $(OSB)/isot/boot/grub/grub.cfg
 	grub-mkrescue -o $@ $(OSB)/isot >/dev/null 2>&1
 
-.PHONY: os os-check os-kernel os-user os-iso os-run os-test
+# ---- the same kernel booted by the bootloader written in Sprint (os/boot/sprintboot.sp): a raw disk image, no GRUB ----
+$(OSB)/sprintos.img: $(OSB)/kernel.elf os/boot/sprintboot.sp stdlib/asm.sp $(BUILD)/sprint
+	$(BUILD)/sprint run --allow-read=$(OSB) --allow-write=$(OSB) os/boot/sprintboot.sp $(OSB)/kernel32.elf $@ "init=boot"
+$(OSB)/sprintos-test.img: $(OSB)/kernel.elf os/boot/sprintboot.sp stdlib/asm.sp $(BUILD)/sprint
+	$(BUILD)/sprint run --allow-read=$(OSB) --allow-write=$(OSB) os/boot/sprintboot.sp $(OSB)/kernel32.elf $@ "init=init"
+
+.PHONY: os os-check os-kernel os-user os-iso os-run os-test os-img os-img-run os-img-test
 # `make os`: check the tools, then build the bootable ISO
 os: os-check os-iso
 	@echo "ISO ready: $(OSB)/sprintos.iso   (try: make os-run)"
@@ -97,3 +103,10 @@ os-run: $(OSB)/sprintos.iso
 	qemu-system-x86_64 -m 256 -cdrom $< -serial stdio
 os-test: $(OSB)/sprintos-test.iso $(OSB)/sprintos.iso
 	python3 os/tests/qemu_test.py $(OSB)/sprintos-test.iso $(OSB)/sprintos.iso
+
+os-img: $(OSB)/sprintos.img
+os-img-run: $(OSB)/sprintos.img
+	qemu-system-x86_64 -m 256 -drive format=raw,file=$< -serial stdio
+# the same checks as os-test, but booted by the Sprint bootloader from a disk image
+os-img-test: $(OSB)/sprintos-test.img $(OSB)/sprintos.img
+	python3 os/tests/qemu_test.py $(OSB)/sprintos-test.img $(OSB)/sprintos.img

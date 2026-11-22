@@ -976,7 +976,7 @@ void prog_quicken(Program *pg);
 #endif
 /* copy-and-patch loop JIT. SP_JIT_X86: the x86-64 Linux backend (region JIT + TraceJIT). SP_JIT_A64: AArch64 Linux, where the pure-function JIT
  * (jit_pure_a64.c) is always built and the region JIT (stencils_a64.S) is built with -DSP_A64_REGION. SP_JIT: the region JIT is available. */
-#if defined(__x86_64__) && defined(__linux__) && !defined(SP_NO_JIT) && !defined(SP_OS) && !defined(SP_OS_USER)
+#if defined(__x86_64__) && defined(__linux__) && !defined(SP_NO_JIT)
 #define SP_JIT_X86 1
 #else
 #define SP_JIT_X86 0

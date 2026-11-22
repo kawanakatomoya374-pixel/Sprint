@@ -1,6 +1,26 @@
 # 24. Sprint OS (ブート可能なOS)
 
-`make os`（または `make os-iso`）で `build/os/sprintos.iso` (GRUB / Multiboot2, x86-64) を作る。必要: `musl-tools`, `grub-pc-bin`, `xorriso`, `mtools`、テストに `qemu-system-x86`。
+起動方法は2通り（どちらも同じカーネルで、`make os-test` / `make os-img-test` が同じ検査を行う）:
+
+- `make os`（または `make os-iso`）で `build/os/sprintos.iso`（GRUB / Multiboot2、x86-64）を作る。必要: `musl-tools`, `grub-pc-bin`, `xorriso`, `mtools`、テストに `qemu-system-x86`。
+- `make os-img` で `build/os/sprintos.img` を作る。**ブートローダーも Sprint 製**（`os/boot/sprintboot.sp`。GRUB・外部アセンブラ・Cのブート処理は使わない）。生のディスクイメージで、`make os-img-run`（QEMU、`-drive format=raw`）で起動する。必要なのは `musl-tools` と `qemu-system-x86` だけ。
+
+## Sprint 製ブートローダー（os/boot/sprintboot.sp）
+
+`import asm`（§15.21）で組む。構成は2段:
+
+1. **ステージ1**（MBR、512バイト）: INT 13h 拡張でステージ2を 0x8000 へ読む。
+2. **ステージ2**（リアルモード）: A20 を有効にし、VBE で 1024x768x32 のリニアフレームバッファを設定し、ACPI RSDP を探し（EBDA、0xE0000〜0xFFFFF）、E820 のメモリマップを集め、Multiboot2 の情報構造（コマンドライン・メモリマップ・フレームバッファ・RSDP タグ）を 0x30000 に作る。続いてカーネルの `PT_LOAD` セグメントを、ディスクから 1 MiB 以上へ読み込む（バウンスバッファ経由。コピーの間だけ unreal モードで ES を 4 GiB 幅にする）。最後に 32 ビット保護モードへ移り、GRUB と同じ規約（`eax = 0x36d76289`、`ebx` = 情報構造）でカーネルの Multiboot2 入口へ飛ぶ。
+
+カーネルの ELF は**イメージ生成時に Sprint が解析**する（`fs.read_bytes`）。各セグメントをセクタ境界に置き、(LBA, 配置先, ファイルサイズ, メモリサイズ) の表をステージ2に埋めるので、16ビットのローダーは ELF を理解しなくてよい。カーネルのコマンドライン（`init=...`）もイメージ生成時の引数である。
+
+## JIT
+
+カーネル（Ring 0）の Sprint VM も、ユーザープロセス（Ring 3）の Sprint VM も、x86-64 の JIT（領域 JIT・TraceJIT・純関数 JIT）付きでビルドされる。JIT コードは匿名 `mmap` のページに置く: ユーザー側は `mmap` が常に実行可能なページを返し（NX は使わない）、`mprotect` は成功を返す。コンテキストスイッチは `fxsave`/`fxrstor` で SSE の状態を保存するので、float を使う JIT コードも切り替えをまたいで壊れない。`make os-test` / `os-img-test` は、CPU バウンドのジョブ（4本）が 1 CPU で 4.5 秒未満で終わること（インタプリタだけだと約 7.8 秒、JIT で約 1.8 秒）を検査する。
+
+## カーネルの mmap（修正）
+
+`mmap` のエミュレーションは、要求サイズではなく**ページに切り上げた全体**をゼロで埋める。musl の malloc は mmap した領域の末尾（要求サイズの後ろ）のガードバイトを読むため、以前は前の持ち主のデータが残っていると、メモリ量が大きい環境（256 MiB 以上）で `free()` の整合性検査に失敗して止まっていた。
 
 ## 構成
 

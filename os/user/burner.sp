@@ -4,4 +4,4 @@ func spin(n):
     for i in range(n):
         s += i % 7
     return s
-spin(6000000)
+spin(18000000)
