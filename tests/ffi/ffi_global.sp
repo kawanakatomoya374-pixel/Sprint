@@ -1,0 +1,15 @@
+# global variables and typed views through ffi.at / lib.var
+import ffi
+ffi.cdef("struct tv { long tv_sec; long tv_usec; };")
+let c = ffi.open(nil)
+let env = c.var("environ", "char**")
+print(env.get(0) != 0)
+let buf = ffi.array("i32", 4, [10, 20, 30, 40])
+let v = ffi.at("int[4]", buf.addr())
+v.set(2, 99)
+print(v.to_array(), buf.to_array())
+let tv = ffi.at("struct tv", ffi.new("struct tv").addr())
+print(tv.size())
+let x = ffi.new("double", 1.5)
+ffi.at("double", x.addr()).set(0, 2.25)
+print(x.get(0))

@@ -181,18 +181,17 @@ func parse_base(p):
             p.next()
             word = t
             any = true
-        elif t == "union":
-            fail("unions are not supported")
-        elif t == "struct":
+        elif t == "struct" or t == "union":
             p.next()
+            let is_union = t == "union"
             let tag = nil
             if is_word(p.peek()):
                 tag = p.next()
             if p.peek() == "{":
-                st = parse_struct_body(p, tag)
+                st = parse_struct_body(p, tag, is_union)
             else:
                 if tag == nil:
-                    fail("expected a struct name")
+                    fail("expected a struct or union name")
                 st = structs[tag] if has(structs, tag) else nil
                 if st == nil:
                     st = {name: tag, size: 0, align: 1, fields: {}, order: [], incomplete: true}
@@ -365,17 +364,21 @@ func scalar_align(d):
         return d.st.align
     return SIZE[d.code]
 
-func parse_struct_body(p, tag):
+func parse_struct_body(p, tag, is_union = false):
     p.expect("{")
-    let lay = {name: tag, size: 0, align: 1, fields: {}, order: [], incomplete: false}
+    let lay = {name: tag, size: 0, align: 1, fields: {}, order: [], incomplete: false, union: is_union}
     if tag != nil:
         structs[tag] = lay
     let off = 0
+    let bitpos = -1   # next free bit of the open bit-field run (-1: none)
     while p.peek() != "}":
         let base = parse_base(p)
         while true:
             let dc = parse_declarator(p, base)
-            if dc.name == nil:
+            let bits = 0
+            if p.accept(":"):
+                bits = parse_number(p.next())
+            if dc.name == nil and bits == 0:
                 fail("unnamed struct member")
             if dc.params != nil:
                 fail("function members are not supported")
@@ -387,15 +390,49 @@ func parse_struct_body(p, tag):
             let esize = scalar_size(d)
             let al = scalar_align(d)
             let n = dc.arr if dc.arr > 0 else 0
-            off = align_up(off, al)
-            let w = "p" if d.ptr > 0 else d.code
-            if d.ptr == 1 and d.code == "i8" and d.plain_char and n == 0:
-                w = "s"
-            lay.fields[dc.name] = {off: off, code: w, esize: esize, n: n, st: d.st if d.ptr == 0 else nil, pst: d.st if d.ptr == 1 else nil}
-            lay.order.append(dc.name)
-            off += esize * (n if n > 0 else 1)
-            if al > lay.align:
-                lay.align = al
+            if bits > 0:
+                if d.ptr > 0 or d.st != nil or n > 0 or d.code == "f32" or d.code == "f64" or bits > esize * 8:
+                    fail("invalid bit-field '" .. to_string(dc.name) .. "'")
+                # SysV layout: the field takes the next free bits unless it would straddle a unit of its own type
+                let ubits = esize * 8
+                if bitpos < 0:
+                    bitpos = off * 8
+                if is_union:
+                    bitpos = 0
+                elif bitpos % ubits + bits > ubits:
+                    bitpos = align_up(bitpos, ubits)
+                if dc.name != nil:
+                    lay.fields[dc.name] = {off: (bitpos // ubits) * esize, code: d.code, esize: esize, n: 0, st: nil, pst: nil, bits: bits, shift: bitpos % ubits}
+                    lay.order.append(dc.name)
+                    if al > lay.align:
+                        lay.align = al
+                bitpos += bits
+                let endb = (bitpos + 7) // 8
+                if is_union:
+                    if endb > off:
+                        off = endb
+                    bitpos = -1
+                else:
+                    off = endb
+            else:
+                bitpos = -1
+                let at = 0
+                if not is_union:
+                    off = align_up(off, al)
+                    at = off
+                let w = "p" if d.ptr > 0 else d.code
+                if d.ptr == 1 and d.code == "i8" and d.plain_char and n == 0:
+                    w = "s"
+                lay.fields[dc.name] = {off: at, code: w, esize: esize, n: n, st: d.st if d.ptr == 0 else nil, pst: d.st if d.ptr == 1 else nil, bits: 0, shift: 0}
+                lay.order.append(dc.name)
+                let total = esize * (n if n > 0 else 1)
+                if is_union:
+                    if total > off:
+                        off = total
+                else:
+                    off += total
+                if al > lay.align:
+                    lay.align = al
             if not p.accept(","):
                 break
         p.expect(";")
@@ -406,7 +443,7 @@ func parse_struct_body(p, tag):
 # ---- cdef --------------------------------------------------------------------------
 # Declare C types and functions. Supported: function prototypes (incl. `...`), struct, enum,
 # typedef (incl. function pointers), pointers, fixed arrays in structs. Not supported:
-# unions, bit fields, structs by value, `long double`, global variables.
+# `long double`.
 export func cdef(src):
     let p = Parser(tokenize(src))
     while p.peek() != nil:
@@ -508,6 +545,26 @@ export class Arr:
         let z = s.find("\0")
         return s if z < 0 else s.slice(0, z)
 
+# bit-field access: the storage unit is read/written as an unsigned integer of the declared width, then masked / sign-extended
+func unit_code(f):
+    return "u" .. to_string(f.esize * 8)
+
+func bit_get(a, f):
+    let u = _ffi.peek(a, unit_code(f))
+    let m = (1 << f.bits) - 1
+    let v = (u >> f.shift) & m
+    if f.code.slice(0, 1) == "i" and v >= (1 << (f.bits - 1)):
+        v -= 1 << f.bits
+    return v
+
+func bit_set(a, f, v):
+    if type(v) != "int":
+        throw error("TypeError", "a bit-field takes an integer")
+    let m = (1 << f.bits) - 1
+    let u = _ffi.peek(a, unit_code(f))
+    u = (u & ~(m << f.shift)) | ((v & m) << f.shift)
+    _ffi.poke(a, unit_code(f), u)
+
 export class Struct:
     let layout = nil
     let base = 0
@@ -539,6 +596,8 @@ export class Struct:
             a += i * f.esize
         if f.st != nil:
             return Struct(f.st, a, self.keep)
+        if f.bits > 0:
+            return bit_get(a, f)
         if f.code == "s":
             let ptr = _ffi.peek(a, "i64")
             return nil if ptr == 0 else _ffi.string_at(ptr)
@@ -552,6 +611,9 @@ export class Struct:
             a += i * f.esize
         if f.st != nil:
             throw error("TypeError", "cannot assign a struct field; set its members")
+        if f.bits > 0:
+            bit_set(a, f, v)
+            return nil
         if f.code == "s" or f.code == "p":
             if type(v) == "string":
                 let b = cstr(v)
@@ -629,6 +691,23 @@ export func new(text, init = nil):
     if init != nil:
         a.set(0, init)
     return a
+
+# a view of a C type at an address: scalars and pointers are one-element arrays (get(0) / set(0, v)), "T[n]" an array, a struct / union a Struct
+func view_of(text, address):
+    let dc = type_of(text)
+    let d = dc.d
+    if d.ptr > 0 or dc.params != nil:
+        return Arr(address, "p", 1, nil)
+    if dc.arr > 0:
+        if d.st != nil:
+            throw error("TypeError", "views of arrays of structs are not supported; cast each element")
+        return Arr(address, d.code, dc.arr, nil)
+    if d.st != nil:
+        return Struct(d.st, address, nil)
+    return Arr(address, d.code, 1, nil)
+
+export func at(text, address):
+    return view_of(text, addr(address))
 
 # a view of a struct at an address: ffi.cast("struct Point", p)
 export func cast(text, address):
@@ -760,6 +839,9 @@ export class Lib:
         else:
             throw error("NameError", "no prototype for '" .. name .. "': call ffi.cdef first or pass a declaration")
         return make_fn(_ffi.sym(self.h, name), pr)
+    # a global variable as a view: lib.var("environ", "char*") / lib.var("tbl", "int[8]") / lib.var("cfg", "struct Config")
+    func var(self, name, text):
+        return view_of(text, _ffi.sym(self.h, name))
     # table of functions: lib.bind(["sqrt", "pow"]).sqrt(2.0)
     func bind(self, names):
         let t = {}

@@ -41,11 +41,12 @@ try:
 catch e:
     print(e.kind)
 # the pool is finite and slots are reusable
-let cbs = [ffi.callback("int(int)", x => x) for i in range(16)]
+let cbs = []
 try:
-    ffi.callback("int(int)", x => x)
+    for i in range(5000):
+        cbs.append(ffi.callback("int(int)", x => x))
 catch e:
-    print(e.kind)
+    print(e.kind, len(cbs) > 4000)
 for c in cbs:
     c.release()
 let again = ffi.callback("int(int)", x => x + 1)

@@ -81,4 +81,4 @@
 1. **PreparedCall（VM経路）＋ `ffi.asm` ＋ `asm` capability** — 実装済み（`_ffi.prep` / `_ffi.asm`、`lib_ffi.c` の `PrepFn`）
 2. 専用スタブ — 未着手
 3. JIT inline — **実装済み**。署名が「引数すべて i64/u64/f64（整数6・浮動8まで）、非可変長、戻り値が文字列/構造体以外」のとき、`jit.c` の `emit_ffcall` が stencil `ff_fn`（呼出し先の `PrepFn` 同一性ガード）→ `ff_ia*`/`ff_fa*`（引数の型ガード＋レジスタ載せ）→ `ff_call`（C関数を直接 call）→ `ff_sx*`/`ff_zx*`/`ff_r*`（戻り値の拡張と格納）を並べる。ガード失敗は C 関数の実行前に `JIT_X` で抜け、インタプリタが同じ呼出しをやり直す（副作用なし）。ポインタ/文字列引数・callback を含む署名は、再入や割当てを伴い得るため対象外（ヘルパー経由 `jh_ffi` か通常経路）。実測: `sqrt` 2000万回ループ 9.26s → 約0.08s（呼出し単体）。
-4. CData/union/ビットフィールド/グローバル変数/動的 callback — 未着手
+4. union / ビットフィールド / グローバル変数 / 動的 callback — **一部実装済み**。`ffi.cdef` が `union`（全メンバー offset 0）と `T x : n` のビットフィールド（SysV 配置: 型の単位をまたがない限り詰める。`get`/`set` が単位を読み書きしてマスク・符号拡張）を受理する。`lib.var(name, "T")` と `ffi.at("T", addr)` が C 型のビュー（スカラ/ポインタは 1 要素の `Arr`、`T[n]`、構造体）を返す。callback は戻り種別ごと 16 個の静的 trampoline をやめ、実行メモリに 64 バイトのスタブ（スロット番号を `g_cb_cur` に書いて共通 C 入口へ jmp。x86-64 / AArch64 の両方を生成）を動的に作る（最大 4096、解放したスロットは再利用）。未着手: CData の `s.x` 構文、`long double`、callback の構造体値渡し、`ffi.gc`。

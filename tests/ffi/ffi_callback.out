@@ -7,6 +7,6 @@
 6 ["a0", "bcd1", "ef2"]
 ArithmeticError
 TypeError
-RuntimeError
+RuntimeError true
 42
 42

@@ -15,6 +15,6 @@ try:
 catch e:
     print(e.kind)
 try:
-    ffi.cdef("union U { int a; float b; };")
+    ffi.cdef("struct U { void a; };")
 catch e:
     print(e.kind)

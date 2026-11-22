@@ -375,15 +375,25 @@ static int f_sym(VM *vm, int argc, SpValue *argv, SpValue *ret) {
 static const NativeClass clib_class = {"ffi_library", NULL, NULL, NULL};
 
 /* ---- callbacks (C calls Sprint) -------------------------------------------------- */
-enum { NCB = 16 };
+/* Callback slots live in pages: each page owns one page of generated entry stubs (64 bytes each) and the slots they stand for.
+ * A stub stores its slot number in g_cb_cur and jumps to the common C entry (cb_entry_i / cb_entry_d, by return kind), so the
+ * number of live callbacks is bounded only by CB_MAX. The stub memory is writable while it is generated and executable
+ * (never both) afterwards; a released slot is reused with its stub unchanged. */
+enum { CB_STUB = 64, CB_PER_PAGE = 64, CB_MAX_PAGES = 64 };
 typedef struct CbSlot {
     VM *vm;
     SpValue fn;
     Sig sig;
     int used;
 } CbSlot;
-static CbSlot cb_i[NCB]; /* integer / pointer / void returns */
-static CbSlot cb_d[NCB]; /* floating-point returns */
+typedef struct CbPage {
+    uint8_t *code;
+    int fp;                       /* the stubs return a floating-point value */
+    CbSlot slots[CB_PER_PAGE];
+} CbPage;
+static CbPage *g_cb_pages[CB_MAX_PAGES];
+static int g_cb_npages;
+static volatile uint32_t g_cb_cur;   /* set by the stub just before it jumps to the entry, read first thing there */
 static int g_cb_failed;  /* a callback raised: the error stays pending in the VM until the outer call returns */
 
 static void cb_collect(CbSlot *s, const int64_t *ia, const double *da, SpValue *out, int *nout) {
@@ -441,17 +451,61 @@ static double cb_run_d(CbSlot *s, const int64_t *ia, const double *da) {
     return d;
 }
 
-#define TR(K) \
-    static int64_t tri##K(int64_t a0, int64_t a1, int64_t a2, int64_t a3, int64_t a4, int64_t a5, double d0, double d1, double d2, double d3, double d4, double d5, double d6, double d7) { \
-        const int64_t ia[6] = {a0, a1, a2, a3, a4, a5}; const double da[8] = {d0, d1, d2, d3, d4, d5, d6, d7}; return cb_run_i(&cb_i[K], ia, da); } \
-    static double trd##K(int64_t a0, int64_t a1, int64_t a2, int64_t a3, int64_t a4, int64_t a5, double d0, double d1, double d2, double d3, double d4, double d5, double d6, double d7) { \
-        const int64_t ia[6] = {a0, a1, a2, a3, a4, a5}; const double da[8] = {d0, d1, d2, d3, d4, d5, d6, d7}; return cb_run_d(&cb_d[K], ia, da); }
-TR(0) TR(1) TR(2) TR(3) TR(4) TR(5) TR(6) TR(7) TR(8) TR(9) TR(10) TR(11) TR(12) TR(13) TR(14) TR(15)
+static CbSlot *cb_slot_of(uint32_t k) { return &g_cb_pages[k / CB_PER_PAGE]->slots[k % CB_PER_PAGE]; }
+static int64_t cb_entry_i(int64_t a0, int64_t a1, int64_t a2, int64_t a3, int64_t a4, int64_t a5, double d0, double d1, double d2, double d3, double d4, double d5, double d6, double d7) {
+    CbSlot *sl = cb_slot_of(g_cb_cur);
+    const int64_t ia[6] = {a0, a1, a2, a3, a4, a5}; const double da[8] = {d0, d1, d2, d3, d4, d5, d6, d7};
+    return cb_run_i(sl, ia, da);
+}
+static double cb_entry_d(int64_t a0, int64_t a1, int64_t a2, int64_t a3, int64_t a4, int64_t a5, double d0, double d1, double d2, double d3, double d4, double d5, double d6, double d7) {
+    CbSlot *sl = cb_slot_of(g_cb_cur);
+    const int64_t ia[6] = {a0, a1, a2, a3, a4, a5}; const double da[8] = {d0, d1, d2, d3, d4, d5, d6, d7};
+    return cb_run_d(sl, ia, da);
+}
 
-typedef int64_t (*TrampI)(int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, double, double, double, double, double, double, double, double);
-typedef double (*TrampD)(int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, double, double, double, double, double, double, double, double);
-static const TrampI tramp_i[NCB] = {tri0, tri1, tri2, tri3, tri4, tri5, tri6, tri7, tri8, tri9, tri10, tri11, tri12, tri13, tri14, tri15};
-static const TrampD tramp_d[NCB] = {trd0, trd1, trd2, trd3, trd4, trd5, trd6, trd7, trd8, trd9, trd10, trd11, trd12, trd13, trd14, trd15};
+static void cb_emit_stub(uint8_t *at, uint32_t idx, uintptr_t cur, uintptr_t entry) {
+#if defined(__x86_64__)
+    static const uint8_t endbr[4] = {0xf3, 0x0f, 0x1e, 0xfa};
+    memcpy(at, endbr, 4); at += 4;
+    *at++ = 0x48; *at++ = 0xb8; memcpy(at, &cur, 8); at += 8;      /* movabs rax, &g_cb_cur */
+    *at++ = 0xc7; *at++ = 0x00; memcpy(at, &idx, 4); at += 4;      /* mov dword [rax], idx */
+    *at++ = 0x48; *at++ = 0xb8; memcpy(at, &entry, 8); at += 8;    /* movabs rax, entry */
+    *at++ = 0xff; *at++ = 0xe0;                                    /* jmp rax */
+#else
+    uint32_t w[11];   /* 4 + 1 + 1 + 4 words, then br */
+    int n = 0;
+    for (int h = 0; h < 4; h++) w[n++] = (h == 0 ? 0xd2800000u : 0xf2800000u | ((uint32_t)h << 21)) | ((uint32_t)((cur >> (16 * h)) & 0xffffu) << 5) | 16u;
+    w[n++] = 0x52800000u | (idx << 5) | 17u;                       /* movz w17, #idx */
+    w[n++] = 0xb9000200u | 17u;                                    /* str w17, [x16] */
+    for (int h = 0; h < 4; h++) w[n++] = (h == 0 ? 0xd2800000u : 0xf2800000u | ((uint32_t)h << 21)) | ((uint32_t)((entry >> (16 * h)) & 0xffffu) << 5) | 16u;
+    w[n++] = 0xd61f0200u;                                          /* br x16 */
+    memcpy(at, w, (size_t)n * 4);
+#endif
+}
+
+static CbPage *cb_new_page(int fp) {
+    if (g_cb_npages >= CB_MAX_PAGES) return NULL;
+    size_t page = (size_t)sysconf(_SC_PAGESIZE);
+    if (page < (size_t)CB_STUB * CB_PER_PAGE) return NULL;
+    CbPage *pg = (CbPage *)calloc(1, sizeof *pg);
+    if (!pg) return NULL;
+    void *mem = mmap(NULL, page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (mem == MAP_FAILED) { free(pg); return NULL; }
+    uintptr_t entry;
+    if (fp) { double (*f)(int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, double, double, double, double, double, double, double, double) = cb_entry_d; memcpy(&entry, &f, sizeof entry); }
+    else { int64_t (*f)(int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, double, double, double, double, double, double, double, double) = cb_entry_i; memcpy(&entry, &f, sizeof entry); }
+    uintptr_t cur = (uintptr_t)&g_cb_cur;
+    uint8_t *code = (uint8_t *)mem;
+    for (int i = 0; i < CB_PER_PAGE; i++) cb_emit_stub(code + (size_t)i * CB_STUB, (uint32_t)(g_cb_npages * CB_PER_PAGE + i), cur, entry);
+#if defined(__aarch64__)
+    __builtin___clear_cache((char *)mem, (char *)mem + CB_STUB * CB_PER_PAGE);
+#endif
+    if (mprotect(mem, page, PROT_READ | PROT_EXEC) != 0) { munmap(mem, page); free(pg); return NULL; }
+    pg->code = code;
+    pg->fp = fp;
+    g_cb_pages[g_cb_npages++] = pg;
+    return pg;
+}
 
 /* callback(fn, sig) -> address. The caller keeps `fn` alive (ffi.sp stores it). */
 static int f_callback(VM *vm, int argc, SpValue *argv, SpValue *ret) {
@@ -468,34 +522,34 @@ static int f_callback(VM *vm, int argc, SpValue *argv, SpValue *ret) {
         if (is_fp(sig.args[i])) nd++; else ni++;
     }
     if (sig.variadic || ni > MAX_INT_ARGS || nd > MAX_FP_ARGS) return vm_set_error(vm, E_VALUE, "callback signature too large (max 6 integer and 8 floating-point parameters, no varargs)");
-    CbSlot *pool = is_fp(sig.ret) ? cb_d : cb_i;
-    for (int k = 0; k < NCB; k++) {
-        if (pool[k].used) continue;
-        pool[k].vm = vm;
-        pool[k].fn = argv[0];
-        pool[k].sig = sig;
-        pool[k].used = 1;
-        uintptr_t a;
-        if (is_fp(sig.ret)) { TrampD f = tramp_d[k]; memcpy(&a, &f, sizeof a); }
-        else { TrampI f = tramp_i[k]; memcpy(&a, &f, sizeof a); }
-        *ret = v_int((int64_t)a);
-        return 0;
+    int fp = is_fp(sig.ret);
+    for (int round = 0; round < 2; round++) {
+        for (int pi = 0; pi < g_cb_npages; pi++) {
+            CbPage *pg = g_cb_pages[pi];
+            if (pg->fp != fp) continue;
+            for (int k = 0; k < CB_PER_PAGE; k++) {
+                if (pg->slots[k].used) continue;
+                pg->slots[k].vm = vm;
+                pg->slots[k].fn = argv[0];
+                pg->slots[k].sig = sig;
+                pg->slots[k].used = 1;
+                *ret = v_int((int64_t)(uintptr_t)(pg->code + (size_t)k * CB_STUB));
+                return 0;
+            }
+        }
+        if (round == 0 && !cb_new_page(fp)) break;
     }
-    return vm_set_error(vm, E_RUNTIME, "no free ffi callback slots (at most %d per return kind; release some)", NCB);
+    return vm_set_error(vm, E_RUNTIME, "no free ffi callback slots (at most %d; release some)", CB_MAX_PAGES * CB_PER_PAGE);
 }
 static int f_release_callback(VM *vm, int argc, SpValue *argv, SpValue *ret) {
     (void)argc; (void)ret;
     if (need_cap(vm)) return 1;
     int64_t a = 0;
     if (a_int64(vm, argv[0], "address", &a)) return 1;
-    for (int k = 0; k < NCB; k++) {
-        uintptr_t x;
-        TrampI fi = tramp_i[k];
-        TrampD fd = tramp_d[k];
-        memcpy(&x, &fi, sizeof x);
-        if ((int64_t)x == a) { cb_i[k].used = 0; return 0; }
-        memcpy(&x, &fd, sizeof x);
-        if ((int64_t)x == a) { cb_d[k].used = 0; return 0; }
+    for (int pi = 0; pi < g_cb_npages; pi++) {
+        CbPage *pg = g_cb_pages[pi];
+        uintptr_t base = (uintptr_t)pg->code, x = (uintptr_t)a;
+        if (x >= base && x < base + (uintptr_t)CB_STUB * CB_PER_PAGE && (x - base) % CB_STUB == 0) { pg->slots[(x - base) / CB_STUB].used = 0; return 0; }
     }
     return vm_set_error(vm, E_VALUE, "not an ffi callback address");
 }
