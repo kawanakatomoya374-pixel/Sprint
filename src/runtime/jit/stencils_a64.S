@@ -1605,3 +1605,90 @@ ST a64_stself                           // slot H0 <- the instance in x0
     str x0, [x20, :lo12:H0+8]
 ST a64_nilt                             // the type word of slot H0 <- 0 (nil)
     str xzr, [x20, :lo12:H0]
+.macro IDIV_BODY ba, bb
+    ldr x1, [\bb, :lo12:H2+8]
+    cbz x1, JIT_X
+    ldr x0, [\ba, :lo12:H1+8]
+    scvtf d0, x0
+    scvtf d1, x1
+    fdiv d0, d0, d1
+    SETT H0, T_FLOAT
+    str d0, [x20, :lo12:H0+8]
+.endm
+ST a64_idiv_rk                          // int / int gives a float; the divisor is a constant
+    IDIV_BODY x20, x21
+ST a64_idiv_kr
+    IDIV_BODY x21, x20
+
+// ---- direct calls of prepared ffi functions (numeric-only signatures), as on x86-64: a failed guard leaves through JIT_X before the C function runs
+ST ff_fn                                // H0 = callee slot, HQ = the PrepFn's NativeDesc
+    ldr x0, [x20, :lo12:H0]
+    cmp x0, #T_FUNCTION
+    b.ne JIT_X
+    ldr x0, [x20, :lo12:H0+8]
+    ldr x2, [x0, #L_SFUNC_NAT]
+    LDI64 1, HQ
+    cmp x1, x2
+    b.ne JIT_X
+.macro FF_IARG k
+    ST ff_ia\k
+    ldr x9, [x20, :lo12:H0]
+    cmp x9, #T_INT
+    b.ne JIT_X
+    ldr x\k, [x20, :lo12:H0+8]
+.endm
+FF_IARG 0
+FF_IARG 1
+FF_IARG 2
+FF_IARG 3
+FF_IARG 4
+FF_IARG 5
+.macro FF_FARG k
+    ST ff_fa\k
+    ldr x9, [x20, :lo12:H0]
+    cmp x9, #T_FLOAT
+    b.ne 1f
+    ldr d\k, [x20, :lo12:H0+8]
+    b 2f
+1:  cmp x9, #T_INT
+    b.ne JIT_X
+    ldr x9, [x20, :lo12:H0+8]
+    scvtf d\k, x9
+2:
+.endm
+FF_FARG 0
+FF_FARG 1
+FF_FARG 2
+FF_FARG 3
+FF_FARG 4
+FF_FARG 5
+FF_FARG 6
+FF_FARG 7
+ST ff_call                              // HQ = the C function
+    LDI64 16, HQ
+    blr x16
+ST ff_sqrt
+    fsqrt d0, d0
+ST ff_sx32
+    sxtw x0, w0
+ST ff_zx32
+    mov w0, w0
+ST ff_sx16
+    sxth x0, w0
+ST ff_zx16
+    uxth w0, w0
+ST ff_sx8
+    sxtb x0, w0
+ST ff_zx8
+    uxtb w0, w0
+ST ff_ri64                              // integer result -> slot H0
+    SETT H0, T_INT
+    str x0, [x20, :lo12:H0+8]
+ST ff_rf32
+    fcvt d0, s0
+ST ff_rf64
+    SETT H0, T_FLOAT
+    str d0, [x20, :lo12:H0+8]
+ST ff_rnil
+    str xzr, [x20, :lo12:H0]
+    str xzr, [x20, :lo12:H0+8]

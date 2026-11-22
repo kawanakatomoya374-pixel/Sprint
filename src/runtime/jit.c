@@ -1242,8 +1242,13 @@ static int do_arith(JC *c, int op, uint32_t pc, int len, uint32_t *skip) {
             EM(T[op == OP_MOD][form], dst, oa, ob, 0, 0, 0);
         }
     } else if (!fl) {                                   /* int / int -> float */
+#if SP_JIT_X86
         if (form != 0 || a->kind == EK_K || b->kind == EK_K) FAIL("int division needs registers");
         EM(ST_idiv_rr, dst, oa, ob, 0, 0, 0);
+#else
+        if (a->kind == EK_K && b->kind == EK_K) FAIL("int division of two constants");
+        EM(form == 0 ? ST_idiv_rr : form == 1 ? ST_a64_idiv_rk : ST_a64_idiv_kr, dst, oa, ob, 0, 0, 0);
+#endif
     } else {
         int opi = op == OP_ADD ? 0 : op == OP_SUB ? 1 : op == OP_MUL ? 2 : 3;
         if ((opi == 0 || opi == 2) && (b->kind == EK_LOC || b->kind == EK_MEM) && ob == c->xmm_off && oa != c->xmm_off) {
