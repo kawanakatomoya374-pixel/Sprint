@@ -15,7 +15,9 @@ def check(cond, what):
         fails.append(what)
 
 def disk(path):
-    """QEMU arguments that boot `path`: an ISO as a CD-ROM (GRUB), a raw .img as a hard disk (the Sprint bootloader)."""
+    """QEMU arguments that boot `path`: an ISO as a CD-ROM (GRUB), a raw .img as a hard disk (the Sprint BIOS bootloader), *uefi*.img under OVMF."""
+    if "uefi" in os.path.basename(path):   # UEFI: OVMF firmware (SPRINT_OVMF), the image as a hard disk
+        return ["-bios", os.environ.get("SPRINT_OVMF", "/usr/share/ovmf/OVMF.fd"), "-drive", "format=raw,file=" + path]
     return ["-drive", "format=raw,file=" + path] if path.endswith(".img") else ["-cdrom", path]
 
 def boot(cpus):

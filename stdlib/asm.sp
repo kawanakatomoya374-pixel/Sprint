@@ -132,7 +132,14 @@ func parse_num(text):
         let d = digit_val(s[i])
         if d >= base:
             return nil
-        v = v * base + d
+        if base == 16:
+            v = (v << 4) | d          # literals above 2^63 wrap to the 64-bit two's complement value
+        elif base == 2:
+            v = (v << 1) | d
+        elif base == 8:
+            v = (v << 3) | d
+        else:
+            v = v * base + d
     return v
 
 # [kind, value] tokens: "n" number, "i" identifier, "s" string, "o" operator

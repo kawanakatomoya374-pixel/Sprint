@@ -21,6 +21,7 @@ show("top: dec cx\n jnz top\n loop top\n call top\n ret")
 # protected mode and long mode
 show("mov eax, [ebx+ecx*4+8]\npush dword 5\nmovzx eax, byte [esi]\nshl edx, 3\nrep movsd\nxchg eax, ecx", 32)
 show("mov rax, 0x123456789abc\nmov r9, rsp\nadd r10, [rbx+r12*8+0x10]\nlea rdi, [rel $]\nsyscall\nmov sil, 5\ncqo", 64)
+show("mov rax, 0x8000000000000001\nmov rcx, 0xffffffffffffffff\nmov rdx, -2", 64)
 show("mov rax, [rip+0x10]\npush rbp\npop r15\nmovsxd rax, ecx\nbswap r11\nmov cr3, rax\ncall rax", 64)
 # directives
 let r = asm.assemble("""

@@ -14,6 +14,16 @@
 
 カーネルの ELF は**イメージ生成時に Sprint が解析**する（`fs.read_bytes`）。各セグメントをセクタ境界に置き、(LBA, 配置先, ファイルサイズ, メモリサイズ) の表をステージ2に埋めるので、16ビットのローダーは ELF を理解しなくてよい。カーネルのコマンドライン（`init=...`）もイメージ生成時の引数である。
 
+## UEFI（os/boot/uefiboot.sp、`make os-uefi`）
+
+`build/os/sprintos-uefi.img` は GPT のディスクイメージで、FAT32 の EFI System Partition を持つ（`\EFI\BOOT\BOOTX64.EFI` と `\SPRINTOS.BIN`）。**イメージ生成からローダーまで全部 Sprint**: ローダーは `asm` モジュールで組んだ x86-64 の EFI アプリ（Microsoft ABI）で、`os/boot/uefi_pe.sp` が PE32+ に包み、`os/boot/diskimg.sp` が GPT（CRC32 付き）と FAT32 を書く。QEMU では OVMF（`apt install ovmf`）で起動する（`make os-uefi-run`、`make os-uefi-test`）。
+
+ローダーは次を行う: GOP で 1024x768 のモードを選び、構成テーブルから ACPI RSDP を探し、`SPRINTOS.BIN`（カーネルの `PT_LOAD` セグメントを連結したもの。アドレスと大きさの表はローダーが持つ）を起動元のボリュームから読み、Multiboot2 の情報構造（コマンドライン・フレームバッファ・RSDP・メモリマップ）を 1 MiB 未満に作り、`ExitBootServices` を呼ぶ。その後、低メモリに置いた小さなトランポリンが、32 ビット保護モードへ降りてページングとロングモードを切り、カーネルのセグメントを所定のアドレスへコピーして（bss をゼロ埋めし、UEFI のページテーブルを壊す心配がない）、`eax = 0x36d76289`、`ebx` = 情報構造でカーネルの Multiboot2 入口へ飛ぶ。カーネルは BIOS / GRUB と同じものを使う。
+
+カーネルを 1 MiB に置くと、ファームウェアの領域（OVMF は ACPI NVS を 8 MiB に置く）と衝突するので、**UEFI 用のカーネルは 16 MiB にリンク**する（`os/link.ld` の `1M` を置き換えた `link-uefi.ld`）。ローダーは `ExitBootServices` の前に、カーネルの各アドレス範囲がメモリマップ上「起動後に解放できる種別」であること、ファイルバッファと重ならないことを検査し、違えば衝突した領域を表示して戻る。
+
+制約: カーネルは位置固定（16 MiB）なので、その範囲をファームウェアが予約している機種では起動できない（再配置可能なカーネルが要る）。Secure Boot 未対応。実機では未検証。
+
 ## JIT
 
 カーネル（Ring 0）の Sprint VM も、ユーザープロセス（Ring 3）の Sprint VM も、x86-64 の JIT（領域 JIT・TraceJIT・純関数 JIT）付きでビルドされる。JIT コードは匿名 `mmap` のページに置く: ユーザー側は `mmap` が常に実行可能なページを返し（NX は使わない）、`mprotect` は成功を返す。コンテキストスイッチは `fxsave`/`fxrstor` で SSE の状態を保存するので、float を使う JIT コードも切り替えをまたいで壊れない。`make os-test` / `os-img-test` は、CPU バウンドのジョブ（4本）が 1 CPU で 4.5 秒未満で終わること（インタプリタだけだと約 7.8 秒、JIT で約 1.8 秒）を検査する。

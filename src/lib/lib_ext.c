@@ -621,7 +621,7 @@ static int fs_write_bytes(VM *vm, int argc, SpValue *argv, SpValue *ret) {
     for (int64_t i = 0; i < n; i++) {
         SpValue v;
         if (is_arr) v = array_get(AS_ARRAY(argv[1]), i);
-        else if (typed_peek(argv[1], v_int(i), &v)) v = v_nil();
+        else if (!typed_peek(argv[1], v_int(i), &v)) v = v_nil();
         if (v.type != T_INT || v.as.i < 0 || v.as.i > 255) { free(buf); return vm_set_error(vm, E_VALUE, "byte %lld is not an int in 0..255", (long long)i); }
         buf[i] = (unsigned char)v.as.i;
     }

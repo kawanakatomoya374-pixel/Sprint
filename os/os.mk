@@ -70,6 +70,13 @@ $(OSB)/kernel.elf: $(OSKOBJ) os/link.ld
 	$(OSCC) -static -nostartfiles -fno-pie -no-pie -Wl,-T,os/link.ld -Wl,-z,max-page-size=4096 -o $@ $(OSKOBJ) -lgcc
 	objcopy -O elf32-i386 $@ $(OSB)/kernel32.elf
 
+# the same objects linked at 16 MiB for UEFI: firmware keeps (ACPI NVS, runtime) memory inside the first 24 MiB
+$(OSB)/link-uefi.ld: os/link.ld
+	sed 's/\. = 1M;/. = 0x1000000;/' $< > $@
+$(OSB)/kernel-uefi.elf: $(OSKOBJ) $(OSB)/link-uefi.ld
+	$(OSCC) -static -nostartfiles -fno-pie -no-pie -Wl,-T,$(OSB)/link-uefi.ld -Wl,-z,max-page-size=4096 -o $@ $(OSKOBJ) -lgcc
+	objcopy -O elf32-i386 $@ $(OSB)/kernel-uefi32.elf
+
 $(OSB)/sprintos.iso: $(OSB)/kernel.elf os/boot/grub.cfg
 	rm -rf $(OSB)/iso && mkdir -p $(OSB)/iso/boot/grub
 	cp $(OSB)/kernel32.elf $(OSB)/iso/boot/kernel.elf
@@ -89,7 +96,14 @@ $(OSB)/sprintos.img: $(OSB)/kernel.elf os/boot/sprintboot.sp stdlib/asm.sp $(BUI
 $(OSB)/sprintos-test.img: $(OSB)/kernel.elf os/boot/sprintboot.sp stdlib/asm.sp $(BUILD)/sprint
 	$(BUILD)/sprint run --allow-read=$(OSB) --allow-write=$(OSB) os/boot/sprintboot.sp $(OSB)/kernel32.elf $@ "init=init"
 
-.PHONY: os os-check os-kernel os-user os-iso os-run os-test os-img os-img-run os-img-test
+# ---- UEFI: a GPT disk image with an EFI System Partition, loader and image generator written in Sprint (os/boot/uefiboot.sp) ----
+UEFI_SP  := os/boot/uefiboot.sp os/boot/uefi_pe.sp os/boot/diskimg.sp stdlib/asm.sp
+$(OSB)/sprintos-uefi.img: $(OSB)/kernel-uefi.elf $(UEFI_SP) $(BUILD)/sprint
+	$(BUILD)/sprint run --allow-read=$(OSB) --allow-write=$(OSB) os/boot/uefiboot.sp $(OSB)/kernel-uefi32.elf $@ "init=boot"
+$(OSB)/sprintos-uefi-test.img: $(OSB)/kernel-uefi.elf $(UEFI_SP) $(BUILD)/sprint
+	$(BUILD)/sprint run --allow-read=$(OSB) --allow-write=$(OSB) os/boot/uefiboot.sp $(OSB)/kernel-uefi32.elf $@ "init=init"
+
+.PHONY: os os-check os-kernel os-user os-iso os-run os-test os-img os-img-run os-img-test os-uefi os-uefi-run os-uefi-test
 # `make os`: check the tools, then build the bootable ISO
 os: os-check os-iso
 	@echo "ISO ready: $(OSB)/sprintos.iso   (try: make os-run)"
@@ -110,3 +124,11 @@ os-img-run: $(OSB)/sprintos.img
 # the same checks as os-test, but booted by the Sprint bootloader from a disk image
 os-img-test: $(OSB)/sprintos-test.img $(OSB)/sprintos.img
 	python3 os/tests/qemu_test.py $(OSB)/sprintos-test.img $(OSB)/sprintos.img
+
+os-uefi: $(OSB)/sprintos-uefi.img
+# OVMF (apt install ovmf) is the UEFI firmware for QEMU
+OVMF ?= $(firstword $(wildcard /usr/share/ovmf/OVMF.fd /usr/share/OVMF/OVMF.fd /usr/share/qemu/OVMF.fd))
+os-uefi-run: $(OSB)/sprintos-uefi.img
+	qemu-system-x86_64 -m 256 -bios $(OVMF) -drive format=raw,file=$< -serial stdio
+os-uefi-test: $(OSB)/sprintos-uefi-test.img $(OSB)/sprintos-uefi.img
+	SPRINT_OVMF=$(OVMF) python3 os/tests/qemu_test.py $(OSB)/sprintos-uefi-test.img $(OSB)/sprintos-uefi.img
