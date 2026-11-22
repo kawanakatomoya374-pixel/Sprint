@@ -18,13 +18,15 @@
 |---|---|
 | `ffi.open(name = nil)` | 共有ライブラリを開く（`dlopen`）。`nil`は実行中のprogram（libc・libmなど）。失敗は`IOError`。返す`Lib`は`addr(name)`（symbolのaddress）`fn(name, decl = nil)`（`decl`は`"double sqrt(double)"`のような宣言。省略時は`cdef`の宣言）`bind(names)`（名前→関数のtable）を持つ |
 | `ffi.fn_at(address, decl)` | 関数pointerを関数にする（宣言は`"int(int, int)"`の形も可） |
-| `ffi.callback(decl, fn)` | Sprintの関数`fn`をC関数pointerにする（`Callback`: `addr()` `release()`）。戻り値の種類（整数系/浮動小数点）ごとに16個まで同時に有効。`fn`でerrorが起きると、そのコールバックを起こした呼出しからerrorが伝わる。**宣言した関数pointer引数に関数を直接渡すと、その呼出しの間だけ自動でcallbackにする** |
+| `ffi.callback(decl, fn)` | Sprintの関数`fn`をC関数pointerにする（`Callback`: `addr()` `release()`）。同時に有効なのは最大4096個（実行時に生成する小さな入口スタブを使う。解放したスロットは再利用される）。`fn`でerrorが起きると、そのコールバックを起こした呼出しからerrorが伝わる。**宣言した関数pointer引数に関数を直接渡すと、その呼出しの間だけ自動でcallbackにする** |
 | `ffi.new(type, init = nil)` | `"struct P"`/`"P"`（`Struct`）、`"int[8]"`（`Arr`）、`"double"`（要素1の`Arr`）を割り当てる。0で初期化され、GCされる |
 | `ffi.array(code, n, init = nil)` / `ffi.cstr(s)` / `ffi.view(address, code, n)` | 型付き配列 / NUL終端の`char`配列 / 既存メモリの窓（範囲検査はnだけ） |
 | `Arr` | `get(i)` `set(i, v)`（範囲外は`IndexError`）`count()` `to_array()` `fill_from(xs)` `str()` `addr()` |
 | `Struct` | `get(name, i = nil)` `set(name, v, i = nil)`（入れ子は`Struct`、配列メンバは`Arr`、`char *`はstring）`str(name)` `to_table()` `addr()` `size()` |
 | `ffi.cast(type, address)` | addressを構造体の窓として見る。`T *`を返す宣言の関数は、返り値を自動で`Struct`にする |
 | `ffi.string(x, n = nil)` / `ffi.addr(x)` | addressや配列からstringへ / 値（int・view・buffer）からaddressへ |
+| `ffi.asm(code, decl)` | 機械語（0〜255の整数のarray）をC ABIの関数にする（アセンブラのソースからは`asm.function(src, decl)`、§15.21）。`--allow-asm`が別に要る（`--allow-ffi`では足りず、`--deterministic`では常に拒否） |
+| `ffi.at(type, address)` / `lib.var(name, type)` | アドレス（またはライブラリのグローバル変数）をCの型のビューにする。スカラ・ポインタは1要素の`Arr`（`get(0)`/`set(0, v)`）、`"int[8]"`は`Arr`、構造体/unionは`Struct`。`cdef`は`union`と`T x : n`のビットフィールドも受け付ける（レイアウトはSysV、`get`/`set`がマスクと符号拡張を行う） |
 | `ffi.sizeof(type)` `ffi.offsetof(type, field)` `ffi.abi()` `ffi.NULL` `ffi.consts` | |
 
 関数に`Struct`・`Arr`・bufferを渡すと、そのaddressが渡る。Cが保持し続けるメモリは、Sprint側の値（`Arr`など）が生きている間だけ有効である。libraryは閉じない（`dlclose`しない）。

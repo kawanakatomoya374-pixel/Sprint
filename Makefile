@@ -426,3 +426,13 @@ jit-regen-a64: tools/jitgen.c tools/jitlayout.c src/runtime/jit/stencils_a64.S
 	$(GEN)/jitgen $(GEN)/stencils_a64.o src/runtime/jit/stencils.h > src/runtime/jit/stencils_a64.h
 test-arm64: $(BUILD)/sprint-a64
 	@SPRINT_A64=$(BUILD)/sprint-a64 sh tools/arm64/test.sh
+
+# the Sprint assembler against NASM (needs nasm): ~37000 instruction encodings in 16/32/64-bit mode plus label-heavy programs
+asm-check: $(BUILD)/sprint
+	python3 tools/asm/check.py
+.PHONY: asm-check
+
+# boots the bootloader that examples/boot/boot.sp assembles (all in Sprint) under QEMU, up to 64-bit long mode
+boot-test: $(BUILD)/sprint
+	@SPRINT=$(BUILD)/sprint sh tests/boot/run.sh
+.PHONY: boot-test

@@ -606,6 +606,51 @@ static int write_impl(VM *vm, SpValue *argv, int append) {
 static int fs_write_file(VM *vm, int argc, SpValue *argv, SpValue *ret) { (void)argc; (void)ret; return write_impl(vm, argv, 0); }
 static int fs_append_file(VM *vm, int argc, SpValue *argv, SpValue *ret) { (void)argc; (void)ret; return write_impl(vm, argv, 1); }
 
+/* write_bytes(path, data): data is an array (or typed array) of ints 0..255, written as raw bytes (boot sectors, images, machine code) */
+static int fs_write_bytes(VM *vm, int argc, SpValue *argv, SpValue *ret) {
+    (void)argc; (void)ret;
+    char rp[PATH_MAX];
+    if (fs_check(vm, argv[0], 1, "write", rp)) return 1;
+    int64_t n = 0;
+    int is_arr = argv[1].type == T_ARRAY;
+    if (is_arr) n = AS_ARRAY(argv[1])->len;
+    else if (argv[1].type == T_NATIVE && typed_kind(argv[1]) >= 0 && typed_kind(argv[1]) <= 8) n = typed_len(argv[1]);
+    else return vm_set_error(vm, E_TYPE, "write_bytes() needs an array of bytes, not %s", type_name(argv[1]));
+    unsigned char *buf = malloc((size_t)(n > 0 ? n : 1));
+    if (!buf) return vm_set_error(vm, E_MEMORY, "out of memory");
+    for (int64_t i = 0; i < n; i++) {
+        SpValue v;
+        if (is_arr) v = array_get(AS_ARRAY(argv[1]), i);
+        else if (typed_peek(argv[1], v_int(i), &v)) v = v_nil();
+        if (v.type != T_INT || v.as.i < 0 || v.as.i > 255) { free(buf); return vm_set_error(vm, E_VALUE, "byte %lld is not an int in 0..255", (long long)i); }
+        buf[i] = (unsigned char)v.as.i;
+    }
+    FILE *f = fopen(rp, "wb");
+    if (!f) { free(buf); return io_fail(vm, errno, "write", AS_STR(argv[0])->dp); }
+    int ok = fwrite(buf, 1, (size_t)n, f) == (size_t)n;
+    int e = errno;
+    if (fclose(f) != 0) ok = 0;
+    free(buf);
+    return ok ? 0 : io_fail(vm, e ? e : EIO, "write", AS_STR(argv[0])->dp);
+}
+
+/* read_bytes(path) -> array of ints 0..255 */
+static int fs_read_bytes(VM *vm, int argc, SpValue *argv, SpValue *ret) {
+    (void)argc;
+    char rp[PATH_MAX];
+    if (fs_check(vm, argv[0], 0, "read", rp)) return 1;
+    size_t len = 0;
+    char *b = sp_read_file(rp, &len);
+    if (!b) return io_fail(vm, errno ? errno : EIO, "read", AS_STR(argv[0])->dp);
+    SArray *a = vm_new_array(vm, (int64_t)len);
+    if (!a) { free(b); return vm_set_error(vm, E_MEMORY, "out of memory"); }
+    for (size_t i = 0; i < len; i++)
+        if (array_push(vm, a, v_int((unsigned char)b[i]))) { free(b); return 1; }
+    free(b);
+    *ret = v_obj(T_ARRAY, a);
+    return 0;
+}
+
 static int stat_impl(VM *vm, SpValue *argv, SpValue *ret, int kind) {
     char rp[PATH_MAX];
     if (fs_check(vm, argv[0], 0, "stat", rp)) return 1;
@@ -677,6 +722,7 @@ static int fs_remove(VM *vm, int argc, SpValue *argv, SpValue *ret) {
 }
 const NativeDesc lib_fs_fns[] = {
     {"read_file", 1, 1, fs_read_file}, {"write_file", 2, 2, fs_write_file},
+    {"read_bytes", 1, 1, fs_read_bytes}, {"write_bytes", 2, 2, fs_write_bytes},
     {"append_file", 2, 2, fs_append_file}, {"exists", 1, 1, fs_exists},
     {"is_file", 1, 1, fs_is_file}, {"is_dir", 1, 1, fs_is_dir},
     {"list_dir", 1, 1, fs_list_dir}, {"make_dir", 1, 1, fs_make_dir},

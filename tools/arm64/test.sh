@@ -13,7 +13,7 @@ for f in tests/cases/jit/*.sp tests/cases/lang/*.sp tests/cases/syntax/*.sp test
     done
 done
 # ffi tests that need only libc (not the x86-64 build/libctest.so)
-for f in tests/ffi/ffi_union_bits tests/ffi/ffi_global tests/ffi/ffi_callback_libc; do
+for f in tests/ffi/ffi_union_bits tests/ffi/ffi_global tests/ffi/ffi_callback_libc tests/cases/stdlib/asm_basic; do
     out=$(timeout 300 tools/arm64/sprint-a64 run --allow-ffi "$f.sp" 2>/dev/null)
     if [ "$out" = "$(cat "$f.out")" ]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL $f"; fi
 done
