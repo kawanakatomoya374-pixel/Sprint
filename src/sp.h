@@ -1047,7 +1047,7 @@ int op_len(int op);
 /* ------------------------------------------------------------------ */
 /* stdlib                                                              */
 /* ------------------------------------------------------------------ */
-extern const NativeDesc lib_json_fns[], lib_random_fns[], lib_fs_fns[], lib_typed_fns[], lib_hash_fns[];
+extern const NativeDesc lib_json_fns[], lib_random_fns[], lib_fs_fns[], lib_typed_fns[], lib_hash_fns[], lib_sslcore_fns[];
 /* typed arrays (lib_typed.c): native objects holding unboxed numbers */
 /* element kinds of a typed array; the JIT reads the element straight from the payload (layout: TypedHdr, then the elements) */
 typedef enum TKind { TK_I8, TK_U8, TK_I16, TK_U16, TK_I32, TK_U32, TK_I64, TK_F32, TK_F64, TK_COUNT } TKind;
@@ -1059,6 +1059,7 @@ static inline int typed_is(SpValue v) {
 }
 int64_t typed_len(SpValue v);
 SpValue typed_u8_from(VM *vm, const unsigned char *b, size_t n);
+unsigned char *typed_u8_data(SpValue v);
 int typed_kind(SpValue v);
 int typed_peek(SpValue o, SpValue k, SpValue *out);
 int typed_poke(SpValue o, SpValue k, SpValue v);

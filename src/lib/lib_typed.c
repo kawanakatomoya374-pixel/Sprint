@@ -133,6 +133,9 @@ SpValue typed_u8_from(VM *vm, const unsigned char *b, size_t n) {
     return v;
 }
 
+/* the bytes of a typed.u8 (NULL for any other value): lets natives such as sslcore read and fill byte buffers without copying */
+unsigned char *typed_u8_data(SpValue v) { return typed_is(v) && tarr(v)->kind == TK_U8 ? tarr(v)->b : NULL; }
+
 /* typed.<kind>(n) or typed.<kind>(array) */
 static int make(VM *vm, TKind kind, SpValue arg, SpValue *ret) {
     int64_t n;
