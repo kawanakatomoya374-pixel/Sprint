@@ -19,6 +19,12 @@ for f in examples/basics/*.sp examples/gfx/*.sp examples/gui/*.sp examples/os/*.
     if [ "$out" = "$(cat "$exp")" ] && [ "$rc" = 0 ]; then pass=$((pass+1))
     else fail=$((fail+1)); echo "FAIL $f (rc=$rc)"; fi
 done
+# SprintSSL: known-answer, X.509 and TLS loopback tests print "true" as their last line when every check passed
+for f in sprintssl/tests/*.sp; do
+    out=$("$SPRINT" run --deterministic --allow-read=sprintssl/tests "$f" 2>/dev/null | tail -n 1); rc=$?
+    if [ "$out" = "true" ]; then pass=$((pass+1))
+    else fail=$((fail+1)); echo "FAIL $f"; fi
+done
 for d in tests/mods/*/; do
     d=${d%/}
     f=$d/main.sp; [ -f "$f" ] || f=$d/src/main.sp

@@ -584,7 +584,7 @@ export class Stack:
             p16(q, 1)
             self.udp_send(s, self.dns, self.dns_port, q)
             let t0 = self.clock()
-            let wait = timeout / 3
+            let wait = timeout // 3
             while self.clock() - t0 < wait:
                 let r = self.udp_recv(s, wait - (self.clock() - t0))
                 if r == nil:

@@ -142,3 +142,12 @@ x86-64 の JIT（領域 JIT・TraceJIT・純関数 JIT）は、カーネル自�
 検証: `make os-smp-test` — システムコールを連続で呼ぶ 4 プロセス（各呼び出しがカーネルの Sprint コードを走らせる）の所要時間。大カーネルロックの旧設計は 1/2/4 CPU で 11.2 / 9.2 / 12.0 秒（増やしても速くならない）、CPU ごとの VM は 11.9 / 6.0 / 3.0 秒（ほぼ直線的）。ホストの物理コア数（テスト環境は 4）を超える vCPU では QEMU の都合で伸びない。
 
 修正した不具合（SMP の本当の欠陥）: プロセスが終わるとそのページテーブルを解放するが、**その CPU はトラップのあともそのプロセスの CR3 のままカーネルを実行していた**（待機中の `hlt` の CPU も、前に動かしたプロセスの CR3 を持ち続ける）。解放されたページが別のプロセスのために 0 クリアされると、カーネル自身の写像（PML4 の 0 番）が消え、カーネルが落ちる。以前の「2 CPU で約 1 割落ちる」現象と、4 CPU 以上で止まる現象の原因はこれ。いまはユーザからのトラップの入口（`cpu.S` の `save_user`）で必ずカーネルの CR3 に戻す。修正後、2 CPU のセルフテストを 20 回連続で通した。
+
+## SprintSSL（TLS）
+
+`sprintssl/` は独立したフォルダ（コピーして取り出せる）。速さに効く部分は C（`sprintssl/c/`、モジュール `sslcore`）、それ以外は Sprint（`sprintssl/sp/`）。インタプリタのビルドが `sprintssl/c/*.c` を取り込み、`.sp` は標準ライブラリと同じく同梱されるので、ホストでも SprintOS のユーザープロセスでも `import sprintssl` で使える。
+
+- **C の核**: SHA-256/384/512、HMAC、HKDF、AES-GCM（128/256）、ChaCha20-Poly1305、X25519、Ed25519（署名と検証）、RSA 公開演算、ECDSA 検証と ECDH（P-256 / P-384）、乱数。Python の `cryptography` と RFC のテストベクトルで確認（`sprintssl/tests/kat_test.sp`）。
+- **Sprint 側**: DER（`sslasn1`）、X.509（`sslx509`: PEM、署名検証（RSA PKCS#1 v1.5 / PSS、ECDSA、Ed25519）、チェーン検証、期間、ホスト名（SAN・ワイルドカード・IP）、CA と経路長）、TLS 1.3（`ssltls`: レコード層、鍵スケジュール、クライアント、テスト用の小さなサーバー、KeyUpdate）、入口（`sprintssl`: `connect`、`TcpTransport`（`netstack` の TCP を載せる）、`http_get`）。
+- **確認**: `make test` が `sprintssl/tests/*.sp`（既知解、X.509 のチェーン、メモリ内のクライアント↔サーバー）を回す。`make os-net-test` は QEMU のゲスト（SprintOS）から、ホスト上の Python `ssl` サーバー（ECDSA P-256 + 中間 CA、RSA、Ed25519。200000 バイトの本文、信頼できないチェーンの拒否）と、**GitHub Pages**（`octocat.github.io`。ホストの TCP 中継を通すが、TLS はゲストと GitHub の間で完結し、実際の証明書チェーン Let's Encrypt → ISRG Root X1 を検証する）へ HTTPS で接続する。
+- **限界**: TLS 1.2・再開・クライアント証明書・HelloRetryRequest・失効確認は無い。秘密のスカラーを使う ECDH は定数時間ではない。QEMU の既定 CPU には RDRAND が無く、乱数の質は呼び出し側が与える種（`sslcore.seed`）次第（テスト用）。ルート証明書の一式はまだ SprintOS に同梱していない（呼び出し側が渡す）。

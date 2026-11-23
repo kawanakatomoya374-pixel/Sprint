@@ -14,7 +14,7 @@ CC       ?= gcc
 BUILD    ?= build
 .DEFAULT_GOAL := all
 GEN      := $(BUILD)/gen
-STDSRC   := $(wildcard stdlib/*.sp)
+STDSRC   := $(wildcard stdlib/*.sp) $(wildcard sprintssl/sp/*.sp)
 # gui is kept as ordered parts (stdlib/gui/NN_*.sp) and embedded as one module
 GUIPARTS := $(sort $(wildcard stdlib/gui/*.sp))
 

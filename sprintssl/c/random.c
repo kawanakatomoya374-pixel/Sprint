@@ -4,7 +4,7 @@
  * caller supplied: SprintOS feeds it clock readings, the network card's MAC address and interrupt timing, which is NOT enough for production use. */
 #include <string.h>
 #include "sslcore.h"
-#if !defined(SP_OS) && defined(__linux__)
+#if !defined(SP_OS) && !defined(SP_OS_USER) && defined(__linux__)
 #include <sys/random.h>
 #endif
 
@@ -53,7 +53,7 @@ void ssl_random_seed(const uint8_t *p, size_t n) {
 void ssl_random(uint8_t *out, size_t n) {
     uint8_t e[64];
     size_t el = 0;
-#if !defined(SP_OS) && defined(__linux__)
+#if !defined(SP_OS) && !defined(SP_OS_USER) && defined(__linux__)
     ssize_t got = getrandom(e, 32, 0);
     if (got > 0) el = (size_t)got;
 #endif

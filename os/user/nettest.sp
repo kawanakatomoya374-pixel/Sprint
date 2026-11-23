@@ -7,6 +7,10 @@ import netstack
 import netlink
 import str
 import io
+import sslcore
+import sprintssl
+import urtc
+import testroots
 
 const HOST = "10.0.2.2"
 
@@ -71,6 +75,56 @@ if got:
             back.extend(p)
         say("nettest: tcp client", len(back), "bytes back, match", fnv(back) == fnv(upper(data)), "in", sys.ms() - t1, "ms")
         st.tcp_close(c)
+
+    # TLS 1.3 against python's ssl module on the host: an ECDSA leaf under an ECDSA intermediate, an RSA leaf (RSA-PSS signature), an Ed25519 leaf
+    sslcore.seed(sslcore.from_str(to_string(sys.ms()) .. netstack.mac_str(link.mac)))
+    let now = nil
+    try:
+        now = sprintssl.unix_time(urtc.now())
+    catch e:
+        now = nil
+    say("nettest: tls clock", "none" if now == nil else to_string(now))
+    let roots = sprintssl.load_roots(testroots.INTEROP_ROOT)
+    let others = sprintssl.load_roots(testroots.OTHER_ROOT)
+    let names = ["ec", "rsa", "ed"]
+    for i in range(3):
+        let tc = st.tcp_connect(host, 18443 + i, 5000)
+        if tc == nil:
+            say("nettest: tls", names[i], "tcp connect failed")
+            continue
+        let tt = sprintssl.TcpTransport(st, tc)
+        try:
+            let t2 = sys.ms()
+            let conn = sprintssl.connect(tt, "interop.test", roots, now)
+            let r = sprintssl.http_get(conn, "interop.test", "/hello")
+            say("nettest: tls", names[i], conn.suite.name, "status", r.status, "body", sslcore.to_str(r.body), "in", sys.ms() - t2, "ms")
+            if i == 0:
+                let big = sprintssl.http_get(conn, "interop.test", "/big")
+                say("nettest: tls big", len(big.body), "bytes")
+            conn.close()
+        catch e:
+            say("nettest: tls", names[i], "failed:", to_string(e))
+        st.tcp_close(tc)
+    # GitHub Pages: the host relays port 18500 to octocat.github.io:443 through the proxy (a plain TCP tunnel, so the TLS session is between the guest and GitHub)
+    let tg = st.tcp_connect(host, 18500, 5000)
+    if tg != nil:
+        try:
+            let t3 = sys.ms()
+            let gh = sprintssl.connect(sprintssl.TcpTransport(st, tg), "octocat.github.io", sprintssl.load_roots(testroots.ISRG_ROOT_X1), now, ["http/1.1"])
+            let gr = sprintssl.http_get(gh, "octocat.github.io", "/")
+            say("nettest: github.io", gh.suite.name, "status", gr.status, "body", to_string(len(gr.body)) .. " bytes, server " .. to_string(gr.headers["server"]), "in", sys.ms() - t3, "ms")
+            gh.close()
+        catch e:
+            say("nettest: github.io failed:", to_string(e))
+        st.tcp_close(tg)
+    let tc2 = st.tcp_connect(host, 18443, 5000)
+    let tt2 = sprintssl.TcpTransport(st, tc2)
+    try:
+        let conn2 = sprintssl.connect(tt2, "interop.test", others, now)
+        say("nettest: tls wrong root: accepted (BAD)")
+    catch e:
+        say("nettest: tls wrong root refused:", to_string(e))
+    st.tcp_close(tc2)
 
     let l = st.tcp_listen(LISTEN_PORT)
     say("nettest: listening", LISTEN_PORT)
