@@ -5,11 +5,13 @@ import lapic
 import acpi
 import sched
 import ksys
+import kdisk
 
 func log(s):
     ksys.log(s)
 
 log("physical pages: " .. to_string(kmem.init()))
+kdisk.mount_all()
 let img = hw.initrd()
 log("userland image: " .. to_string(img[1]) .. " bytes")
 let per_ms = lapic.start(10)

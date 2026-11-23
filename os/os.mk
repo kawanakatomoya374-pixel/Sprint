@@ -129,6 +129,10 @@ os-img-run: $(OSB)/sprintos.img
 os-img-test: $(OSB)/sprintos-test.img $(OSB)/sprintos.img
 	python3 os/tests/qemu_test.py $(OSB)/sprintos-test.img $(OSB)/sprintos.img
 
+# a second ATA disk formatted with SprintFS: the Sprint kernel mounts it, reads and writes it
+os-disk-test: $(OSB)/sprintos-test.img $(BUILD)/sprint
+	python3 os/tests/disk_test.py $(OSB)/sprintos-test.img
+
 os-hybrid: $(OSB)/sprintos-hybrid.img
 os-hybrid-run: $(OSB)/sprintos-hybrid.img
 	qemu-system-x86_64 -m 256 -drive format=raw,file=$< -serial stdio
