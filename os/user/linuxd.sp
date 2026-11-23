@@ -52,6 +52,10 @@ func log(s):
     print("[linuxd] " .. s)
     io.flush()
 
+# a C int argument arrives zero-extended in its 64-bit register: make it signed again
+func i32(v):
+    return v - 4294967296 if v >= 2147483648 and v < 4294967296 else v
+
 func align_up(v):
     return (v + 4095) & ~4095
 
@@ -277,8 +281,34 @@ func load_elf(pid, img, bias):
         phdr = first_load[0] - first_load[1] + phoff
     return {entry: u64(img, 24) + b, phdr: phdr + b, phent: phent, phnum: phnum, base: b, top: align_up(top + b), interp: interp}
 
+# a small cache of whole files (libraries and programs are read again and again): path -> [size, mtime, bytes]
+let fcache = {}
+let fcache_bytes = 0
+func cache_drop(path):
+    let e = fcache[path]
+    if e != nil:
+        fcache_bytes -= len(e[2])
+        fcache[path] = nil
+
+func cached_file(path):
+    let st = fs.stat(path)
+    if st.size > (8 << 20):
+        return nil
+    let e = fcache[path]
+    if e != nil and e[0] == st.size and e[1] == st.mtime:
+        return e[2]
+    cache_drop(path)
+    if fcache_bytes + st.size > (48 << 20):
+        fcache = {}
+        fcache_bytes = 0
+    let data = fs.read_bytes(path)
+    fcache[path] = [st.size, st.mtime, data]
+    fcache_bytes += len(data)
+    return data
+
 func read_file(path):
-    return fs.read_bytes(path)
+    let d = cached_file(path)
+    return d if d != nil else fs.read_bytes(path)
 
 # the initial stack: argc, argv, envp and the auxiliary vector; returns the stack pointer
 func build_stack(pid, argv, envp, info, interp_base):
@@ -329,8 +359,7 @@ func build_stack(pid, argv, envp, info, interp_base):
     for w in words:
         for i in range(8):
             buf.append((w >> (8 * i)) & 255)
-    let all = sslcore.concat([buf, area])
-    if lx.write(pid, sp, all) != 0:
+    if lx.write(pid, sp, sslcore.concat([buf])) != 0 or lx.write(pid, abase, sslcore.concat([area])) != 0:
         return nil
     return sp
 
@@ -419,6 +448,7 @@ func do_write(g, f, b):
         try:
             if f.append:
                 f.pos = fs.stat(f.path).size
+            cache_drop(f.path)
             fs.write_bytes(f.path, b, f.pos, false)
         catch e:
             return -errno_of(e.kind)
@@ -426,6 +456,8 @@ func do_write(g, f, b):
         return len(b)
     if f.kind == "null":
         return len(b)
+    if f.kind == "eventfd":
+        return eventfd_write(g, f, b)
     if f.kind == "pipe" and f.end == "w":
         let p = f.pipe
         if p.readers == 0:
@@ -479,6 +511,9 @@ func do_read(g, f, n, off):
         let want = imin(n, size - at)
         if want <= 0:
             return sslcore.concat([[]])
+        let whole = cached_file(f.path)
+        if whole != nil:
+            return whole.slice(at, at + want)
         return fs.read_bytes(f.path, at, want)
     catch e:
         return -errno_of(e.kind)
@@ -489,6 +524,8 @@ func sys_read(g, a):
         return -EBADF
     if f.kind == "dir":
         return -EISDIR
+    if f.kind == "eventfd":
+        return eventfd_read(g, f, a[1])
     if f.kind == "pipe":
         if f.end != "r":
             return -EBADF
@@ -527,6 +564,7 @@ func sys_pwrite(g, a):
     if b == nil:
         return -EFAULT
     try:
+        cache_drop(f.path)
         fs.write_bytes(f.path, b, a[3], false)
     catch e:
         return -errno_of(e.kind)
@@ -556,6 +594,8 @@ func sys_lseek(g, a):
 
 func do_open(g, path, flags, mode):
     let p = abspath(g, path)
+    if verbose == "paths":
+        log("open " .. p .. " by " .. to_string(g.pid))
     if p == "/dev/null":
         return g.alloc_fd({kind: "null"})
     if p == "/dev/zero":
@@ -604,8 +644,8 @@ func sys_openat(g, a):
     let path = cstr(g, a[1])
     if path == nil:
         return -EFAULT
-    if a[0] != AT_FDCWD and not path.starts_with("/"):
-        let d = g.fds[a[0]]
+    if i32(a[0]) != AT_FDCWD and not path.starts_with("/"):
+        let d = g.fds[i32(a[0])]
         if d == nil or d.kind != "dir":
             return -EBADF
         path = d.path .. "/" .. path
@@ -618,6 +658,14 @@ func sys_close(g, a):
     g.fds[a[0]] = nil
     fclose(f)
     return 0
+
+# a stable inode number for a path (the file system server does not report one): FNV-1a of the path
+func path_ino(p):
+    let h = 2166136261
+    let b = sslcore.from_str(p)
+    for x in b:
+        h = ((h ^ x) * 16777619) & 0xFFFFFFFF
+    return h + 2
 
 # struct stat (144 bytes)
 func fill_stat(kind, size, mtime, ino):
@@ -646,7 +694,7 @@ func stat_path(g, p, buf):
         return wr(g, buf, b)
     try:
         let st = fs.stat(ap)
-        return wr(g, buf, fill_stat(st.kind, st.size, st.mtime, 1000 + len(ap)))
+        return wr(g, buf, fill_stat(st.kind, st.size, st.mtime, path_ino(ap)))
     catch e:
         return -errno_of(e.kind)
 
@@ -671,6 +719,12 @@ func sys_fstat(g, a):
         b[24] = 0o20666 & 255
         b[25] = (0o20666 >> 8) & 255
         return wr(g, a[1], b)
+    if f.kind == "pipe" or f.kind == "eventfd" or f.kind == "epoll" or f.kind == "sock":
+        let b = fill_stat("file", 0, 0, 7)
+        let m = 0o140777 if f.kind == "sock" else (0o10600 if f.kind == "pipe" else 0o600)
+        b[24] = m & 255
+        b[25] = (m >> 8) & 255
+        return wr(g, a[1], b)
     return stat_path(g, f.path, a[1])
 
 func sys_newfstatat(g, a):
@@ -679,8 +733,8 @@ func sys_newfstatat(g, a):
         return -EFAULT
     if path == "" and (a[3] & 0x1000) != 0:
         return sys_fstat(g, [a[0], a[2]])
-    if a[0] != AT_FDCWD and not path.starts_with("/"):
-        let d = g.fds[a[0]]
+    if i32(a[0]) != AT_FDCWD and not path.starts_with("/"):
+        let d = g.fds[i32(a[0])]
         if d == nil or d.kind != "dir":
             return -EBADF
         path = d.path .. "/" .. path
@@ -880,7 +934,7 @@ func sys_mmap(g, a):
         g.mmap_next += n + 4096
     let f = nil
     if (flags & 0x20) == 0:
-        f = g.fds[fd]
+        f = g.fds[i32(fd)]
         if f == nil or f.kind != "file":
             return -EBADF
     if lx.map(g.pid, addr, n, 3 if f != nil else (3 if (prot & 2) != 0 else 1)) != 0:
@@ -937,6 +991,8 @@ func finish(g, code, status):
     ended(g, status)
 
 func ended(g, status):
+    if verbose:
+        log("pid " .. to_string(g.pid) .. " ended at " .. to_string(psys.ms()) .. " after " .. to_string(g.calls) .. " calls")
     guests[g.pid] = nil
     for t in g.tids:
         if t != g.pid:
@@ -1102,7 +1158,7 @@ func sys_sched_getaffinity(g, a):
     return 8
 
 func sys_wait4(g, a):
-    let want = a[0]
+    let want = i32(a[0])
     let sp = a[1]
     for z in g.zombies:
         if want == -1 or want == z:
@@ -1136,7 +1192,7 @@ func deliver_signal(t, sig):
     return 0
 
 func sys_kill(g, a):
-    let t = guests[a[0]]
+    let t = guests[i32(a[0])]
     if t == nil:
         return -3
     return deliver_signal(t, a[1])
@@ -1203,8 +1259,11 @@ func sys_execve(g, a):
         catch e:
             return -errno_of(e.kind)
         p = line[0]
+    let t0 = psys.ms()
     lx.reset(g.pid)
     let r = setup_image(g.pid, img, p, argv, envp, g)
+    if verbose:
+        log("exec " .. p .. " took " .. to_string(psys.ms() - t0) .. " ms at " .. to_string(psys.ms()))
     if type(r) == "string":
         log("exec " .. p .. ": " .. r)
         finish(g, 127, 127 << 8)
@@ -1477,6 +1536,625 @@ func sys_sysinfo(g, a):
     put32(b, 104, 1)
     return wr(g, a[0], sslcore.concat([b]))
 
+
+# ================= more of the system call table (after C-OS's cos_linux.c) =================
+
+# a path argument relative to a directory descriptor
+func at_path(g, dirfd0, path):
+    let dirfd = i32(dirfd0)
+    if path.starts_with("/") or dirfd == AT_FDCWD:
+        return abspath(g, path)
+    let d = g.fds[dirfd]
+    if d == nil or d.kind != "dir":
+        return nil
+    return norm(d.path .. "/" .. path)
+
+func sys_readv(g, a):
+    let f = g.fds[a[0]]
+    if f == nil:
+        return -EBADF
+    let total = 0
+    for i in range(a[2]):
+        let iov = rd(g, a[1] + i * 16, 16)
+        if iov == nil:
+            return -EFAULT
+        let n = u64(iov, 8)
+        if n == 0:
+            continue
+        let r = sys_read(g, [a[0], u64(iov, 0), n])
+        if r == nil:
+            return nil if total == 0 else total
+        if r < 0:
+            return r if total == 0 else total
+        total += r
+        if r < n:
+            break
+    return total
+
+func sys_preadv(g, a):
+    let f = g.fds[a[0]]
+    if f == nil or f.kind != "file":
+        return -EBADF
+    let total = 0
+    for i in range(a[2]):
+        let iov = rd(g, a[1] + i * 16, 16)
+        if iov == nil:
+            return -EFAULT
+        let n = u64(iov, 8)
+        let r = sys_pread(g, [a[0], u64(iov, 0), n, a[3] + total])
+        if r < 0:
+            return r if total == 0 else total
+        total += r
+        if r < n:
+            break
+    return total
+
+func sys_pwritev(g, a):
+    let total = 0
+    for i in range(a[2]):
+        let iov = rd(g, a[1] + i * 16, 16)
+        if iov == nil:
+            return -EFAULT
+        let r = sys_pwrite(g, [a[0], u64(iov, 0), u64(iov, 8), a[3] + total])
+        if r < 0:
+            return r if total == 0 else total
+        total += r
+    return total
+
+func sys_creat(g, a):
+    let path = cstr(g, a[0])
+    if path == nil:
+        return -EFAULT
+    return do_open(g, path, 0o1101, a[1])
+
+func sys_truncate(g, a):
+    let path = cstr(g, a[0])
+    if path == nil:
+        return -EFAULT
+    try:
+        fs.truncate(abspath(g, path), a[1])
+    catch e:
+        return -errno_of(e.kind)
+    return 0
+
+func sys_fchdir(g, a):
+    let d = g.fds[a[0]]
+    if d == nil or d.kind != "dir":
+        return -EBADF
+    g.cwd = d.path
+    return 0
+
+func sys_statfs(g, a):
+    let b = []
+    for i in range(120):
+        b.append(0)
+    try:
+        let sf = fs.statfs()
+        put64(b, 0, 0x53707266)
+        put64(b, 8, 4096)
+        put64(b, 16, sf.blocks)
+        put64(b, 24, sf.free_blocks)
+        put64(b, 32, sf.free_blocks)
+        put64(b, 72, 255)
+        put64(b, 80, 4096)
+    catch e:
+        return -errno_of(e.kind)
+    return wr(g, a[1], sslcore.concat([b]))
+
+func sys_mkdirat(g, a):
+    let path = cstr(g, a[1])
+    if path == nil:
+        return -EFAULT
+    let p = at_path(g, a[0], path)
+    if p == nil:
+        return -EBADF
+    try:
+        fs.mkdir(p)
+    catch e:
+        return -errno_of(e.kind)
+    return 0
+
+func sys_unlinkat(g, a):
+    let path = cstr(g, a[1])
+    if path == nil:
+        return -EFAULT
+    let p = at_path(g, a[0], path)
+    if p == nil:
+        return -EBADF
+    try:
+        if (a[2] & 0x200) != 0:
+            fs.rmdir(p)
+        else:
+            fs.unlink(p)
+    catch e:
+        return -errno_of(e.kind)
+    return 0
+
+func sys_renameat(g, a):
+    let p1 = cstr(g, a[1])
+    let p2 = cstr(g, a[3])
+    if p1 == nil or p2 == nil:
+        return -EFAULT
+    let x = at_path(g, a[0], p1)
+    let y = at_path(g, a[2], p2)
+    if x == nil or y == nil:
+        return -EBADF
+    try:
+        fs.rename(x, y)
+    catch e:
+        return -errno_of(e.kind)
+    return 0
+
+func sys_readlinkat(g, a):
+    let path = cstr(g, a[1])
+    if path == nil:
+        return -EFAULT
+    let p = at_path(g, a[0], path)
+    if p == nil:
+        p = abspath(g, path)
+    return readlink_path(g, p, a[2], a[3])
+
+func readlink_path(g, p, buf, size):
+    if p == "/proc/self/exe":
+        let b = sslcore.from_str(g.exe)
+        let n = imin(len(b), size)
+        let r = wr(g, buf, b.slice(0, n))
+        return r if r < 0 else n
+    if p == "/proc/self/cwd":
+        let b = sslcore.from_str(g.cwd)
+        let n = imin(len(b), size)
+        let r = wr(g, buf, b.slice(0, n))
+        return r if r < 0 else n
+    return -EINVAL
+
+func sys_faccessat2(g, a):
+    let path = cstr(g, a[1])
+    if path == nil:
+        return -EFAULT
+    let p = at_path(g, a[0], path)
+    if p == nil:
+        return -EBADF
+    try:
+        return 0 if fs.exists(p) else -ENOENT
+    catch e:
+        return -errno_of(e.kind)
+
+func sys_dup3(g, a):
+    if a[0] == a[1]:
+        return -EINVAL
+    return sys_dup2(g, a)
+
+func sys_statx(g, a):
+    let path = cstr(g, a[1])
+    if path == nil:
+        return -EFAULT
+    let kind = "file"
+    let size = 0
+    let mtime = 0
+    let special = false
+    if path == "" and (a[2] & 0x1000) != 0:
+        let f = g.fds[a[0]]
+        if f == nil:
+            return -EBADF
+        if f.kind == "console" or f.kind == "stdin" or f.kind == "null" or f.kind == "zero" or f.kind == "random" or f.kind == "pipe":
+            special = true
+        else:
+            path = f.path
+    else:
+        path = at_path(g, a[0], path)
+        if path == nil:
+            return -EBADF
+    if not special:
+        try:
+            let st = fs.stat(path)
+            kind = st.kind
+            size = st.size
+            mtime = st.mtime
+        catch e:
+            return -errno_of(e.kind)
+    let b = []
+    for i in range(256):
+        b.append(0)
+    put32(b, 0, 0xfff)
+    put32(b, 4, 4096)
+    put32(b, 16, 2 if kind == "dir" else 1)
+    put16(b, 28, 0o20620 if special else (0o40755 if kind == "dir" else 0o100644))
+    put64(b, 32, path_ino(path))
+    put64(b, 40, size)
+    put64(b, 48, (size + 511) // 512)
+    for o in [64, 80, 96, 112]:
+        put64(b, o, mtime)
+    return wr(g, a[4], sslcore.concat([b]))
+
+func sys_getrlimit(g, a):
+    return sys_prlimit64(g, [0, a[0], 0, a[1]])
+
+func sys_time(g, a):
+    let t = now_us() // 1000000
+    if a[0] != 0:
+        let b = []
+        for i in range(8):
+            b.append(0)
+        put64(b, 0, t)
+        wr(g, a[0], sslcore.concat([b]))
+    return t
+
+func sys_times(g, a):
+    if a[0] != 0:
+        let b = []
+        for i in range(32):
+            b.append(0)
+        wr(g, a[0], sslcore.concat([b]))
+    return psys.ms() // 10
+
+func sys_getrusage(g, a):
+    let b = []
+    for i in range(144):
+        b.append(0)
+    return wr(g, a[1], sslcore.concat([b]))
+
+func sys_clock_getres(g, a):
+    if a[1] != 0:
+        let b = []
+        for i in range(16):
+            b.append(0)
+        put64(b, 8, 1000000)
+        return wr(g, a[1], sslcore.concat([b]))
+    return 0
+
+func sys_prctl(g, a):
+    return 0
+
+func sys_getgroups(g, a):
+    return 0
+
+func sys_umask(g, a):
+    return 0o22
+
+func sys_getcpu(g, a):
+    if a[0] != 0:
+        wr(g, a[0], sslcore.concat([[0, 0, 0, 0]]))
+    if a[1] != 0:
+        wr(g, a[1], sslcore.concat([[0, 0, 0, 0]]))
+    return 0
+
+func sys_getresuid(g, a):
+    for i in range(3):
+        wr(g, a[i], sslcore.concat([[0, 0, 0, 0]]))
+    return 0
+
+func sys_close_range(g, a):
+    for fd in range(a[0], imin(a[1], 4096) + 1):
+        let f = g.fds[fd]
+        if f != nil:
+            g.fds[fd] = nil
+            fclose(f)
+    return 0
+
+func sys_sendfile(g, a):
+    let out = g.fds[a[0]]
+    let inp = g.fds[a[1]]
+    if out == nil or inp == nil:
+        return -EBADF
+    let off = -1
+    if a[2] != 0:
+        let ob = rd(g, a[2], 8)
+        if ob == nil:
+            return -EFAULT
+        off = u64(ob, 0)
+    let data = do_read(g, inp, a[3], off)
+    if type(data) == "int":
+        return data
+    let r = do_write(g, out, data)
+    if r < 0:
+        return r
+    if a[2] != 0:
+        let nb = []
+        for i in range(8):
+            nb.append(0)
+        put64(nb, 0, off + r)
+        wr(g, a[2], sslcore.concat([nb]))
+    elif inp.kind == "file":
+        inp.pos += r
+    return r
+
+func sys_copy_file_range(g, a):
+    let inp = g.fds[a[0]]
+    let out = g.fds[a[2]]
+    if inp == nil or out == nil:
+        return -EBADF
+    let data = do_read(g, inp, a[4], -1)
+    if type(data) == "int":
+        return data
+    if inp.kind == "file":
+        inp.pos += len(data)
+    return do_write(g, out, data)
+
+func sys_noop_ok(g, a):
+    return 0
+
+# ---- readiness: poll, select, epoll, eventfd ----
+const POLLIN = 1
+const POLLOUT = 4
+const POLLERR = 8
+const POLLHUP = 16
+
+let waiters = []     # [thread, check function, deadline (0 = none), result on timeout]
+
+# block the calling thread until check() gives a result (not nil), or the timeout; timeout_ms < 0: for ever, 0: do not wait
+func block(check, timeout_ms, tres):
+    let r = check()
+    if r != nil:
+        return r
+    if timeout_ms == 0:
+        return tres
+    waiters.append([cur_tid, check, 0 if timeout_ms < 0 else psys.ms() + timeout_ms, tres])
+    return nil
+
+func recheck():
+    if len(waiters) == 0:
+        return nil
+    let now = psys.ms()
+    let keep = []
+    let list = waiters
+    waiters = []
+    for w in list:
+        if tmap[w[0]] == nil:
+            continue
+        let r = w[1]()
+        if r == nil and w[2] != 0 and now >= w[2]:
+            r = w[3]
+        if r != nil:
+            lx.reply(w[0], r)
+        else:
+            keep.append(w)
+    for w in waiters:
+        keep.append(w)
+    waiters = keep
+
+func waiter_deadline():
+    let best = 0
+    for w in waiters:
+        if w[2] != 0:
+            let d = imax(1, w[2] - psys.ms())
+            if best == 0 or d < best:
+                best = d
+    return best
+
+# which of POLLIN / POLLOUT / POLLHUP / POLLERR a descriptor has now
+func fd_ready(f):
+    let k = f.kind
+    if k == "file" or k == "null" or k == "zero" or k == "random" or k == "dir" or k == "mem":
+        return POLLIN | POLLOUT
+    if k == "console":
+        return POLLOUT
+    if k == "stdin":
+        return POLLIN
+    if k == "pipe":
+        let p = f.pipe
+        if f.end == "r":
+            let r = 0
+            if p.size > 0:
+                r = POLLIN
+            if p.writers == 0:
+                r = r | POLLHUP | POLLIN
+            return r
+        return POLLERR if p.readers == 0 else POLLOUT
+    if k == "eventfd":
+        return (POLLIN if f.count > 0 else 0) | POLLOUT
+    if k == "epoll":
+        return POLLIN if len(epoll_ready(f, 1)) > 0 else 0
+    if k == "sock":
+        return POLLIN | POLLOUT
+    return POLLIN | POLLOUT
+
+func sys_poll_core(g, fds_addr, nfds, timeout_ms):
+    if nfds > 4096:
+        return -EINVAL
+    func check():
+        let raw = rd(g, fds_addr, nfds * 8)
+        if raw == nil:
+            return -EFAULT
+        let count = 0
+        let out = []
+        for i in range(nfds):
+            let fd = u32(raw, i * 8)
+            if fd >= 2147483648:
+                fd -= 4294967296
+            let ev = u16(raw, i * 8 + 4)
+            let rev = 0
+            if fd >= 0:
+                let f = g.fds[fd]
+                if f == nil:
+                    rev = 32          # POLLNVAL
+                else:
+                    rev = fd_ready(f) & (ev | POLLERR | POLLHUP)
+            if rev != 0:
+                count += 1
+            put16(raw, i * 8 + 6, rev)
+        if count == 0:
+            return nil
+        wr(g, fds_addr, raw)
+        return count
+    return block(check, timeout_ms, 0)
+
+func sys_poll(g, a):
+    let t = a[2]
+    if t >= 2147483648:
+        t -= 4294967296
+    if t < 0 and a[2] != 0:
+        t = -1
+    return sys_poll_core(g, a[0], a[1], t)
+
+func ts_ms(g, addr):
+    if addr == 0:
+        return -1
+    let ts = rd(g, addr, 16)
+    if ts == nil:
+        return nil
+    return u64(ts, 0) * 1000 + (u64(ts, 8) + 999999) // 1000000
+
+func sys_ppoll(g, a):
+    let t = ts_ms(g, a[2])
+    if t == nil:
+        return -EFAULT
+    return sys_poll_core(g, a[0], a[1], t)
+
+func fdset_get(raw, i):
+    return (raw[i // 8] >> (i % 8)) & 1
+
+func sys_select_core(g, nfds, rp, wp, ep, timeout_ms):
+    let nbytes = (nfds + 7) // 8
+    func check():
+        let rr = rd(g, rp, nbytes) if rp != 0 else nil
+        let wrr = rd(g, wp, nbytes) if wp != 0 else nil
+        let outr = []
+        let outw = []
+        for i in range(nbytes):
+            outr.append(0)
+            outw.append(0)
+        let count = 0
+        for fd in range(nfds):
+            let f = g.fds[fd]
+            if rr != nil and fdset_get(rr, fd) == 1:
+                if f == nil:
+                    return -EBADF
+                if (fd_ready(f) & (POLLIN | POLLHUP)) != 0:
+                    outr[fd // 8] = outr[fd // 8] | (1 << (fd % 8))
+                    count += 1
+            if wrr != nil and fdset_get(wrr, fd) == 1:
+                if f == nil:
+                    return -EBADF
+                if (fd_ready(f) & POLLOUT) != 0:
+                    outw[fd // 8] = outw[fd // 8] | (1 << (fd % 8))
+                    count += 1
+        if count == 0:
+            return nil
+        if rp != 0:
+            wr(g, rp, sslcore.concat([outr]))
+        if wp != 0:
+            wr(g, wp, sslcore.concat([outw]))
+        if ep != 0:
+            wr(g, ep, sslcore.concat([zeros(nbytes)]))
+        return count
+    return block(check, timeout_ms, 0)
+
+func zeros(n):
+    let z = []
+    for i in range(n):
+        z.append(0)
+    return z
+
+func sys_select(g, a):
+    let t = -1
+    if a[4] != 0:
+        let tv = rd(g, a[4], 16)
+        if tv == nil:
+            return -EFAULT
+        t = u64(tv, 0) * 1000 + u64(tv, 8) // 1000
+    let r = sys_select_core(g, a[0], a[1], a[2], a[3], t)
+    if r == 0 and a[1] != 0:
+        wr(g, a[1], sslcore.concat([zeros((a[0] + 7) // 8)]))
+    return r
+
+func sys_pselect6(g, a):
+    let t = ts_ms(g, a[4])
+    if t == nil:
+        return -EFAULT
+    let r = sys_select_core(g, a[0], a[1], a[2], a[3], t)
+    if r == 0 and a[1] != 0:
+        wr(g, a[1], sslcore.concat([zeros((a[0] + 7) // 8)]))
+    return r
+
+# epoll: a set of watched descriptors; level triggered
+func sys_epoll_create(g, a):
+    return g.alloc_fd({kind: "epoll", watches: {}})
+
+func sys_epoll_ctl(g, a):
+    let ep = g.fds[a[0]]
+    if ep == nil or ep.kind != "epoll":
+        return -EBADF
+    let f = g.fds[a[2]]
+    if f == nil:
+        return -EBADF
+    if a[1] == 2:
+        ep.watches[a[2]] = nil
+        return 0
+    let ev = rd(g, a[3], 12)
+    if ev == nil:
+        return -EFAULT
+    if a[1] == 1 and ep.watches[a[2]] != nil:
+        return -EEXIST
+    if a[1] == 3 and ep.watches[a[2]] == nil:
+        return -ENOENT
+    ep.watches[a[2]] = [u32(ev, 0), u64(ev, 4), f]
+    return 0
+
+func epoll_ready(ep, maxn):
+    let out = []
+    for fd in ep.watches:
+        let w = ep.watches[fd]
+        if w == nil:
+            continue
+        let r = fd_ready(w[2]) & (w[0] | POLLERR | POLLHUP)
+        if (w[0] & 0x2000) != 0 and (fd_ready(w[2]) & POLLHUP) != 0:
+            r = r | 0x2000
+        if r != 0:
+            out.append([r, w[1], fd])
+            if len(out) >= maxn:
+                break
+    return out
+
+func sys_epoll_wait(g, a):
+    let ep = g.fds[a[0]]
+    if ep == nil or ep.kind != "epoll":
+        return -EBADF
+    if a[2] <= 0:
+        return -EINVAL
+    let t = a[3]
+    if t >= 2147483648:
+        t -= 4294967296
+    func check():
+        let ready = epoll_ready(ep, a[2])
+        if len(ready) == 0:
+            return nil
+        let b = []
+        for i in range(12 * len(ready)):
+            b.append(0)
+        for i in range(len(ready)):
+            put32(b, i * 12, ready[i][0])
+            put64(b, i * 12 + 4, ready[i][1])
+            let w = ep.watches[ready[i][2]]
+            if (w[0] & (1 << 30)) != 0:        # EPOLLONESHOT
+                ep.watches[ready[i][2]] = nil
+        wr(g, a[1], sslcore.concat([b]))
+        return len(ready)
+    return block(check, t, 0)
+
+func sys_eventfd(g, a):
+    return g.alloc_fd({kind: "eventfd", count: a[0], sem: (a[1] & 1) != 0})
+
+func eventfd_read(g, f, buf):
+    func check():
+        if f.count == 0:
+            return nil
+        let v = 1 if f.sem else f.count
+        f.count -= v
+        let b = []
+        for i in range(8):
+            b.append(0)
+        put64(b, 0, v)
+        wr(g, buf, sslcore.concat([b]))
+        return 8
+    return block(check, -1, 0)
+
+func eventfd_write(g, f, b):
+    if len(b) < 8:
+        return -EINVAL
+    f.count += u64(b, 0)
+    return 8
+
+
 func setup():
     table[0] = sys_read
     table[1] = sys_write
@@ -1550,6 +2228,75 @@ func setup():
     table[273] = sys_zero
     table[302] = sys_prlimit64
     table[318] = sys_getrandom
+    table[7] = sys_poll
+    table[19] = sys_readv
+    table[23] = sys_select
+    table[26] = sys_noop_ok
+    table[27] = sys_noop_ok
+    table[40] = sys_sendfile
+    table[73] = sys_noop_ok
+    table[74] = sys_noop_ok
+    table[75] = sys_noop_ok
+    table[76] = sys_truncate
+    table[81] = sys_fchdir
+    table[85] = sys_creat
+    table[90] = sys_noop_ok
+    table[91] = sys_noop_ok
+    table[92] = sys_noop_ok
+    table[93] = sys_noop_ok
+    table[95] = sys_umask
+    table[97] = sys_getrlimit
+    table[98] = sys_getrusage
+    table[100] = sys_times
+    table[105] = sys_noop_ok
+    table[106] = sys_noop_ok
+    table[109] = sys_noop_ok
+    table[112] = sys_getpid
+    table[113] = sys_noop_ok
+    table[115] = sys_getgroups
+    table[118] = sys_getresuid
+    table[121] = sys_getpid
+    table[124] = sys_getpid
+    table[137] = sys_statfs
+    table[138] = sys_statfs
+    table[157] = sys_prctl
+    table[160] = sys_noop_ok
+    table[162] = sys_noop_ok
+    table[201] = sys_time
+    table[203] = sys_noop_ok
+    table[213] = sys_epoll_create
+    table[221] = sys_noop_ok
+    table[229] = sys_clock_getres
+    table[232] = sys_epoll_wait
+    table[233] = sys_epoll_ctl
+    table[235] = sys_noop_ok
+    table[258] = sys_mkdirat
+    table[260] = sys_noop_ok
+    table[263] = sys_unlinkat
+    table[264] = sys_renameat
+    table[267] = sys_readlinkat
+    table[268] = sys_noop_ok
+    table[270] = sys_pselect6
+    table[271] = sys_ppoll
+    table[277] = sys_noop_ok
+    table[280] = sys_noop_ok
+    table[281] = sys_epoll_wait
+    table[284] = sys_eventfd
+    table[285] = sys_noop_ok
+    table[290] = sys_eventfd
+    table[291] = sys_epoll_create
+    table[292] = sys_dup3
+    table[295] = sys_preadv
+    table[296] = sys_pwritev
+    table[309] = sys_getcpu
+    table[316] = sys_renameat
+    table[326] = sys_copy_file_range
+    table[327] = sys_preadv
+    table[328] = sys_pwritev
+    table[332] = sys_statx
+    table[436] = sys_close_range
+    table[439] = sys_faccessat2
+    table[452] = sys_noop_ok
 
 # one forwarded system call of guest `g`
 func serve_call(g, q):
@@ -1559,6 +2306,7 @@ func serve_call(g, q):
         a.append(to_int(q[i]))
     g.calls += 1
     let f = table[nr]
+    let t_start = psys.ms()
     let r = nil
     if f == nil:
         if verbose:
@@ -1570,6 +2318,10 @@ func serve_call(g, q):
         catch e:
             log("pid " .. to_string(g.pid) .. ": system call " .. to_string(nr) .. " failed inside linuxd: " .. to_string(e))
             r = -5
+    if verbose and psys.ms() - t_start > 150:
+        log("slow: tid " .. to_string(cur_tid) .. " syscall " .. to_string(nr) .. " (" .. to_string(a[0]) .. "," .. to_string(a[1]) .. "," .. to_string(a[2]) .. ") took " .. to_string(psys.ms() - t_start) .. " ms")
+    if verbose == "trace" and cur_tid >= 8:
+        log("tid " .. to_string(cur_tid) .. " syscall " .. to_string(nr) .. " (" .. to_string(a[0]) .. "," .. to_string(a[1]) .. "," .. to_string(a[2]) .. ") = " .. to_string(r))
     if r != nil:
         lx.reply(cur_tid, r)
 
@@ -1584,7 +2336,7 @@ func serve_request(src, text):
         else:
             ipc.send(src, "ok\t" .. to_string(r[0]))
     elif q[0] == "verbose":
-        verbose = true
+        verbose = q[1] if len(q) > 1 else true
         ipc.send(src, "ok")
     elif q[0] == "quit":
         ipc.send(src, "ok")
@@ -1602,12 +2354,22 @@ let running = true
 while running:
     io.flush()
     let tmo = next_wake()
-    let m = ipc.recv_from(true, tmo)
+    let wd = waiter_deadline()
+    if wd != 0 and (tmo == 0 or wd < tmo):
+        tmo = wd
+    let m = nil
+    if fs != nil and len(fs.backlog) > 0:
+        m = fs.backlog.remove_at(0)           # a message that came in while we waited for fsd
+    else:
+        m = ipc.recv_from(true, tmo)
     wake_sleepers()
     if m == nil:
+        recheck()
         continue
     let src = m[0]
     let text = m[1]
+    if verbose == "trace" and src >= 8:
+        log("recv from " .. to_string(src) .. ": " .. text.slice(0, 30))
     let g = tmap[src]
     if g != nil:
         if text.starts_with("X\t"):
@@ -1621,4 +2383,5 @@ while running:
         pass          # a program we already finished
     else:
         running = serve_request(src, text)
+    recheck()
 log("bye")

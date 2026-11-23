@@ -29,8 +29,11 @@ export class Stat:
 export class Client:
     let server = 0
     let seg = nil
+    let backlog = nil            # messages from other processes that arrived while a call waited for the server's answer (a program that serves
+                                 # other clients itself, like linuxd, takes them from here instead of losing them)
     func init(self, server):
         self.server = server
+        self.backlog = []
         self.seg = ipc.shm_create(BUF)
         self.call("attach\t" .. to_string(self.seg[0]))
     # one request / answer; returns the fields after "ok"
@@ -40,6 +43,8 @@ export class Client:
         while true:
             let m = ipc.recv_from()
             if m[0] != self.server:
+                if len(self.backlog) < 4096:
+                    self.backlog.append(m)
                 continue
             let f = m[1].split("\t")
             if f[0] == "ok":

@@ -14,6 +14,7 @@ def check(c, what):
 tmp = tempfile.mkdtemp()
 src = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "tests", "linux")
 glibc_ok = subprocess.run(["gcc", "-O2", "-pie", "-fPIE", "-o", os.path.join(tmp, "glibc"), os.path.join(src, "glibc.c"), "-lm"], capture_output=True).returncode == 0
+glibc_ok = glibc_ok and subprocess.run(["gcc", "-O2", "-pie", "-fPIE", "-o", os.path.join(tmp, "dl"), os.path.join(src, "dl.c"), "-ldl"], capture_output=True).returncode == 0
 glibc_ok = glibc_ok and subprocess.run(["gcc", "-O2", "-pie", "-fPIE", "-pthread", "-o", os.path.join(tmp, "threads_glibc"), os.path.join(src, "threads.c")], capture_output=True).returncode == 0
 check(glibc_ok, "gcc builds glibc dynamic PIE programs")
 for name, flags in (("hello", ["-static-pie"]), ("files", ["-static-pie"]), ("proc", ["-static-pie"]), ("threads", ["-static-pie", "-pthread"]), ("hello_dyn", ["-pie", "-fPIE"])):
@@ -22,14 +23,46 @@ for name, flags in (("hello", ["-static-pie"]), ("files", ["-static-pie"]), ("pr
 fsimg = os.path.join(tmp, "fs.img")
 def tool(*a):
     return subprocess.run([SP, "run", "--allow-read=" + tmp, "--allow-write=" + tmp, "tools/sprintfs.sp", fsimg] + list(a), capture_output=True, text=True)
-tool("mkfs", "24"); tool("mkdir", "/bin"); tool("mkdir", "/lx")
+tool("mkfs", "40"); tool("mkdir", "/bin"); tool("mkdir", "/lx")
 open(os.path.join(tmp, "input.txt"), "w").write("hello from the SprintFS disk\nsecond line\n")
 tool("mkdir", "/lib"); import shutil; shutil.copy("/lib/ld-musl-x86_64.so.1", os.path.join(tmp, "ld-musl")); tool("put", os.path.join(tmp, "ld-musl"), "/lib/ld-musl-x86_64.so.1")
 if glibc_ok:
     tool("mkdir", "/lib64"); tool("mkdir", "/lib/x86_64-linux-gnu")
     for host, guest in (("/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2", "/lib64/ld-linux-x86-64.so.2"), ("/lib/x86_64-linux-gnu/libc.so.6", "/lib/x86_64-linux-gnu/libc.so.6")):
         shutil.copy(os.path.realpath(host), os.path.join(tmp, "glibc_lib")); tool("put", os.path.join(tmp, "glibc_lib"), guest)
-    tool("put", os.path.join(tmp, "glibc"), "/bin/glibc"); tool("put", os.path.join(tmp, "threads_glibc"), "/bin/threads_glibc")
+    tool("put", os.path.join(tmp, "glibc"), "/bin/glibc"); tool("put", os.path.join(tmp, "dl"), "/bin/dl"); tool("put", os.path.join(tmp, "threads_glibc"), "/bin/threads_glibc")
+REAL = ["dash", "cat", "sort", "sed", "ls", "echo", "wc", "tr", "head"]
+made = set()
+def put_real(binpath):
+    """a program of the host's distribution with the shared libraries it needs, at the same paths"""
+    real = os.path.realpath(binpath)
+    deps = [real]
+    for line in subprocess.run(["ldd", real], capture_output=True, text=True).stdout.splitlines():
+        parts = line.split()
+        if "=>" in line and len(parts) >= 3 and parts[2].startswith("/"): deps.append(parts[2])
+        elif parts and parts[0].startswith("/"): deps.append(parts[0])
+    for d in deps:
+        guest = os.path.join("/usr/bin", os.path.basename(binpath)) if d == real else d
+        if guest in made: continue
+        made.add(guest)
+        parent = ""
+        for comp in os.path.dirname(guest).strip("/").split("/"):
+            parent += "/" + comp
+            if parent not in made: made.add(parent); tool("mkdir", parent)
+        shutil.copy(os.path.realpath(d), os.path.join(tmp, "dep")); tool("put", os.path.join(tmp, "dep"), guest)
+for b in REAL:
+    w = shutil.which(b)
+    if w: put_real(w)
+open(os.path.join(tmp, "script.sh"), "w").write("""echo "shell works"
+printf 'b\\na\\nc\\n' | sort
+ls /lx | sort
+cat /lx/input.txt | sed 's/hello/HELLO/' | head -1
+for i in 1 2 3; do echo -n "$i "; done; echo
+x=$(echo subshell); echo "got $x"
+echo "done" | tr a-z A-Z
+exit 5
+""")
+tool("put", os.path.join(tmp, "script.sh"), "/lx/script.sh")
 tool("put", os.path.join(tmp, "threads"), "/bin/threads"); tool("put", os.path.join(tmp, "proc"), "/bin/proc"); tool("put", os.path.join(tmp, "hello_dyn"), "/bin/hello_dyn")
 tool("put", os.path.join(tmp, "hello"), "/bin/hello"); tool("put", os.path.join(tmp, "files"), "/bin/files"); tool("put", os.path.join(tmp, "input.txt"), "/lx/input.txt")
 ser = os.path.join(OUT, "linux.log")
@@ -53,7 +86,7 @@ check("lxtest: /bin/hello exited with 7" in L, "the exit status comes back")
 check("open input: ok" in L and "read 41 bytes: hello from the SprintFS disk" in L, "open + read of a file on the SprintFS disk through fsd")
 check("size=41 regular=1" in L and "seek+read: [from ]" in L, "fstat, lseek")
 check("fopen/fgets lines=2" in L, "stdio files: fopen, fprintf, fgets")
-check("entry: out" in L and "entry: input.txt" in L and "entries=2" in L, "opendir / readdir (getdents64)")
+check("entry: out" in L and "entry: input.txt" in L and "entries=3" in L, "opendir / readdir (getdents64)")
 check("missing: No such file or directory" in L, "errno from a missing file")
 check("cwd=/bin" in L, "getcwd")
 check("lxtest: /bin/files exited with 0" in L, "second program exits 0")
@@ -69,6 +102,10 @@ check("lxtest: /bin/hello_dyn exited with 7" in L, "a dynamically linked (musl l
 check("glibc hello, argc=3" in L and "sqrt(2)=1.414214 strlen=3" in L and "lxtest: /bin/glibc exited with 3" in L, "a glibc dynamically linked program (ld-linux, libc.so.6) runs")
 check("threads done: counter=2000 sum=12 main tls=0" in L and "short threads: 20 counter=12000" in L, "pthreads (clone with shared memory), mutex + condition variable (futex), thread-local storage, join")
 check(L.count("threads done: counter=2000 sum=12 main tls=0") == 2 and L.count("short threads: 20 counter=12000") == 2, "the same threads program built against glibc (clone3 falls back to clone, robust lists, rseq refused)")
+check("shell works" in L and "a\nb\nc" in L.replace("\r", "") and "HELLO from the SprintFS disk" in L, "dash from the distribution runs a script: pipes, sort, ls, sed, cat, head")
+check("1 2 3" in L and "got subshell" in L and "DONE" in L, "dash: loops, command substitution (fork + pipe), tr")
+check("lxtest: /usr/bin/dash exited with 5" in L, "the script's exit status")
+check("dlopen: ok" in L and "dlsym: serialize=found compile=found" in L, "dlopen / dlsym of a real shared library (libpcre2) finds its symbols")
 check("lxtest: /bin/nothere: cannot read" in L, "a missing program is reported")
 check("lxtest: done" in L, "the test finished")
 # the host looks at the disk

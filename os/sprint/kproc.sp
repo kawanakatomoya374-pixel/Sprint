@@ -125,6 +125,16 @@ export class Process:
         for r in self.regions:
             if r.start >= a and r.end <= end:
                 continue   # whole region goes
+            if r.start < a and r.end > end:
+                # a hole in the middle: the region is split in two
+                let tail = Region()
+                tail.start = end
+                tail.end = r.end
+                tail.flags = r.flags
+                r.end = a
+                keep.append(r)
+                keep.append(tail)
+                continue
             if r.start < end and r.end > a:
                 if r.start < a:
                     r.end = a

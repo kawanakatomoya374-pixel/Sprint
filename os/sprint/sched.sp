@@ -351,6 +351,7 @@ func lx_syscall(p, nr):
         return true
     if nr == 1047:   # lx_reply(pid, value): answer the system call it is waiting on
         if q.state != "lxwait":
+            log("lx_reply to pid " .. to_string(q.pid) .. " in state " .. q.state)
             set_ret(p, -11)
             return true
         set_ret(q, a1)

@@ -32,9 +32,14 @@ func run(path, args, env):
             io.flush()
             return to_int(q[2])
 
-let progs = ["/bin/hello", "/bin/files", "/bin/proc", "/bin/hello_dyn", "/bin/glibc", "/bin/threads", "/bin/threads_glibc"]
+ipc.send(srv, "verbose")
+ipc.recv_from()
+let progs = ["/bin/hello", "/bin/files", "/bin/proc", "/bin/hello_dyn", "/bin/glibc", "/bin/dl", "/bin/threads", "/bin/threads_glibc"]
+
 for p in progs:
     run(p, [p, "one", "two words"], ["HOME=/root", "LANG=C"])
+# real programs from the host's distribution (dash, coreutils, sed ...): a shell script with pipes and subshells
+run("/usr/bin/dash", ["dash", "/lx/script.sh"], ["PATH=/usr/bin", "HOME=/root"])
 print("lxtest: missing program:", run("/bin/nothere", ["x"], []))
 print("lxtest: done")
 io.flush()
