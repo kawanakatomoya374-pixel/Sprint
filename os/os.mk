@@ -108,7 +108,7 @@ $(OSB)/sprintos-hybrid-test.img: $(OSB)/kernel.elf $(HYBRID_SP) $(BUILD)/sprint
 	$(BUILD)/sprint run --allow-read=$(OSB) --allow-write=$(OSB) os/boot/hybridboot.sp $(OSB)/kernel32.elf $@ "init=init" $(OSB)/kernel.elf
 
 # (os-explorer-test is at the end)
-.PHONY: os-explorer-test os os-check os-kernel os-user os-iso os-run os-test os-img os-img-run os-img-test os-uefi os-uefi-run os-uefi-test os-hybrid os-hybrid-run os-hybrid-uefi-run os-hybrid-test
+.PHONY: os-explorer-test os-linux-test os os-check os-kernel os-user os-iso os-run os-test os-img os-img-run os-img-test os-uefi os-uefi-run os-uefi-test os-hybrid os-hybrid-run os-hybrid-uefi-run os-hybrid-test
 # `make os`: check the tools, then build the bootable ISO
 os: os-check os-iso
 	@echo "ISO ready: $(OSB)/sprintos.iso   (try: make os-run)"
@@ -200,3 +200,10 @@ $(OSB)/sprintos-exptest.img: $(OSB)/kernel.elf os/boot/sprintboot.sp os/boot/bio
 # Explorer icon opens its window through guid
 os-explorer-test: $(OSB)/sprintos-exptest.img $(OSB)/sprintos.img $(BUILD)/sprint
 	python3 os/tests/explorer_test.py $(OSB)/sprintos-exptest.img $(OSB)/sprintos.img
+
+$(OSB)/sprintos-lxtest.img: $(OSB)/kernel.elf os/boot/sprintboot.sp os/boot/bios_loader.sp os/boot/elf32.sp os/boot/boot_menu.sp stdlib/asm.sp $(BUILD)/sprint
+	$(BUILD)/sprint run --allow-read=$(OSB) --allow-write=$(OSB) os/boot/sprintboot.sp $(OSB)/kernel32.elf $@ "init=lxtest"
+
+# Linux programs (static-pie, built here with musl-gcc) run on SprintOS: the kernel forwards their system calls to linuxd, which answers them in Sprint
+os-linux-test: $(OSB)/sprintos-lxtest.img $(BUILD)/sprint
+	python3 os/tests/linux_test.py $(OSB)/sprintos-lxtest.img

@@ -3,6 +3,7 @@
 import hw
 import kmem
 import kproc
+import vmm
 import ksys
 import lapic
 import ioapic
@@ -33,6 +34,7 @@ func log(s):
 # what a program may do beyond computing: the framebuffer and input (gui), and the I/O ports of a driver
 const GUI = ["guid"]
 const PORTS = {fsd: [0x1F0, 8, 0x3F6, 1, 0x170, 8, 0x376, 1], gpud: [0xCF8, 8], inputd: [0x60, 1, 0x64, 1], netd: [0xCF8, 8]}
+const LX = ["linuxd"]                 # may create and drive Linux programs
 const DRIVERS = ["gpud", "netd"]       # may map device registers and allocate DMA memory
 let io_open = {}      # cpu -> the port ranges currently open in its I/O permission bitmap
 let io_pid = {}       # cpu -> pid they belong to
@@ -124,6 +126,7 @@ func spawn_here(pid, mod, parent):
     p.cpu = me
     p.gui = GUI.contains(mod)
     p.mmio = DRIVERS.contains(mod)
+    p.lx = LX.contains(mod)
     p.dma = p.mmio
     if mod in PORTS:
         p.ports = PORTS[mod]
@@ -173,10 +176,14 @@ func child_exited(parent, child, code):
 func finish(p):
     # free the address space now and tell the parent how it ended; the process is gone
     let code = p.exit_code
+    let handler = p.handler
     p.destroy()
     p.state = "zombie"
     reap(p.pid)
-    exit_notice(p.parent, p.pid, code)
+    if handler != 0:
+        send_to(handler, p.pid, "X\t" .. to_string(code))      # a Linux program ended (also when it crashed): its server hears about it
+    else:
+        exit_notice(p.parent, p.pid, code)
     k.pid_gone(p.pid)
     k.load_add(me, -1)
 
@@ -223,8 +230,123 @@ func drain_mailbox():
             child_exited(m[1], m[2], m[3])
 
 # scheduler-level system calls; returns true when `p` can keep running (its result is already in rax)
+# the Linux programs of this CPU that `p` (a personality server) drives
+func lx_target(p, pid):
+    if not p.lx or not (pid in procs):
+        return nil
+    let q = procs[pid]
+    return q if q.handler == p.pid else nil
+
+# copy n bytes between two address spaces (the kernel sees all memory, so this is a page-wise physical copy); false when a page is not mapped
+func copy_between(src_p, src_va, dst_p, dst_va, n):
+    let done = 0
+    while done < n:
+        src_p.ensure(src_va + done, 1)
+        dst_p.ensure(dst_va + done, 1)
+        let a = src_p.space.translate(src_va + done)
+        let b = dst_p.space.translate(dst_va + done)
+        if a == nil or b == nil:
+            return false
+        let chunk = 4096 - (a & 4095)
+        let c2 = 4096 - (b & 4095)
+        if c2 < chunk:
+            chunk = c2
+        if chunk > n - done:
+            chunk = n - done
+        hw.memcpy(b, a, chunk)
+        done += chunk
+    return true
+
+func lx_syscall(p, nr):
+    let a0 = hw.peek64(p.ctx + kproc.CTX_RDI)
+    let a1 = hw.peek64(p.ctx + kproc.CTX_RSI)
+    let a2 = hw.peek64(p.ctx + kproc.CTX_RDX)
+    let a3 = hw.peek64(p.ctx + kproc.CTX_R10)
+    if nr == 1040:   # lx_create() -> pid: a Linux program with an empty address space, answered by the caller; not running yet
+        if not p.lx:
+            set_ret(p, -1)
+            return true
+        let pid = k.pid_new(me)
+        k.load_add(me, 1)
+        let q = kproc.Process(pid, "linux")
+        q.parent = p.pid
+        q.handler = p.pid
+        q.cpu = me
+        q.state = "stopped"
+        kproc.setup_user(q, 0, 0)
+        procs[pid] = q
+        p.children[pid] = true
+        set_ret(p, pid)
+        return true
+    let q = lx_target(p, a0)
+    if q == nil:
+        set_ret(p, -3)
+        return true
+    if nr == 1041:   # lx_map(pid, addr, len, prot): a zero-filled region (pages appear when touched); prot bit 2 = writable
+        let flags = vmm.U | (vmm.W if (a3 & 2) != 0 else 0)
+        if (a1 & 4095) != 0 or a2 <= 0 or a1 < vmm.USER_BASE:
+            set_ret(p, -22)
+            return true
+        q.munmap(a1, a2)
+        q.add_region(a1, a1 + ((a2 + 4095) & ~4095), flags)
+        set_ret(p, 0)
+        return true
+    if nr == 1042:   # lx_unmap(pid, addr, len)
+        q.munmap(a1, a2)
+        set_ret(p, 0)
+        return true
+    if nr == 1043:   # lx_protect(pid, addr, len, prot)
+        q.mprotect(a1, a2, vmm.U | (vmm.W if (a3 & 2) != 0 else 0))
+        set_ret(p, 0)
+        return true
+    if nr == 1044:   # lx_write(pid, addr, buf, n): copy n bytes from our buf into the program
+        let n = hw.peek64(p.ctx + kproc.CTX_R10)
+        set_ret(p, 0 if copy_between(p, a2, q, a1, n) else -14)
+        return true
+    if nr == 1045:   # lx_read(pid, addr, buf, n): copy n bytes from the program into our buf
+        let n = hw.peek64(p.ctx + kproc.CTX_R10)
+        set_ret(p, 0 if copy_between(q, a1, p, a2, n) else -14)
+        return true
+    if nr == 1046:   # lx_start(pid, rip, rsp): let it run
+        kproc.setup_user(q, a1, a2)
+        q.state = "run"
+        order.append(q.pid)
+        set_ret(p, 0)
+        return true
+    if nr == 1047:   # lx_reply(pid, value): answer the system call it is waiting on
+        if q.state != "lxwait":
+            set_ret(p, -11)
+            return true
+        set_ret(q, a1)
+        q.state = "run"
+        set_ret(p, 0)
+        return true
+    if nr == 1048:   # lx_kill(pid, status)
+        q.exit_code = a1
+        finish(q)
+        set_ret(p, 0)
+        return true
+    if nr == 1049:   # lx_setfs(pid, base): the thread pointer
+        hw.poke64(q.ctx + kproc.CTX_FSB, a1)
+        set_ret(p, 0)
+        return true
+    set_ret(p, -38)
+    return true
+
 func syscall(p):
     let nr = hw.peek64(p.ctx + kproc.CTX_RAX)
+    if p.handler != 0:
+        # a Linux program: the system call goes to its server as a message "nr<TAB>a0 ... a5", and the program waits for lx_reply
+        let m = to_string(nr)
+        for r in [kproc.CTX_RDI, kproc.CTX_RSI, kproc.CTX_RDX, kproc.CTX_R10, kproc.CTX_R8, kproc.CTX_R9]:
+            m = m .. "\t" .. to_string(hw.peek64(p.ctx + r))
+        if send_to(p.handler, p.pid, m):
+            p.state = "lxwait"
+            return false
+        p.exit_code = 137
+        return false
+    if nr >= 1040 and nr < 1050:
+        return lx_syscall(p, nr)
     if nr == 35:   # nanosleep(&ts, nil)
         let ts = p.space.read64(hw.peek64(p.ctx + kproc.CTX_RDI))
         let ns = p.space.read64(hw.peek64(p.ctx + kproc.CTX_RDI) + 8)

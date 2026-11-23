@@ -5,6 +5,7 @@
 #include "sprint.h"
 #include "udev.h"
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 
 static long sc3(long n, long a, long b, long c) {
@@ -455,6 +456,67 @@ static const SpNativeDesc ipc_fns[] = {
     {"send", 2, 2, 0, 0, i_send}, {"recv", 0, 1, 0, SP_NATIVE_ALLOCATES, i_recv},
 };
 
+
+/* ---- module `lx`: what the personality server linuxd uses to create and drive Linux programs (system calls 1040..1049; the kernel only lets linuxd use them) ---- */
+static SpStatus lx_int(SpVM *vm, const SpValue *argv, int i, int64_t *out) { return need_i(vm, argv[i], out); }
+static SpStatus l_create(SpVM *vm, int argc, const SpValue *argv, SpValue *ret) {
+    (void)vm; (void)argc; (void)argv;
+    *ret = sp_int(sc3(1040, 0, 0, 0));
+    return SP_OK;
+}
+static SpStatus l_map3(SpVM *vm, const SpValue *argv, long nr, SpValue *ret) {
+    int64_t pid, a, n, prot = 0;
+    if (lx_int(vm, argv, 0, &pid) != SP_OK || lx_int(vm, argv, 1, &a) != SP_OK || lx_int(vm, argv, 2, &n) != SP_OK) return SP_E_RUNTIME;
+    if (nr != 1042 && lx_int(vm, argv, 3, &prot) != SP_OK) return SP_E_RUNTIME;
+    *ret = sp_int(sc4(nr, (long)pid, (long)a, (long)n, (long)prot));
+    return SP_OK;
+}
+static SpStatus l_map(SpVM *vm, int argc, const SpValue *argv, SpValue *ret) { (void)argc; return l_map3(vm, argv, 1041, ret); }
+static SpStatus l_unmap(SpVM *vm, int argc, const SpValue *argv, SpValue *ret) { (void)argc; return l_map3(vm, argv, 1042, ret); }
+static SpStatus l_protect(SpVM *vm, int argc, const SpValue *argv, SpValue *ret) { (void)argc; return l_map3(vm, argv, 1043, ret); }
+/* write(pid, addr, bytes [, off [, n]]): copy bytes[off .. off+n) into the program at addr */
+static SpStatus l_write(SpVM *vm, int argc, const SpValue *argv, SpValue *ret) {
+    int64_t pid, a, off = 0, n = -1;
+    if (lx_int(vm, argv, 0, &pid) != SP_OK || lx_int(vm, argv, 1, &a) != SP_OK) return SP_E_RUNTIME;
+    unsigned char *d = typed_u8_data(argv[2]);
+    if (!d) return sp_throw(vm, "TypeError", "lx.write: expected a typed.u8");
+    int64_t len = typed_len(argv[2]);
+    if (argc > 3 && lx_int(vm, argv, 3, &off) != SP_OK) return SP_E_RUNTIME;
+    if (argc > 4 && lx_int(vm, argv, 4, &n) != SP_OK) return SP_E_RUNTIME;
+    if (n < 0) n = len - off;
+    if (off < 0 || n < 0 || off + n > len) return sp_throw(vm, "IndexError", "lx.write: range outside the buffer");
+    *ret = sp_int(sc4(1044, (long)pid, (long)a, (long)(uintptr_t)(d + off), (long)n));
+    return SP_OK;
+}
+static SpStatus l_read(SpVM *vm, int argc, const SpValue *argv, SpValue *ret) {
+    (void)argc;
+    int64_t pid, a, n;
+    if (lx_int(vm, argv, 0, &pid) != SP_OK || lx_int(vm, argv, 1, &a) != SP_OK || lx_int(vm, argv, 2, &n) != SP_OK) return SP_E_RUNTIME;
+    if (n < 0 || n > (64 << 20)) return sp_throw(vm, "ValueError", "lx.read: bad length");
+    unsigned char *tmp = (unsigned char *)malloc((size_t)n + 1);
+    if (!tmp) return sp_throw(vm, "MemoryError", "lx.read: out of memory");
+    long r = sc4(1045, (long)pid, (long)a, (long)(uintptr_t)tmp, (long)n);
+    *ret = r == 0 ? typed_u8_from(vm, tmp, (size_t)n) : sp_nil();
+    free(tmp);
+    return SP_OK;
+}
+static SpStatus l_call3(SpVM *vm, const SpValue *argv, long nr, SpValue *ret) {
+    int64_t a, b, c = 0;
+    if (lx_int(vm, argv, 0, &a) != SP_OK || lx_int(vm, argv, 1, &b) != SP_OK) return SP_E_RUNTIME;
+    if (nr == 1046 && lx_int(vm, argv, 2, &c) != SP_OK) return SP_E_RUNTIME;
+    *ret = sp_int(sc3(nr, (long)a, (long)b, (long)c));
+    return SP_OK;
+}
+static SpStatus l_start(SpVM *vm, int argc, const SpValue *argv, SpValue *ret) { (void)argc; return l_call3(vm, argv, 1046, ret); }
+static SpStatus l_reply(SpVM *vm, int argc, const SpValue *argv, SpValue *ret) { (void)argc; return l_call3(vm, argv, 1047, ret); }
+static SpStatus l_kill(SpVM *vm, int argc, const SpValue *argv, SpValue *ret) { (void)argc; return l_call3(vm, argv, 1048, ret); }
+static SpStatus l_setfs(SpVM *vm, int argc, const SpValue *argv, SpValue *ret) { (void)argc; return l_call3(vm, argv, 1049, ret); }
+static const SpNativeDesc lx_fns[] = {
+    {"create", 0, 0, 0, 0, l_create}, {"map", 4, 4, 0, 0, l_map}, {"unmap", 3, 3, 0, 0, l_unmap}, {"protect", 4, 4, 0, 0, l_protect},
+    {"write", 3, 5, 0, 0, l_write}, {"read", 3, 3, 0, SP_NATIVE_ALLOCATES, l_read}, {"start", 3, 3, 0, 0, l_start},
+    {"reply", 2, 2, 0, 0, l_reply}, {"kill", 2, 2, 0, 0, l_kill}, {"setfs", 2, 2, 0, 0, l_setfs},
+};
+
 /* ---- module `uio`: port I/O for a driver process (the kernel opens the ports in its I/O permission bitmap; anything else faults) ---- */
 static SpStatus u_inb(SpVM *vm, int argc, const SpValue *argv, SpValue *ret) {
     (void)argc;
@@ -581,5 +643,6 @@ static const SpNativeDesc uio_fns[] = {
 int udev_register(SpVM *vm) {
     (void)sp_register_module(vm, "uio", uio_fns, sizeof uio_fns / sizeof uio_fns[0]);
     (void)sp_register_module(vm, "ipc", ipc_fns, sizeof ipc_fns / sizeof ipc_fns[0]);
+    (void)sp_register_module(vm, "lx", lx_fns, sizeof lx_fns / sizeof lx_fns[0]);
     return (int)sp_register_module(vm, "gdev", gdev_fns, sizeof gdev_fns / sizeof gdev_fns[0]);
 }

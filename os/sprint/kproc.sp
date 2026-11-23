@@ -64,6 +64,8 @@ export class Process:
     let ports = []       # I/O port ranges [first, count, ...] this process may use (a driver)
     let rbuf = 0         # where a blocked msg_recv wants its message
     let rcap = 0
+    let lx = false       # may run Linux programs (the personality server linuxd)
+    let handler = 0      # a Linux program: the pid of the server that answers its system calls (0 = an ordinary process)
     let mwake = 0        # when a blocked msg_recv with a timeout gives up (microseconds; 0 = never)
     func init(self, pid, name):
         self.pid = pid
@@ -123,6 +125,41 @@ export class Process:
             keep.append(r)
         self.regions = keep
         self.space.unmap_free(a, end - a)
+    # change the protection of [a, a + len): regions are split at the edges and mapped pages get their new flags
+    func mprotect(self, a, len, flags):
+        let end = a + ((len + 4095) & ~4095)
+        let out = []
+        for r in self.regions:
+            if r.end <= a or r.start >= end:
+                out.append(r)
+                continue
+            if r.start < a:
+                let left = Region()
+                left.start = r.start
+                left.end = a
+                left.flags = r.flags
+                out.append(left)
+            if r.end > end:
+                let right = Region()
+                right.start = end
+                right.end = r.end
+                right.flags = r.flags
+                out.append(right)
+            let mid = Region()
+            mid.start = imax(r.start, a)
+            mid.end = imin(r.end, end)
+            mid.flags = flags
+            out.append(mid)
+        self.regions = out
+        let v = a & ~4095
+        while v < end:
+            let e = self.space.entry(v, false)
+            if e != 0:
+                let x = hw.peek64(e)
+                if x & vmm.P != 0:
+                    hw.poke64(e, (x & ~(vmm.W | vmm.NX)) | (flags & vmm.W))
+                    hw.invlpg(v)
+            v += 4096
     # mremap(old, oldlen, newlen, may_move): grow by moving the pages (no copying); returns the address or -ENOMEM
     func mremap(self, old, oldlen, newlen, may_move):
         let o = (oldlen + 4095) & ~4095
@@ -154,6 +191,23 @@ export class Process:
         shm.detach_all(self)
         self.space.destroy()
         hw.ctx_free(self.ctx)
+
+func imax(a, b):
+    return a if a > b else b
+
+func imin(a, b):
+    return a if a < b else b
+
+# a user context that starts at rip with stack pointer sp (ring 3, interrupts on, FPU / SSE state reset)
+export func setup_user(p, rip, sp):
+    hw.poke64(p.ctx + CTX_RIP, rip)
+    hw.poke64(p.ctx + CTX_RSP, sp)
+    hw.poke64(p.ctx + CTX_RFLAGS, 0x202)
+    hw.poke64(p.ctx + CTX_CS, 0x23)
+    hw.poke64(p.ctx + CTX_SS, 0x1B)
+    hw.poke64(p.ctx + CTX_CR3, p.space.pml4)
+    hw.poke16(p.ctx + CTX_FX, 0x37F)
+    hw.poke32(p.ctx + CTX_FX + 24, 0x1F80)
 
 # push a C string below sp; returns the new sp
 func push_str(proc, sp, s):

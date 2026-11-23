@@ -371,7 +371,36 @@ static int sc_inflate(VM *vm, int argc, SpValue *argv, SpValue *ret) {   /* zlib
     return 0;
 }
 
+/* bytes -> string, keeping valid UTF-8 and replacing every byte that is not part of a valid sequence by '?' */
+static int sc_to_text(VM *vm, int argc, SpValue *argv, SpValue *ret) {
+    (void)argc;
+    NEED(a, 0, "bytes");
+    char *s = malloc(a.n + 1);
+    if (!s) { DONE(a); return vm_set_error(vm, E_MEMORY, "out of memory"); }
+    size_t i = 0;
+    while (i < a.n) {
+        unsigned char c = a.p[i];
+        size_t k = c < 0x80 ? 1 : (c >= 0xC2 && c <= 0xDF) ? 2 : (c >= 0xE0 && c <= 0xEF) ? 3 : (c >= 0xF0 && c <= 0xF4) ? 4 : 0;
+        int ok = k > 0 && i + k <= a.n;
+        for (size_t j = 1; ok && j < k; j++) ok = (a.p[i + j] & 0xC0) == 0x80;
+        if (ok && k == 3) {
+            unsigned v = ((unsigned)(c & 15) << 12) | ((unsigned)(a.p[i + 1] & 63) << 6) | (a.p[i + 2] & 63u);
+            ok = v >= 0x800 && (v < 0xD800 || v > 0xDFFF);
+        } else if (ok && k == 4) {
+            unsigned v = ((unsigned)(c & 7) << 18) | ((unsigned)(a.p[i + 1] & 63) << 12) | ((unsigned)(a.p[i + 2] & 63) << 6) | (a.p[i + 3] & 63u);
+            ok = v >= 0x10000 && v <= 0x10FFFF;
+        }
+        if (ok) { memcpy(s + i, a.p + i, k); i += k; }
+        else { s[i] = '?'; i++; }
+    }
+    *ret = vstr(vm, s, a.n);
+    free(s);
+    DONE(a);
+    return 0;
+}
+
 const NativeDesc lib_sslcore_fns[] = {
+    {"to_text", 1, 1, sc_to_text},
     {"inflate", 1, 2, sc_inflate},
     {"hash", 2, 2, sc_hash}, {"hmac", 3, 3, sc_hmac}, {"hkdf_extract", 3, 3, sc_hkdf_extract}, {"hkdf_expand", 4, 4, sc_hkdf_expand},
     {"gcm_seal", 4, 4, sc_gcm_seal}, {"gcm_open", 4, 4, sc_gcm_open}, {"chacha_seal", 4, 4, sc_chacha_seal}, {"chacha_open", 4, 4, sc_chacha_open},
