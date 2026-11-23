@@ -431,6 +431,11 @@ static int os_main(int argc, char **argv, char **envp) {
     cfg.loader = os_loader;
     SpVM *vm;
     if (sp_vm_new(&cfg, &vm) != SP_OK) kpanic("cannot create the Sprint VM");
+    for (const char *w = g_cmdline; *w;) { /* `nojit` on the kernel command line: the interpreter alone (to measure what the JIT does) */
+        if (strncmp(w, "nojit", 5) == 0 && (w[5] == ' ' || w[5] == 0)) vm->jit_on = 0;
+        while (*w && *w != ' ') w++;
+        while (*w == ' ') w++;
+    }
     if (hw_register(vm) != SP_OK) kpanic("cannot register the hw module");
     SpProgram *prog;
     const char *entry = "osmain";

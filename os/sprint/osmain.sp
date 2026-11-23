@@ -40,3 +40,10 @@ for apic in ids:
             log("cpu with APIC id " .. to_string(apic) .. " did not start")
         idx += 1
 log("processors online: " .. to_string(started) .. " of " .. to_string(len(ids)))
+
+# `kbench` on the kernel command line: how fast does Sprint code run in the kernel itself? (the JIT benchmark of stdlib/jbench.sp)
+import jbench
+for word in hw.cmdline().split(" "):
+    if word == "kbench":
+        for r in jbench.run(() => hw.ticks_us() // 1000):
+            log("kbench " .. r[0] .. ": " .. to_string(r[1]) .. " ms")

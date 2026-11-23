@@ -146,6 +146,10 @@ $(OSB)/sprintos-nettest.img: $(OSB)/kernel.elf os/boot/sprintboot.sp os/boot/bio
 os-net-test: $(OSB)/sprintos-nettest.img $(BUILD)/sprint
 	python3 os/tests/net_test.py $(OSB)/sprintos-nettest.img
 
+# the JIT inside the kernel's own Sprint VM: with and without it (kernel command line `kbench` / `nojit`)
+os-jit-test: $(OSB)/kernel.elf $(BUILD)/sprint
+	python3 os/tests/jit_test.py $(OSB)
+
 # a second ATA disk formatted with SprintFS: the Sprint kernel mounts it, reads and writes it
 os-disk-test: $(OSB)/sprintos-fstest.img $(BUILD)/sprint
 	python3 os/tests/disk_test.py $(OSB)/sprintos-fstest.img
