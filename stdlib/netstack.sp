@@ -163,6 +163,7 @@ export class Stack:
     let mask = 0
     let gw = 0
     let dns = 0
+    let dns_port = 53
     let lease = 0
     let arp = nil
     let udp = nil
@@ -581,7 +582,7 @@ export class Stack:
             q.extend(qn)
             p16(q, 1)
             p16(q, 1)
-            self.udp_send(s, self.dns, 53, q)
+            self.udp_send(s, self.dns, self.dns_port, q)
             let t0 = self.clock()
             let wait = timeout / 3
             while self.clock() - t0 < wait:

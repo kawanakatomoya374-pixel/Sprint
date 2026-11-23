@@ -4,8 +4,15 @@
 # The PCI interrupt pin is routed to an I/O APIC input by the chipset; which one is found by making the card raise a test interrupt (ICS) and seeing
 # where it arrives (the BIOS's interrupt line, and inputs 16-19 as on Q35 machines, are all armed; the one the card's interrupt arrives on is kept).
 #
-# For now it answers "mac" and "stats" and, as a self test, sends an ARP request for the QEMU gateway (10.0.2.2) once the first interrupt has shown that
-# interrupts work, and logs the reply it receives. (The frame interface for a network stack process is the next step.)
+# It answers "mac" and "stats" and, as a self test, sends an ARP request for the QEMU gateway (10.0.2.2) once the first interrupt has shown that
+# interrupts work, and logs the reply it receives.
+#
+# The frame interface for a network stack process (one subscriber, one frame at a time, over a shared segment the stack creates):
+#   stack -> netd   "sub<TAB>segment id"   netd maps the segment and answers "ok<TAB>MAC". Bytes 0..2047 of the segment carry a received frame, bytes 2048..4095 a frame to send.
+#   netd -> stack   "rx<TAB>length"        a received frame is in the segment; netd sends the next one only after the stack answers
+#   stack -> netd   "ack"                  the received frame has been taken (netd keeps up to 64 frames waiting meanwhile, drops the rest)
+#   stack -> netd   "tx<TAB>length"        send the frame in the transmit half; netd copies it into the ring and answers "ok"
+#   stack -> netd   "unsub"
 import io
 import ipc
 import uio
@@ -100,6 +107,12 @@ let int_count = 0
 let rx_frames = 0
 let arp_reply = false
 let tx_frames = 0
+let sub_pid = 0
+let sub_va = 0
+let rxq = []
+let inflight = false
+let inflight_at = 0
+let rx_dropped = 0
 
 func card_open():
     let f = pci_find()
@@ -157,6 +170,10 @@ func card_open():
 func send_frame(data):
     let slot = tx_cur
     let base = tx_blk[1] + 16 * slot
+    if tx_frames >= TX_COUNT:                                 # the descriptor must have been used up (descriptor done) before it is reused
+        for spin in range(200000):
+            if (uio.peek8(base + 12) & 1) != 0:
+                break
     let buf = tx_blk[1] + TX_COUNT * 16 + BUF * slot
     for i in range(len(data)):
         uio.poke8(buf + i, data[i])
@@ -210,6 +227,29 @@ func look(va, n):
         log("ARP reply: " .. ip_str(ip) .. " is at " .. m2.join(":"))
         arp_reply = true
 
+# the frames for the subscribed stack: copied off the ring into rxq, handed over one at a time
+func queue_frame(va, n):
+    if sub_pid == 0:
+        return nil
+    if len(rxq) >= 64 or n > 1514:
+        rx_dropped += 1
+        return nil
+    let f = []
+    f.reserve(n)
+    for i in range(n):
+        f.append(uio.peek8(va + i))
+    rxq.append(f)
+
+func deliver():
+    if sub_pid == 0 or inflight or len(rxq) == 0:
+        return nil
+    let f = rxq.remove_at(0)
+    for i in range(len(f)):
+        uio.poke8(sub_va + i, f[i])
+    inflight = true
+    inflight_at = psys.ms()
+    ipc.send(sub_pid, "rx\t" .. to_string(len(f)))
+
 # ---- main ------------------------------------------------------------------------------------------------------------------------
 let problem = card_open()
 let my_ip = [10, 0, 2, 15]
@@ -233,10 +273,13 @@ let started = psys.ms()
 let arp_sent = false
 while running:
     io.flush()
-    let m = ipc.recv_from(true, 500 if problem == nil and not arp_sent else 0)
+    let m = ipc.recv_from(true, 500 if problem == nil and not arp_sent else (1000 if inflight else 0))
     if m == nil:
+        if inflight and psys.ms() - inflight_at > 2000:
+            inflight = false                                  # the stack never answered: do not stall for ever
+            deliver()
         # (only before the first interrupt shows up: report it rather than wait for ever)
-        if irq_gsi < 0:
+        if irq_gsi < 0 and not arp_sent:
             log("no interrupt arrived from the card (ICR " .. to_string(rd(ICR)) .. ", IMS " .. to_string(rd(IMS)) .. ", PCI command " .. to_string(cfg_r32(pcibdf, 4) & 0xFFFF) .. ", interrupt line/pin " .. to_string(cfg_r32(pcibdf, 0x3C) & 0xFFFF) .. ")")
         arp_sent = true
         continue
@@ -251,7 +294,9 @@ while running:
             log("interrupt works: card input " .. to_string(gsi) .. " (cause " .. to_string(cause) .. ")")
         for f in take_frames():
             look(f[0], f[1])
+            queue_frame(f[0], f[1])
         ipc.irq_ack(gsi)
+        deliver()
         if not arp_sent and irq_gsi >= 0:
             arp_sent = true
             # who has 10.0.2.2? (QEMU's user-mode network answers for its gateway)
@@ -260,7 +305,39 @@ while running:
     if q[0] == "mac":
         ipc.send(src, "ok\t" .. mac.map(b => hex2(b)).join(":"))
     elif q[0] == "stats":
-        ipc.send(src, "ok\t" .. to_string(int_count) .. "\t" .. to_string(rx_frames) .. "\t" .. to_string(tx_frames))
+        ipc.send(src, "ok\t" .. to_string(int_count) .. "\t" .. to_string(rx_frames) .. "\t" .. to_string(tx_frames) .. "\t" .. to_string(rx_dropped))
+    elif q[0] == "sub":
+        if problem != nil:
+            ipc.send(src, "err\t" .. problem)
+        else:
+            let seg = ipc.shm_open(to_int(q[1]))
+            if seg[1] < 4096:
+                ipc.send(src, "err\tsegment too small")
+            else:
+                sub_pid = src
+                sub_va = seg[0]
+                rxq = []
+                inflight = false
+                ipc.send(src, "ok\t" .. mac.map(b => hex2(b)).join(":"))
+    elif q[0] == "tx" and src == sub_pid:
+        let n = to_int(q[1])
+        if n == nil or n < 14 or n > 1514:
+            ipc.send(src, "err\tbad length")
+        else:
+            let f = []
+            f.reserve(n)
+            for i in range(n):
+                f.append(uio.peek8(sub_va + 2048 + i))
+            send_frame(f)
+            ipc.send(src, "ok")
+    elif q[0] == "ack" and src == sub_pid:
+        inflight = false
+        deliver()
+    elif q[0] == "unsub" and src == sub_pid:
+        sub_pid = 0
+        rxq = []
+        inflight = false
+        ipc.send(src, "ok")
     elif q[0] == "quit":
         ipc.send(src, "ok")
         running = false
