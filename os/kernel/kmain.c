@@ -41,13 +41,21 @@ static uint64_t g_log_end;
 
 /* the boot menu's `quiet` option: no output on the serial port (the in-memory log is kept; panics and exceptions switch it back on) */
 static int g_quiet;
+static volatile int g_serial_lock;
 void serial_write(const char *s, size_t n) {
+    /* one writer at a time, so what two CPUs print does not interleave inside a line (bounded wait: a panic must still get out) */
+    int locked = 0;
+    for (int spin = 0; spin < 20000000; spin++) {
+        if (!__atomic_exchange_n(&g_serial_lock, 1, __ATOMIC_ACQUIRE)) { locked = 1; break; }
+        __builtin_ia32_pause();
+    }
     for (size_t i = 0; i < n; i++) {
         g_log[g_log_end++ % LOG_SIZE] = s[i];
         if (g_quiet) continue;
         for (int spin = 0; spin < 100000 && !(inb(0x3FD) & 0x20); spin++) {}
         outb(0x3F8, (uint8_t)s[i]);
     }
+    if (locked) __atomic_store_n(&g_serial_lock, 0, __ATOMIC_RELEASE);
 }
 void serial_puts(const char *s) { serial_write(s, strlen(s)); }
 
@@ -107,6 +115,7 @@ void reboot(void) {
 /* ------------------------------------------------------------------ */
 /* clock: the TSC, calibrated against the PIT                          */
 /* ------------------------------------------------------------------ */
+#define LAPIC_ID() (((volatile uint32_t *)(uintptr_t)0xFEE00000u)[0x20 / 4] >> 24)
 static uint64_t g_tsc_hz = 2000000000ull, g_tsc0;
 static inline uint64_t rdtsc(void) {
     uint32_t lo, hi;
@@ -133,8 +142,20 @@ uint64_t uptime_ms(void) { return uptime_us() / 1000; }
 enum { PAGE = 4096, MAX_RANGES = 4096 };
 static Range g_free[MAX_RANGES]; /* sorted by start, never adjacent */
 static int g_nfree;
+static volatile int g_page_lock; /* libc's mmap emulation runs on every CPU */
+static void page_lock(void) {
+    while (__atomic_exchange_n(&g_page_lock, 1, __ATOMIC_ACQUIRE))
+        while (__atomic_load_n(&g_page_lock, __ATOMIC_RELAXED)) __builtin_ia32_pause();
+}
+static void page_unlock(void) { __atomic_store_n(&g_page_lock, 0, __ATOMIC_RELEASE); }
 
+static void range_free_locked(uint64_t start, uint64_t len);
 static void range_free(uint64_t start, uint64_t len) {
+    page_lock();
+    range_free_locked(start, len);
+    page_unlock();
+}
+static void range_free_locked(uint64_t start, uint64_t len) {
     int i = 0;
     while (i < g_nfree && g_free[i].start < start) i++;
     if (i > 0 && g_free[i - 1].start + g_free[i - 1].len == start) {
@@ -157,7 +178,14 @@ static void range_free(uint64_t start, uint64_t len) {
     g_mem_free_pages += len / PAGE;
 }
 
+static void *page_alloc_locked(uint64_t len);
 static void *page_alloc(uint64_t len) {
+    page_lock();
+    void *r = page_alloc_locked(len);
+    page_unlock();
+    return r;
+}
+static void *page_alloc_locked(uint64_t len) {
     len = (len + PAGE - 1) & ~(uint64_t)(PAGE - 1);
     for (int i = 0; i < g_nfree; i++) {
         if (g_free[i].len >= len) {
@@ -417,16 +445,13 @@ static size_t os_write(void *ud, int stream, const char *data, size_t len) {
     return len;
 }
 
-static int os_main(int argc, char **argv, char **envp) {
-    (void)argc;
-    (void)argv;
-    (void)envp;
-    cpu_capture_fs();
+/* a kernel Sprint VM for this CPU: runs osmain (the BSP sets everything up; an application processor's copy only installs its scheduler) */
+static void run_kernel_vm(int cpu) {
     SpConfig cfg;
     sp_config_init(&cfg);
     cfg.capabilities = SP_CAP_STDIO_WRITE | SP_CAP_CLOCK;
     cfg.deterministic = 0;
-    cfg.limits.max_heap_bytes = (uint64_t)g_mem_total / 2;
+    cfg.limits.max_heap_bytes = (uint64_t)g_mem_total / 2 / 4;
     cfg.write = os_write;
     cfg.loader = os_loader;
     SpVM *vm;
@@ -437,6 +462,7 @@ static int os_main(int argc, char **argv, char **envp) {
         while (*w == ' ') w++;
     }
     if (hw_register(vm) != SP_OK) kpanic("cannot register the hw module");
+    if (shared_register(vm) != SP_OK) kpanic("cannot register the k module");
     SpProgram *prog;
     const char *entry = "osmain";
     SpStatus st = sp_compile(vm, entry, &prog);
@@ -453,7 +479,7 @@ static int os_main(int argc, char **argv, char **envp) {
     {
         char b[96];
         int k = snprintf(b, sizeof b, "\n[kernel] osmain ended with status %d\n", (int)st);
-        serial_write(b, (size_t)k);
+        if (cpu == 0) serial_write(b, (size_t)k);
         if (st != SP_OK) {
             SpValue e = sp_last_error(vm);
             if (e.type == SP_T_ERROR) {
@@ -468,6 +494,21 @@ static int os_main(int argc, char **argv, char **envp) {
         }
     }
     if (st != SP_OK) power_off();
+}
+
+void ap_vm_run(int cpu) { run_kernel_vm(cpu); }
+
+/* libc's lock switch: the kernel is one libc "process" with no threads, so malloc and stdio skip their locks; every CPU now calls them */
+extern struct { char can_do_threads, threaded, secure; volatile signed char need_locks; } __libc;
+
+static int os_main(int argc, char **argv, char **envp) {
+    (void)argc;
+    (void)argv;
+    (void)envp;
+    cpu_capture_fs();
+    __libc.need_locks = 1;
+    smp_note_apic(0, LAPIC_ID());
+    run_kernel_vm(0);
     smp_run_bsp();
 }
 
@@ -479,6 +520,7 @@ void kmain(uint64_t mbi) {
     parse_boot_info(mbi);
     serial_puts("[kernel] Sprint OS booting\n");
     carve_user_memory();
+    upage_init();
     {
         char b[128];
         int k = snprintf(b, sizeof b, "[kernel] %lu MiB free, tsc %lu MHz, fb %ux%u\n", (unsigned long)(g_mem_total >> 20),

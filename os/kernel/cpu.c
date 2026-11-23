@@ -30,6 +30,21 @@ static uint64_t g_gdt[5 + 2 * MAX_CPUS] __attribute__((aligned(16)));
 static IdtEntry g_idt[256] __attribute__((aligned(16)));
 static uint8_t g_trap_stack[MAX_CPUS][TRAP_STACK] __attribute__((aligned(16)));
 static uint64_t g_kernel_fs;
+/* each CPU's own thread-local storage: the Sprint runtime keeps per-VM scratch state in _Thread_local variables (trace recorder, JIT), and libc has errno and
+ * its thread block. The BSP uses the block libc set up at start; an application processor gets a zeroed .tbss (os/link.ld: __tls_size) with a copy of
+ * the BSP's thread control block. */
+enum { TLS_AREA = 128 * 1024, TLS_TCB = 1024 };
+static uint8_t g_tls_area[MAX_CPUS][TLS_AREA] __attribute__((aligned(64)));
+extern char __tls_size[];
+static uint64_t cpu_tls(int id) {
+    if (id == 0) return g_kernel_fs;
+    if ((uint64_t)(uintptr_t)__tls_size + 64 > TLS_AREA - TLS_TCB) kpanic("static TLS is larger than the per-CPU area");
+    uint64_t tp = (uint64_t)(uintptr_t)&g_tls_area[id][TLS_AREA - TLS_TCB];
+    memset(g_tls_area[id], 0, TLS_AREA);
+    memcpy((void *)(uintptr_t)tp, (const void *)(uintptr_t)g_kernel_fs, TLS_TCB);
+    *(uint64_t *)(uintptr_t)tp = tp; /* the thread block's self pointer */
+    return tp;
+}
 volatile uint64_t g_irq_count[256];
 int lapic_present;
 extern const uint64_t isr_table[256];
@@ -103,8 +118,8 @@ void cpu_init(int id) {
         uint64_t fs = rdmsr_(0xC0000100);
         g_kernel_fs = fs;
     }
-    pc->kfs = g_kernel_fs;
-    if (id != 0) wrmsr_(0xC0000100, g_kernel_fs); /* libc's thread pointer */
+    pc->kfs = cpu_tls(id);
+    if (id != 0) wrmsr_(0xC0000100, pc->kfs); /* libc's thread pointer: this CPU's own */
     Tss *t = &g_tss[id];
     t->rsp[0] = pc->rsp0;
     t->iopb_off = (uint16_t)offsetof(Tss, iopb);

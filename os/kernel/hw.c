@@ -528,6 +528,14 @@ static SpStatus h_set_hooks(SpVM *vm, int argc, const SpValue *argv, SpValue *re
     *ret = sp_nil();
     return SP_OK;
 }
+static SpStatus h_ap_go(SpVM *vm, int argc, const SpValue *argv, SpValue *ret) {
+    (void)vm;
+    (void)argc;
+    (void)argv;
+    smp_go();
+    *ret = sp_nil();
+    return SP_OK;
+}
 static SpStatus h_set_timer(SpVM *vm, int argc, const SpValue *argv, SpValue *ret) {
     (void)argc;
     ARG_INT(0, n);
@@ -553,7 +561,7 @@ static SpStatus h_kick(SpVM *vm, int argc, const SpValue *argv, SpValue *ret) {
 
 static const SpNativeDesc hw_fns[] = {
     {"rsdp", 0, 0, 0, 0, h_rsdp}, {"set_hooks", 2, 2, 0, 0, h_set_hooks}, {"set_timer", 1, 1, 0, 0, h_set_timer},
-    {"ap_start", 2, 2, 0, 0, h_ap_start}, {"kick", 0, 0, 0, 0, h_kick},
+    {"ap_start", 2, 2, 0, 0, h_ap_start}, {"ap_go", 0, 0, 0, 0, h_ap_go}, {"kick", 0, 0, 0, 0, h_kick},
     {"rdmsr", 1, 1, 0, 0, h_rdmsr}, {"wrmsr", 2, 2, 0, 0, h_wrmsr},
     {"initrd", 0, 0, 0, SP_NATIVE_ALLOCATES, h_initrd},
     {"inb", 1, 1, 0, 0, h_inb}, {"inw", 1, 1, 0, 0, h_inw}, {"inl", 1, 1, 0, 0, h_inl},

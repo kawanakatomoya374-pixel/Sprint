@@ -57,6 +57,8 @@ export class Process:
     let inbox = []       # messages waiting (strings)
     let inbox_from = []  # the sender's pid of each
     let rfrom = 0        # where a blocked msg_recv wants the sender's pid (0 = nowhere)
+    let children = {}    # pids this process has started and not yet waited for (they may live on another CPU)
+    let exited = {}      # child pid -> exit status, for children that ended before the parent waited
     let mmio = false     # may map device registers (a driver)
     let dma = false      # may allocate physically contiguous DMA memory
     let ports = []       # I/O port ranges [first, count, ...] this process may use (a driver)
@@ -72,6 +74,8 @@ export class Process:
         self.shm = []
         self.inbox = []
         self.inbox_from = []
+        self.children = {}
+        self.exited = {}
         self.ports = []
     func add_region(self, start, end, flags):
         let r = Region()

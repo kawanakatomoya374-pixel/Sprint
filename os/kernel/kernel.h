@@ -18,6 +18,10 @@ extern uint64_t g_mem_total, g_mem_free_pages;
 typedef struct Range { uint64_t start, len; } Range;
 extern Range g_user_mem[64];
 extern int g_nuser_mem;
+void upage_init(void);
+uint64_t upage_alloc(void);
+void upage_free(uint64_t a);
+uint64_t upage_alloc_contig(uint64_t n);
 
 static inline void outb(uint16_t p, uint8_t v) { __asm__ volatile("outb %0, %1" : : "a"(v), "Nd"(p)); }
 static inline uint8_t inb(uint16_t p) { uint8_t v; __asm__ volatile("inb %1, %0" : "=a"(v) : "Nd"(p)); return v; }

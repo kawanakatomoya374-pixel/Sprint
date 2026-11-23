@@ -162,10 +162,7 @@ export func dispatch(p):
         let first = kmem.alloc_contig(n)
         if first == 0:
             return ENOMEM
-        let pages = []
-        for i in range(n):
-            pages.append(first + i * 4096)
-        let r = shm.adopt(p, pages)
+        let r = shm.adopt(p, first, n)
         p.space.write64(arg(p, 1), r[0])
         p.space.write64(arg(p, 1) + 8, r[1])
         p.space.write64(arg(p, 1) + 16, first)

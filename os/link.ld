@@ -9,5 +9,6 @@ SECTIONS
     .data : ALIGN(4096) { *(.data .data.*) }
     .bss : ALIGN(4096) { *(COMMON) *(.bss .bss.*) }
     _end = .;
+    __tls_size = SIZEOF(.tbss);
     /DISCARD/ : { *(.comment) *(.note*) *(.eh_frame*) }
 }

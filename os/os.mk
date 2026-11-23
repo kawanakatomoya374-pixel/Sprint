@@ -11,7 +11,7 @@ OSCOMMON := $(OSWARN) -O2 -g -Isrc -Ios/kernel -fno-stack-protector -fno-delete-
 OSKFLAGS := $(OSCOMMON) -static -fno-pie -fno-pic -mno-red-zone -DSP_OS
 OSUFLAGS := $(OSCOMMON) -fPIE -DSP_OS_USER
 CORE_SRC := $(FRONT_SRC) $(RUNTIME_SRC) $(LIB_SRC)
-OSKSRC   := $(CORE_SRC) os/kernel/kmain.c os/kernel/hw.c os/kernel/cpu.c os/kernel/smp.c
+OSKSRC   := $(CORE_SRC) os/kernel/kmain.c os/kernel/hw.c os/kernel/cpu.c os/kernel/smp.c os/kernel/shared.c
 OSUSRC   := $(CORE_SRC) os/user/umain.c os/user/udev.c
 OSKOBJ   := $(patsubst %.c,$(OSB)/k/%.o,$(OSKSRC)) $(OSB)/k/bundled.o $(OSB)/boot.o $(OSB)/cpu_s.o $(OSB)/isr_stubs.o $(OSB)/ap_tramp.o $(OSB)/initrd.o
 OSUOBJ   := $(patsubst %.c,$(OSB)/u/%.o,$(OSUSRC)) $(OSB)/u/bundled.o
@@ -149,6 +149,10 @@ os-net-test: $(OSB)/sprintos-nettest.img $(BUILD)/sprint
 # the JIT inside the kernel's own Sprint VM: with and without it (kernel command line `kbench` / `nojit`)
 os-jit-test: $(OSB)/kernel.elf $(BUILD)/sprint
 	python3 os/tests/jit_test.py $(OSB)
+
+# does the kernel's own work run in parallel? (system-call-heavy processes on 1, 2 and 4 CPUs)
+os-smp-test: $(OSB)/kernel.elf $(BUILD)/sprint
+	python3 os/tests/smp_test.py $(OSB)
 
 # a second ATA disk formatted with SprintFS: the Sprint kernel mounts it, reads and writes it
 os-disk-test: $(OSB)/sprintos-fstest.img $(BUILD)/sprint

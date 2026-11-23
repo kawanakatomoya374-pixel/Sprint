@@ -10,14 +10,22 @@ import ioapic
 const PF = 14
 const SLICE_MS = 10
 
+# Each CPU runs its own copy of this module in its own VM: its own process table and run queue. Processes do not move between CPUs; spawn() places a new one on
+# the least loaded CPU. What crosses CPUs goes through the C side (module k): process ids, names, shared memory, and mailboxes (message, spawn request, exit
+# notice) with an IPI to wake the receiver.
+import k
+const KIND_MSG = 1      # a = destination pid, b = sender pid, text = the message
+const KIND_SPAWN = 2    # a = new pid, b = parent pid, text = the program
+const KIND_EXIT = 3     # a = parent pid, b = child pid, c = exit status
+const MAX_CPUS = 8
+
+let me = -1             # this CPU
 let procs = {}
-let kick_needed = false
 let order = []
-let next_pid = 1
 let image = nil
 let preemptions = 0
 export let switches = 0
-let cpu_runs = {}     # cpu -> how many times it was given a process to run
+let started = false
 
 func log(s):
     ksys.log(s)
@@ -26,7 +34,6 @@ func log(s):
 const GUI = ["guid"]
 const PORTS = {fsd: [0x1F0, 8, 0x3F6, 1, 0x170, 8, 0x376, 1], gpud: [0xCF8, 8], inputd: [0x60, 1, 0x64, 1], netd: [0xCF8, 8]}
 const DRIVERS = ["gpud", "netd"]       # may map device registers and allocate DMA memory
-let names = {}        # service name -> pid
 let io_open = {}      # cpu -> the port ranges currently open in its I/O permission bitmap
 let io_pid = {}       # cpu -> pid they belong to
 
@@ -46,22 +53,38 @@ func io_apply(cpu, p):
         io_open[cpu] = p.ports
     io_pid[cpu] = want
 
-# interrupts for drivers: the ISA irqs / interrupt inputs a program may take over
+# interrupts for drivers: the ISA irqs / interrupt inputs a program may take over (the owners are kept by the C side)
 const IRQS = {inputd: [1, 12], netd: [10, 11, 16, 17, 18, 19, 20, 21, 22, 23]}
-let irq_owner = {}    # global system interrupt -> pid
 
-# queue a message for q (from the kernel: sender 0, or from process `from`); wakes q if it is waiting
+func set_ret(p, v):
+    hw.poke64(p.ctx + kproc.CTX_RAX, v)
+
+# queue a message for local process q (from the kernel: sender 0, or from a process); wakes q if it is waiting
 func post(q, sender, m):
+    if len(q.inbox) >= 64:
+        return nil
     q.inbox.append(m)
     q.inbox_from.append(sender)
     if q.state == "msgwait":
         deliver(q)
-        kick_needed = true
+
+# a message for any process, wherever it lives; false when it could not be queued
+func send_to(pid, sender, m):
+    let c = k.pid_cpu(pid)
+    if c < 0:
+        return false
+    if c == me:
+        if not (pid in procs):
+            return false
+        post(procs[pid], sender, m)
+        return true
+    return k.mbox_send(c, KIND_MSG, pid, sender, 0, m)
 
 # an interrupt from input `gsi` arrived: tell its driver (one message per interrupt; the input stays masked until the driver acks it)
 func handle_irq(gsi):
-    if gsi in irq_owner and irq_owner[gsi] in procs and procs[irq_owner[gsi]].state != "zombie":
-        post(procs[irq_owner[gsi]], 0, "irq\t" .. to_string(gsi))
+    let owner = k.irq_owner(gsi)
+    if owner != 0:
+        send_to(owner, 0, "irq\t" .. to_string(gsi))
     else:
         log("interrupt " .. to_string(gsi) .. " has no driver")
 
@@ -72,17 +95,33 @@ func take_irqs():
             if (bits >> g) & 1 != 0:
                 handle_irq(g)
 
-export func init(img):
+# this CPU's scheduler comes up
+export func init(img, cpu):
     image = img
+    me = cpu
+    k.load_set(cpu, 0)
 
-export func spawn(mod, parent):
-    let pid = next_pid
-    next_pid += 1
+# the CPU with the fewest processes (among those whose scheduler is running)
+func place():
+    let best = me
+    let bl = k.load_get(me)
+    for c in range(MAX_CPUS):
+        if c != me and k.ready(c) and k.load_get(c) < bl:
+            best = c
+            bl = k.load_get(c)
+    return best
+
+# create process `pid` here
+func spawn_here(pid, mod, parent):
     let p = kproc.spawn(pid, mod, image[0], image[1], ["userland", mod])
     if type(p) == "string":
         log("spawn " .. mod .. " failed: " .. p)
+        exit_notice(parent, pid, -2)
+        k.pid_gone(pid)
+        k.load_add(me, -1)
         return -2
     p.parent = parent
+    p.cpu = me
     p.gui = GUI.contains(mod)
     p.mmio = DRIVERS.contains(mod)
     p.dma = p.mmio
@@ -90,26 +129,56 @@ export func spawn(mod, parent):
         p.ports = PORTS[mod]
     procs[pid] = p
     order.append(pid)
-    kick_needed = true
     return pid
 
-func set_ret(p, v):
-    hw.poke64(p.ctx + kproc.CTX_RAX, v)
+# start `mod` as a child of `parent` on the least loaded CPU; returns the new pid
+export func spawn(mod, parent):
+    let c = place()
+    let pid = k.pid_new(c)
+    k.load_add(c, 1)
+    if parent != 0 and parent in procs:
+        procs[parent].children[pid] = true
+    if c == me:
+        spawn_here(pid, mod, parent)
+    elif not k.mbox_send(c, KIND_SPAWN, pid, parent, 0, mod):
+        k.pid_gone(pid)
+        k.load_add(c, -1)
+        return -11
+    return pid
+
+# a child ended: hand its status to the parent (on any CPU)
+func exit_notice(parent, child, code):
+    if parent == 0:
+        return nil
+    let c = k.pid_cpu(parent)
+    if c < 0:
+        return nil
+    if c == me:
+        child_exited(parent, child, code)
+    else:
+        k.mbox_send(c, KIND_EXIT, parent, child, code, "")
+
+func child_exited(parent, child, code):
+    if not (parent in procs):
+        return nil
+    let par = procs[parent]
+    if par.state == "wait" and par.waiting == child:
+        set_ret(par, code)
+        par.state = "run"
+        par.waiting = 0
+        par.children[child] = nil
+    else:
+        par.exited[child] = code
 
 func finish(p):
-    # free the address space now; keep the exit status until the parent waits for it
+    # free the address space now and tell the parent how it ended; the process is gone
     let code = p.exit_code
     p.destroy()
     p.state = "zombie"
-    p.exit_code = code
-    let par = procs[p.parent] if p.parent in procs else nil
-    if par != nil and par.state == "wait" and par.waiting == p.pid:
-        set_ret(par, code)
-        par.state = "run"
-        kick_needed = true
-        reap(p.pid)
-    elif par == nil:
-        reap(p.pid)
+    reap(p.pid)
+    exit_notice(p.parent, p.pid, code)
+    k.pid_gone(p.pid)
+    k.load_add(me, -1)
 
 func reap(pid):
     procs[pid] = nil
@@ -138,6 +207,21 @@ func deliver(p):
     if p.state == "msgwait":
         p.state = "run"
 
+# what other CPUs sent this one
+func drain_mailbox():
+    while true:
+        let m = k.mbox_recv()
+        if m == nil:
+            return nil
+        let kind = m[0]
+        if kind == KIND_MSG:
+            if m[1] in procs:
+                post(procs[m[1]], m[2], m[4])
+        elif kind == KIND_SPAWN:
+            spawn_here(m[1], m[4], m[2])
+        elif kind == KIND_EXIT:
+            child_exited(m[1], m[2], m[3])
+
 # scheduler-level system calls; returns true when `p` can keep running (its result is already in rax)
 func syscall(p):
     let nr = hw.peek64(p.ctx + kproc.CTX_RAX)
@@ -157,51 +241,45 @@ func syscall(p):
         return true
     if nr == 1001:   # wait(pid) -> exit status
         let pid = hw.peek64(p.ctx + kproc.CTX_RDI)
-        if not (pid in procs) or procs[pid].parent != p.pid:
+        if not (pid in p.children):
             set_ret(p, -10)
             return true
-        let c = procs[pid]
-        if c.state == "zombie":
-            set_ret(p, c.exit_code)
-            reap(pid)
+        if pid in p.exited:
+            set_ret(p, p.exited[pid])
+            p.exited[pid] = nil
+            p.children[pid] = nil
             return true
         p.state = "wait"
         p.waiting = pid
         return false
     if nr == 1013:   # msg_send(pid, buf, len) -> len
-        let q = procs[hw.peek64(p.ctx + kproc.CTX_RDI)] if hw.peek64(p.ctx + kproc.CTX_RDI) in procs else nil
+        let dest = hw.peek64(p.ctx + kproc.CTX_RDI)
         let n = hw.peek64(p.ctx + kproc.CTX_RDX)
-        if q == nil or q.state == "zombie":
+        if k.pid_cpu(dest) < 0:
             set_ret(p, -3)
             return true
-        if n < 0 or n > 4096 or len(q.inbox) >= 64:
-            set_ret(p, -11 if n >= 0 and n <= 4096 else -22)
+        if n < 0 or n > 4096:
+            set_ret(p, -22)
             return true
         let m = p.space.read(hw.peek64(p.ctx + kproc.CTX_RSI), n)
         if m == nil:
             set_ret(p, -14)
             return true
-        post(q, p.pid, m)
+        if not send_to(dest, p.pid, m):
+            set_ret(p, -11)
+            return true
         set_ret(p, n)
         return true
     if nr == 1015:   # ns_register(name, len) -> 0: the calling process serves `name`
         let nm = p.space.read(hw.peek64(p.ctx + kproc.CTX_RDI), hw.peek64(p.ctx + kproc.CTX_RSI))
-        if nm == nil or len(nm) == 0 or len(nm) > 32:
-            set_ret(p, -22)
-        elif nm in names and names[nm] in procs and procs[names[nm]].state != "zombie":
-            set_ret(p, -17)
+        if nm == nil:
+            set_ret(p, -14)
         else:
-            names[nm] = p.pid
-            set_ret(p, 0)
+            set_ret(p, k.name_set(nm, p.pid))
         return true
     if nr == 1016:   # ns_lookup(name, len) -> pid of the server, or -2
         let nm = p.space.read(hw.peek64(p.ctx + kproc.CTX_RDI), hw.peek64(p.ctx + kproc.CTX_RSI))
-        if nm == nil:
-            set_ret(p, -14)
-        elif nm in names and names[nm] in procs and procs[names[nm]].state != "zombie":
-            set_ret(p, names[nm])
-        else:
-            set_ret(p, -2)
+        set_ret(p, -14 if nm == nil else k.name_get(nm))
         return true
     if nr == 1030:   # irq_register(irq, pci): this driver takes interrupt `irq` (an ISA irq, or with pci != 0 a global system interrupt); returns the global interrupt number
         let irq = hw.peek64(p.ctx + kproc.CTX_RDI)
@@ -210,17 +288,16 @@ func syscall(p):
         let gsi = irq if pci else ioapic.gsi_of(irq)
         if not allowed.contains(irq) or gsi < 0 or gsi >= 24:
             set_ret(p, -1)
-        elif gsi in irq_owner and irq_owner[gsi] != p.pid and irq_owner[gsi] in procs and procs[irq_owner[gsi]].state != "zombie":
+        elif k.irq_owner_set(gsi, p.pid) != 0:
             set_ret(p, -16)
         else:
-            irq_owner[gsi] = p.pid
             ioapic.route(gsi, lapic.id(), -1 if pci else irq)
             hw.irq_mask(gsi, 0)
             set_ret(p, gsi)
         return true
     if nr == 1031:   # irq_ack(gsi): the driver has served the device; let the interrupt through again
         let gsi = hw.peek64(p.ctx + kproc.CTX_RDI)
-        if gsi in irq_owner and irq_owner[gsi] == p.pid:
+        if k.irq_owner(gsi) == p.pid:
             hw.irq_mask(gsi, 0)
             set_ret(p, 0)
         else:
@@ -246,24 +323,16 @@ func syscall(p):
     set_ret(p, r)
     return true
 
-func alive():
-    let n = 0
-    for pid in order:
-        if procs[pid].state != "zombie":
-            n += 1
-    return n
-
 let cur = {}      # cpu -> process running there
 let rr = 0
 let t_start = 0
-let kicks = 0
 
 # wake any sleeper whose time has come; true when some process is runnable now
 func ready(now):
     let n = len(order)
     let any = false
-    for k in range(n):
-        let p = procs[order[k]]
+    for i in range(n):
+        let p = procs[order[i]]
         if p.state == "sleep" and p.wake <= now:
             p.state = "run"
         if p.state == "msgwait" and p.mwake != 0 and p.mwake <= now:
@@ -274,36 +343,49 @@ func ready(now):
             any = true
     return any
 
+# the first process exists: from now on, when no process is left anywhere the machine is done
+export func boot_done():
+    started = true
+    k.flag_set(1)
+
 # called by a CPU that has nothing to do: the context to run next (0 = idle until the next interrupt)
 export func pick(cpu):
     if t_start == 0:
         t_start = hw.ticks_us()
     let now = hw.ticks_us()
+    drain_mailbox()
     take_irqs()
     ready(now)
     let n = len(order)
-    for k in range(n):
-        let i = (rr + k) % n
-        let p = procs[order[i]]
+    for i in range(n):
+        let j = (rr + i) % n
+        let p = procs[order[j]]
         if p.state == "run":
-            rr = (i + 1) % n
+            rr = (j + 1) % n
             p.state = "on"
             p.cpu = cpu
             io_apply(cpu, p)
             cur[cpu] = p
             switches += 1
-            cpu_runs[cpu] = (cpu_runs[cpu] if cpu in cpu_runs else 0) + 1
+            k.stat_set(cpu, 0, switches)
             return p.ctx
-    if alive() == 0:
+    if k.flag_get(1) != 0 and k.nproc() == 0:
         done()
     return 0
 
 func done():
-    log("scheduler: " .. to_string(switches) .. " switches, " .. to_string(preemptions) .. " timer preemptions, " .. to_string((hw.ticks_us() - t_start) // 1000) .. " ms")
+    if k.flag_set(2) != 0:
+        return nil
     let per = []
-    for c in range(8):
-        if c in cpu_runs:
-            per.append("cpu" .. to_string(c) .. "=" .. to_string(cpu_runs[c]))
+    let total = 0
+    let pre = 0
+    for c in range(MAX_CPUS):
+        let r = k.stat_get(c, 0)
+        total += r
+        pre += k.stat_get(c, 1)
+        if r > 0:
+            per.append("cpu" .. to_string(c) .. "=" .. to_string(r))
+    log("scheduler: " .. to_string(total) .. " switches, " .. to_string(pre) .. " timer preemptions, " .. to_string((hw.ticks_us() - t_start) // 1000) .. " ms")
     log("runs per cpu: " .. per.join(" "))
     log("free pages after exit: " .. to_string(kmem.free_count()))
     hw.poweroff()
@@ -316,12 +398,11 @@ export func trap(cpu, v):
     if v == 256:
         if not syscall(p) and p.exit_code != nil:
             finish(p)
-        elif p.state == "run" or p.state == "zombie":
-            pass
     elif v == lapic.TIMER_VECTOR:
         lapic.eoi()
         p.slices += 1
         preemptions += 1
+        k.stat_set(cpu, 1, preemptions)
     elif v == PF and p.fault(hw.peek64(p.ctx + kproc.CTX_CR2)):
         pass
     elif v >= ioapic.VECTOR_BASE and v < ioapic.VECTOR_BASE + 24:
@@ -335,6 +416,3 @@ export func trap(cpu, v):
         log("pid " .. to_string(p.pid) .. " (" .. p.name .. "): trap " .. to_string(v) .. " err=" .. to_string(hw.peek64(p.ctx + kproc.CTX_ERR)) .. " rip=" .. to_string(hw.peek64(p.ctx + kproc.CTX_RIP)) .. " cr2=" .. to_string(hw.peek64(p.ctx + kproc.CTX_CR2)))
         p.exit_code = 139
         finish(p)
-    if kick_needed:
-        kick_needed = false
-        hw.kick()
