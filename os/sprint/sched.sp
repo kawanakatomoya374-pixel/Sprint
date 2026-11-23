@@ -20,6 +20,29 @@ export let switches = 0
 func log(s):
     ksys.log(s)
 
+# what a program may do beyond computing: the framebuffer and input (gui), and the I/O ports of a driver
+const GUI = ["desktop", "guid"]
+const PORTS = {fsd: [0x1F0, 8, 0x3F6, 1, 0x170, 8, 0x376, 1]}
+let names = {}        # service name -> pid
+let io_open = {}      # cpu -> the port ranges currently open in its I/O permission bitmap
+let io_pid = {}       # cpu -> pid they belong to
+
+# make the I/O permission bitmap of `cpu` match what `p` may use
+func io_apply(cpu, p):
+    let want = p.pid if len(p.ports) > 0 else 0
+    let have = io_pid[cpu] if cpu in io_pid else 0
+    if want == have:
+        return
+    if have != 0:
+        let r = io_open[cpu]
+        for i in range(len(r) // 2):
+            hw.iopb_set(cpu, r[2 * i], r[2 * i + 1], 0)
+    if want != 0:
+        for i in range(len(p.ports) // 2):
+            hw.iopb_set(cpu, p.ports[2 * i], p.ports[2 * i + 1], 1)
+        io_open[cpu] = p.ports
+    io_pid[cpu] = want
+
 export func init(img):
     image = img
 
@@ -31,7 +54,9 @@ export func spawn(mod, parent):
         log("spawn " .. mod .. " failed: " .. p)
         return -2
     p.parent = parent
-    p.gui = mod == "desktop"
+    p.gui = GUI.contains(mod)
+    if mod in PORTS:
+        p.ports = PORTS[mod]
     procs[pid] = p
     order.append(pid)
     kick_needed = true
@@ -67,7 +92,11 @@ func reap(pid):
 # hand the oldest waiting message to p (its buffer is p.rbuf / p.rcap); the result goes into rax
 func deliver(p):
     let m = p.inbox[0]
+    let sender = p.inbox_from[0]
     p.inbox.remove_at(0)
+    p.inbox_from.remove_at(0)
+    if p.rfrom != 0:
+        p.space.write64(p.rfrom, sender)
     let n = len(m)
     if n > p.rcap:
         n = p.rcap
@@ -121,14 +150,35 @@ func syscall(p):
             set_ret(p, -14)
             return true
         q.inbox.append(m)
+        q.inbox_from.append(p.pid)
         if q.state == "msgwait":
             deliver(q)
             kick_needed = true
         set_ret(p, n)
         return true
+    if nr == 1015:   # ns_register(name, len) -> 0: the calling process serves `name`
+        let nm = p.space.read(hw.peek64(p.ctx + kproc.CTX_RDI), hw.peek64(p.ctx + kproc.CTX_RSI))
+        if nm == nil or len(nm) == 0 or len(nm) > 32:
+            set_ret(p, -22)
+        elif nm in names and names[nm] in procs and procs[names[nm]].state != "zombie":
+            set_ret(p, -17)
+        else:
+            names[nm] = p.pid
+            set_ret(p, 0)
+        return true
+    if nr == 1016:   # ns_lookup(name, len) -> pid of the server, or -2
+        let nm = p.space.read(hw.peek64(p.ctx + kproc.CTX_RDI), hw.peek64(p.ctx + kproc.CTX_RSI))
+        if nm == nil:
+            set_ret(p, -14)
+        elif nm in names and names[nm] in procs and procs[names[nm]].state != "zombie":
+            set_ret(p, names[nm])
+        else:
+            set_ret(p, -2)
+        return true
     if nr == 1014:   # msg_recv(buf, cap, nonblock) -> bytes (blocks when nothing is waiting)
         p.rbuf = hw.peek64(p.ctx + kproc.CTX_RDI)
         p.rcap = hw.peek64(p.ctx + kproc.CTX_RSI)
+        p.rfrom = hw.peek64(p.ctx + kproc.CTX_R10)
         if len(p.inbox) == 0:
             if hw.peek64(p.ctx + kproc.CTX_RDX) != 0:
                 set_ret(p, -11)
@@ -181,6 +231,7 @@ export func pick(cpu):
             rr = (i + 1) % n
             p.state = "on"
             p.cpu = cpu
+            io_apply(cpu, p)
             cur[cpu] = p
             switches += 1
             return p.ctx

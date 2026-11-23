@@ -16,7 +16,7 @@ static SpStatus need_int(SpVM *vm, SpValue v, int64_t *out) {
     return SP_OK;
 }
 #define ARG_INT(i, var)                                  \
-    int64_t var;                                         \
+    int64_t var = 0;                                     \
     do {                                                 \
         SpStatus s_ = need_int(vm, argv[i], &var);       \
         if (s_ != SP_OK) return s_;                      \
@@ -334,6 +334,23 @@ static SpStatus h_kernel_cr3(SpVM *vm, int argc, const SpValue *argv, SpValue *r
     *ret = sp_int((int64_t)(uintptr_t)pml4);
     return SP_OK;
 }
+/* iopb_set(cpu, first, count, allow): open (allow) or close the I/O ports first .. first+count-1 for ring 3 on that CPU */
+static SpStatus h_iopb_set(SpVM *vm, int argc, const SpValue *argv, SpValue *ret) {
+    (void)argc;
+    ARG_INT(0, cpu);
+    ARG_INT(1, first);
+    ARG_INT(2, count);
+    ARG_INT(3, allow);
+    if (cpu < 0 || cpu >= MAX_CPUS || first < 0 || count < 0 || first + count > 65536)
+        return sp_throw(vm, "ValueError", "hw.iopb_set: bad range");
+    uint8_t *map = cpu_iopb((int)cpu);
+    for (int64_t port = first; port < first + count; port++) {
+        if (allow) map[port >> 3] = (uint8_t)(map[port >> 3] & ~(1u << (port & 7)));
+        else map[port >> 3] = (uint8_t)(map[port >> 3] | (1u << (port & 7)));
+    }
+    *ret = sp_nil();
+    return SP_OK;
+}
 static SpStatus h_cpu_id(SpVM *vm, int argc, const SpValue *argv, SpValue *ret) {
     (void)vm;
     (void)argc;
@@ -512,7 +529,7 @@ static const SpNativeDesc hw_fns[] = {
     {"mem_info", 0, 0, 0, SP_NATIVE_ALLOCATES, h_mem_info}, {"serial", 1, 1, 0, 0, h_serial},
     {"log_read", 1, 1, 0, SP_NATIVE_ALLOCATES, h_log_read}, {"cmdline", 0, 0, 0, SP_NATIVE_ALLOCATES, h_cmdline},
     {"ctx_new", 0, 0, 0, 0, h_ctx_new}, {"ctx_free", 1, 1, 0, 0, h_ctx_free}, {"enter", 1, 1, 0, 0, h_enter},
-    {"kernel_cr3", 0, 0, 0, 0, h_kernel_cr3}, {"cpu_id", 0, 0, 0, 0, h_cpu_id}, {"invlpg", 1, 1, 0, 0, h_invlpg},
+    {"kernel_cr3", 0, 0, 0, 0, h_kernel_cr3}, {"iopb_set", 4, 4, 0, 0, h_iopb_set}, {"cpu_id", 0, 0, 0, 0, h_cpu_id}, {"invlpg", 1, 1, 0, 0, h_invlpg},
     {"idle", 0, 0, 0, 0, h_idle}, {"irq_count", 1, 1, 0, 0, h_irq_count}, {"set_lapic", 1, 1, 0, 0, h_set_lapic},
     {"memset", 3, 3, 0, 0, h_memset}, {"memcpy", 3, 3, 0, 0, h_memcpy}, {"str_at", 2, 2, 0, SP_NATIVE_ALLOCATES, h_str_at},
     {"poke_str", 2, 2, 0, 0, h_poke_str}, {"user_mem", 0, 0, 0, SP_NATIVE_ALLOCATES, h_user_mem},

@@ -55,6 +55,9 @@ export class Process:
     let syscalls = 0
     let shm = []         # [segment id, address] of every shared segment mapped
     let inbox = []       # messages waiting (strings)
+    let inbox_from = []  # the sender's pid of each
+    let rfrom = 0        # where a blocked msg_recv wants the sender's pid (0 = nowhere)
+    let ports = []       # I/O port ranges [first, count, ...] this process may use (a driver)
     let rbuf = 0         # where a blocked msg_recv wants its message
     let rcap = 0
     func init(self, pid, name):
@@ -65,6 +68,8 @@ export class Process:
         self.regions = []
         self.shm = []
         self.inbox = []
+        self.inbox_from = []
+        self.ports = []
     func add_region(self, start, end, flags):
         let r = Region()
         r.start = start

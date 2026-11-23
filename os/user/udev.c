@@ -13,6 +13,13 @@ static long sc3(long n, long a, long b, long c) {
     return r;
 }
 
+static long sc4(long n, long a, long b, long c, long d) {
+    long r;
+    register long r10 __asm__("r10") = d;
+    __asm__ volatile("syscall" : "=a"(r) : "a"(n), "D"(a), "S"(b), "d"(c), "r"(r10) : "rcx", "r11", "memory");
+    return r;
+}
+
 static struct { uint8_t *addr; uint32_t w, h, pitch; } g_fb;
 
 static SpStatus need_i(SpVM *vm, SpValue v, int64_t *out) {
@@ -313,14 +320,94 @@ static SpStatus i_recv(SpVM *vm, int argc, const SpValue *argv, SpValue *ret) {
     }
     return sp_new_string(vm, buf, (size_t)n, ret);
 }
+/* recv_from(block = true): [sender pid, message], or nil when none is waiting and block is false. The sender is the kernel's word, not the message's. */
+static SpStatus i_recv_from(SpVM *vm, int argc, const SpValue *argv, SpValue *ret) {
+    static char buf[4096];
+    int nb = argc > 0 && argv[0].type == SP_T_BOOL && !argv[0].as.b;
+    int64_t from = 0;
+    long n = sc4(1014, (long)(uintptr_t)buf, (long)sizeof buf, nb, (long)(uintptr_t)&from);
+    if (n < 0) {
+        *ret = sp_nil();
+        return SP_OK;
+    }
+    SpValue msg;
+    SpStatus st = sp_new_string(vm, buf, (size_t)n, &msg);
+    if (st != SP_OK) return st;
+    st = sp_new_array(vm, 2, ret);
+    if (st != SP_OK) return st;
+    (void)sp_array_push(vm, *ret, sp_int(from));
+    (void)sp_array_push(vm, *ret, msg);
+    return SP_OK;
+}
+/* register(name): this process serves `name`; lookup(name): the pid serving it, or nil */
+static SpStatus i_register(SpVM *vm, int argc, const SpValue *argv, SpValue *ret) {
+    (void)argc;
+    if (argv[0].type != SP_T_STRING) return sp_throw(vm, "TypeError", "ipc.register: expected a name");
+    size_t n;
+    const char *s = sp_string_data(argv[0], &n);
+    long r = sc3(1015, (long)(uintptr_t)s, (long)n, 0);
+    if (r < 0) return sp_throw(vm, "OSError", "ipc.register: error %ld", r);
+    *ret = sp_nil();
+    return SP_OK;
+}
+static SpStatus i_lookup(SpVM *vm, int argc, const SpValue *argv, SpValue *ret) {
+    (void)argc;
+    if (argv[0].type != SP_T_STRING) return sp_throw(vm, "TypeError", "ipc.lookup: expected a name");
+    size_t n;
+    const char *s = sp_string_data(argv[0], &n);
+    long r = sc3(1016, (long)(uintptr_t)s, (long)n, 0);
+    *ret = r < 0 ? sp_nil() : sp_int(r);
+    return SP_OK;
+}
 static const SpNativeDesc ipc_fns[] = {
+    {"recv_from", 0, 1, 0, SP_NATIVE_ALLOCATES, i_recv_from}, {"register", 1, 1, 0, 0, i_register}, {"lookup", 1, 1, 0, 0, i_lookup},
     {"shm_create", 1, 1, 0, SP_NATIVE_ALLOCATES, i_shm_create}, {"shm_open", 1, 1, 0, SP_NATIVE_ALLOCATES, i_shm_open},
     {"shm_close", 1, 1, 0, 0, i_shm_close}, {"shm_read", 3, 3, 0, SP_NATIVE_ALLOCATES, i_shm_read},
     {"shm_write", 3, 3, 0, 0, i_shm_write}, {"shm_get", 2, 2, 0, 0, i_shm_get}, {"shm_set", 3, 3, 0, 0, i_shm_set},
     {"send", 2, 2, 0, 0, i_send}, {"recv", 0, 1, 0, SP_NATIVE_ALLOCATES, i_recv},
 };
 
+/* ---- module `uio`: port I/O for a driver process (the kernel opens the ports in its I/O permission bitmap; anything else faults) ---- */
+static SpStatus u_inb(SpVM *vm, int argc, const SpValue *argv, SpValue *ret) {
+    (void)argc;
+    int64_t p;
+    if (need_i(vm, argv[0], &p) != SP_OK) return SP_E_RUNTIME;
+    uint8_t v;
+    __asm__ volatile("inb %1, %0" : "=a"(v) : "Nd"((uint16_t)p));
+    *ret = sp_int(v);
+    return SP_OK;
+}
+static SpStatus u_inw(SpVM *vm, int argc, const SpValue *argv, SpValue *ret) {
+    (void)argc;
+    int64_t p;
+    if (need_i(vm, argv[0], &p) != SP_OK) return SP_E_RUNTIME;
+    uint16_t v;
+    __asm__ volatile("inw %1, %0" : "=a"(v) : "Nd"((uint16_t)p));
+    *ret = sp_int(v);
+    return SP_OK;
+}
+static SpStatus u_outb(SpVM *vm, int argc, const SpValue *argv, SpValue *ret) {
+    (void)argc;
+    int64_t p, v;
+    if (need_i(vm, argv[0], &p) != SP_OK || need_i(vm, argv[1], &v) != SP_OK) return SP_E_RUNTIME;
+    __asm__ volatile("outb %0, %1" : : "a"((uint8_t)v), "Nd"((uint16_t)p));
+    *ret = sp_nil();
+    return SP_OK;
+}
+static SpStatus u_outw(SpVM *vm, int argc, const SpValue *argv, SpValue *ret) {
+    (void)argc;
+    int64_t p, v;
+    if (need_i(vm, argv[0], &p) != SP_OK || need_i(vm, argv[1], &v) != SP_OK) return SP_E_RUNTIME;
+    __asm__ volatile("outw %0, %1" : : "a"((uint16_t)v), "Nd"((uint16_t)p));
+    *ret = sp_nil();
+    return SP_OK;
+}
+static const SpNativeDesc uio_fns[] = {
+    {"inb", 1, 1, 0, 0, u_inb}, {"inw", 1, 1, 0, 0, u_inw}, {"outb", 2, 2, 0, 0, u_outb}, {"outw", 2, 2, 0, 0, u_outw},
+};
+
 int udev_register(SpVM *vm) {
+    (void)sp_register_module(vm, "uio", uio_fns, sizeof uio_fns / sizeof uio_fns[0]);
     (void)sp_register_module(vm, "ipc", ipc_fns, sizeof ipc_fns / sizeof ipc_fns[0]);
     return (int)sp_register_module(vm, "gdev", gdev_fns, sizeof gdev_fns / sizeof gdev_fns[0]);
 }
