@@ -1,0 +1,37 @@
+libb.so type 3 soname libb.so needed [] runpath  tls true interp nil relro true dynamic true
+liba.so type 3 soname liba.so needed ["libb.so"] runpath $ORIGIN tls false interp nil relro true dynamic true
+libv.so type 3 soname libv.so needed [] runpath  tls false interp nil relro true dynamic true
+prog type 3 soname  needed ["liba.so"] runpath $ORIGIN tls false interp nil relro true dynamic true
+libb.so b_counter=4010/4 b_table=4000/16 b_add=1000/8 b_fp=4018/8 b_get_counter=1017/14 b_bump=1025/15 nosuch=-
+libb.so tls symbol true 24
+libg.so b_counter=4010/4 b_table=4000/16 b_add=1000/8 b_fp=4018/8 b_get_counter=1017/14 b_bump=1025/15 nosuch=-
+libg.so tls symbol true 24
+libs.so b_counter=4010/4 b_table=4000/16 b_add=1000/8 b_fp=4018/8 b_get_counter=1017/14 b_bump=1025/15 nosuch=-
+libs.so tls symbol true 24
+vf nil -> 103a
+vf V1 -> 1030
+vf V2 -> 103a
+vf V3 -> -
+tls layout 32 16 1 32 28 28
+object /x/prog  555555554000 true 1
+object /x/liba.so liba.so 7f0000000000 true 0
+object /x/libb.so libb.so 7f0000010000 true 0
+tls block 32 1
+ifunc applied 4008
+main_run(5) = 218
+a_has_missing = 0
+a_call_ifunc = 42
+a_local = 5
+counter via a_counter_ptr (host memory) = 101
+b_tls through the thread pointer = 7
+dlsym default / missing: true nil undefined symbol: nosuch
+dlopen libv true
+dlsym vf in handle true default scope (RTLD_LOCAL) nil
+vf() = 2
+dlclose true again false invalid handle
+dlopen missing nil cannot find libnone.so
+reopen global true true
+objects 4
+relr table true rela 24
+r_table entries point into the object true
+r_call(7) = 7
