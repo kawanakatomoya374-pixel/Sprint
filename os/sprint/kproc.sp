@@ -125,6 +125,16 @@ export class Process:
             keep.append(r)
         self.regions = keep
         self.space.unmap_free(a, end - a)
+    # execve: a fresh, empty address space and registers (the old frames are freed)
+    func reset_space(self):
+        self.space.destroy()
+        self.space = vmm.Space()
+        self.regions = []
+        self.brk = 0
+        self.brk_base = 0
+        self.mmap_next = MMAP_BASE
+        setup_user(self, 0, 0)
+        hw.poke64(self.ctx + CTX_FSB, 0)
     # change the protection of [a, a + len): regions are split at the edges and mapped pages get their new flags
     func mprotect(self, a, len, flags):
         let end = a + ((len + 4095) & ~4095)
@@ -208,6 +218,30 @@ export func setup_user(p, rip, sp):
     hw.poke64(p.ctx + CTX_CR3, p.space.pml4)
     hw.poke16(p.ctx + CTX_FX, 0x37F)
     hw.poke32(p.ctx + CTX_FX + 24, 0x1F80)
+
+# fork: a new process (pid) with a copy of src's regions, mapped pages and registers
+export func fork(src, pid):
+    let c = Process(pid, src.name)
+    c.parent = src.pid
+    c.handler = src.handler
+    c.lx = false
+    c.brk = src.brk
+    c.brk_base = src.brk_base
+    c.mmap_next = src.mmap_next
+    for r in src.regions:
+        c.add_region(r.start, r.end, r.flags)
+        let a = r.start
+        while a < r.end:
+            let p = src.space.translate(a)
+            if p != nil:
+                let q = kmem.alloc()
+                c.space.pages.append(q)
+                hw.memcpy(q, p & ~4095, 4096)
+                c.space.map(a, q, src.space.flags_of(a) & 0xFFF & ~vmm.P)
+            a += 4096
+    hw.memcpy(c.ctx, src.ctx, 768)
+    hw.poke64(c.ctx + CTX_CR3, c.space.pml4)
+    return c
 
 # push a C string below sp; returns the new sp
 func push_str(proc, sp, s):

@@ -54,6 +54,9 @@ func align_up(v):
 func imin(a, b):
     return a if a < b else b
 
+func imax(a, b):
+    return a if a > b else b
+
 # ---- bytes ----
 func u16(b, o):
     return b[o] | (b[o + 1] << 8)
@@ -113,16 +116,47 @@ class Guest:
     let mmap_next = MMAP_BASE
     let exe = ""
     let calls = 0
+    let parent = 0
+    let children = nil        # pid -> true: started by this program and not yet waited for
+    let zombies = nil         # pid -> exit status of children that ended before the wait
+    let waiting = nil         # a blocked wait4: [pid filter, status address, options]
     func init(self, pid, client):
         self.pid = pid
         self.client = client
-        self.fds = {0: {kind: "stdin"}, 1: {kind: "console", fd: 1}, 2: {kind: "console", fd: 2}}
+        self.children = {}
+        self.zombies = {}
+        self.fds = {}
+        self.alloc_fd({kind: "stdin"})
+        self.alloc_fd({kind: "console", fd: 1})
+        self.alloc_fd({kind: "console", fd: 2})
+    # put an open file description into the table (a new one starts with one reference, a shared one gets another)
     func alloc_fd(self, f, start = 0):
         let n = start
         while self.fds[n] != nil:
             n += 1
         self.fds[n] = f
+        f.refs = 1 if f.refs == nil else f.refs + 1
         return n
+
+# one reference to an open file description is gone
+func fclose(f):
+    f.refs -= 1
+    if f.refs > 0:
+        return nil
+    if f.kind == "pipe":
+        let p = f.pipe
+        if f.end == "r":
+            p.readers -= 1
+        else:
+            p.writers -= 1
+            pipe_wake(p)
+
+func release_fds(g):
+    for fd in g.fds:
+        let f = g.fds[fd]
+        if f != nil:
+            fclose(f)
+    g.fds = {}
 
 func rd(g, addr, n):
     if n == 0:
@@ -290,6 +324,34 @@ func build_stack(pid, argv, envp, info, interp_base):
         return nil
     return sp
 
+# put the program at `path` into the (empty) address space of `pid` and give it its initial stack: [entry, sp] or an error string
+func setup_image(pid, img, path, argv, envp, g):
+    let info = load_elf(pid, img, PIE_BASE)
+    if type(info) == "string":
+        return info
+    let entry = info.entry
+    let ibase = 0
+    if info.interp != nil:
+        let idata = nil
+        try:
+            idata = read_file(info.interp)
+        catch e:
+            return "cannot read the interpreter " .. info.interp
+        let ii = load_elf(pid, idata, INTERP_BASE)
+        if type(ii) == "string":
+            return ii
+        entry = ii.entry
+        ibase = ii.base
+    g.exe = path
+    g.brk = info.top + 0x100000
+    g.brk_end = g.brk
+    g.mmap_next = MMAP_BASE
+    lx.map(pid, STACK_TOP - STACK_SIZE, STACK_SIZE, 3)
+    let sp = build_stack(pid, argv, envp, info, ibase)
+    if sp == nil:
+        return "cannot build the stack"
+    return [entry, sp]
+
 # start the program at `path`; returns [pid] or an error string
 func start_program(client, path, argv, envp):
     let img = nil
@@ -300,38 +362,15 @@ func start_program(client, path, argv, envp):
     let pid = lx.create()
     if pid < 0:
         return "lx.create failed (" .. to_string(pid) .. ")"
-    let info = load_elf(pid, img, PIE_BASE)
-    if type(info) == "string":
-        lx.kill(pid, 127)
-        return info
-    let entry = info.entry
-    let ibase = 0
-    if info.interp != nil:
-        let idata = nil
-        try:
-            idata = read_file(info.interp)
-        catch e:
-            lx.kill(pid, 127)
-            return "cannot read the interpreter " .. info.interp
-        let ii = load_elf(pid, idata, INTERP_BASE)
-        if type(ii) == "string":
-            lx.kill(pid, 127)
-            return ii
-        entry = ii.entry
-        ibase = ii.base
     let g = Guest(pid, client)
-    g.exe = path
-    g.brk = info.top + 0x100000
-    g.brk_end = g.brk
-    lx.map(pid, STACK_TOP - STACK_SIZE, STACK_SIZE, 3)
-    let sp = build_stack(pid, argv, envp, info, ibase)
-    if sp == nil:
+    let r = setup_image(pid, img, path, argv, envp, g)
+    if type(r) == "string":
         lx.kill(pid, 127)
-        return "cannot build the stack"
+        return r
     guests[pid] = g
     let slash = last_slash(path)
     g.cwd = path.slice(0, slash) if slash > 0 else "/"
-    lx.start(pid, entry, sp)
+    lx.start(pid, r[0], r[1])
     return [pid]
 
 func last_slash(p):
@@ -375,6 +414,14 @@ func do_write(g, f, b):
         f.pos += len(b)
         return len(b)
     if f.kind == "null":
+        return len(b)
+    if f.kind == "pipe" and f.end == "w":
+        let p = f.pipe
+        if p.readers == 0:
+            return -32
+        p.data.append(b)
+        p.size += len(b)
+        pipe_wake(p)
         return len(b)
     return -EBADF
 
@@ -431,6 +478,18 @@ func sys_read(g, a):
         return -EBADF
     if f.kind == "dir":
         return -EISDIR
+    if f.kind == "pipe":
+        if f.end != "r":
+            return -EBADF
+        let p = f.pipe
+        if p.size == 0:
+            if p.writers == 0:
+                return 0
+            p.rwait.append([g, a[1], a[2]])
+            return nil
+        let chunk = pipe_take(p, imin(a[2], p.size))
+        let e0 = wr(g, a[1], chunk)
+        return e0 if e0 < 0 else len(chunk)
     let r = do_read(g, f, a[2], -1)
     if type(r) == "int":
         return r
@@ -542,9 +601,11 @@ func sys_openat(g, a):
     return do_open(g, path, a[2], a[3])
 
 func sys_close(g, a):
-    if g.fds[a[0]] == nil:
+    let f = g.fds[a[0]]
+    if f == nil:
         return -EBADF
     g.fds[a[0]] = nil
+    fclose(f)
     return 0
 
 # struct stat (144 bytes)
@@ -753,7 +814,11 @@ func sys_dup2(g, a):
     if f == nil:
         return -EBADF
     if a[0] != a[1]:
+        let old = g.fds[a[1]]
         g.fds[a[1]] = f
+        f.refs += 1
+        if old != nil:
+            fclose(old)
     return a[1]
 
 func sys_fcntl(g, a):
@@ -852,14 +917,217 @@ func sys_mremap(g, a):
 
 # process, time, misc
 func sys_exit(g, a):
-    finish(g, a[0] & 255)
+    finish(g, a[0] & 255, (a[0] & 255) << 8)
     return nil
 
-func finish(g, code):
+# the program is gone: free its descriptors, tell its parent (or whoever started it)
+func finish(g, code, status):
     lx.kill(g.pid, code)
+    ended(g, status)
+
+func ended(g, status):
     guests[g.pid] = nil
+    release_fds(g)
+    for c in g.children:
+        let ch = guests[c]
+        if ch != nil:
+            ch.parent = 0
+    let par = guests[g.parent] if g.parent != 0 else nil
+    if par != nil:
+        if par.waiting != nil and (par.waiting[0] == -1 or par.waiting[0] == g.pid):
+            let w = par.waiting
+            par.waiting = nil
+            par.children[g.pid] = nil
+            if w[1] != 0:
+                let sb = []
+                for i in range(4):
+                    sb.append((status >> (8 * i)) & 255)
+                wr(par, w[1], sslcore.concat([sb]))
+            lx.reply(par.pid, g.pid)
+        else:
+            par.zombies[g.pid] = status
     if g.client != 0:
-        ipc.send(g.client, "exit\t" .. to_string(g.pid) .. "\t" .. to_string(code))
+        ipc.send(g.client, "exit\t" .. to_string(g.pid) .. "\t" .. to_string(status >> 8 if status > 255 else status))
+
+# ---- pipes ----
+func new_pipe():
+    return {data: nil, size: 0, readers: 1, writers: 1, rwait: []}
+
+func pipe_wake(p):
+    # serve the readers that are waiting
+    while len(p.rwait) > 0:
+        let w = p.rwait[0]
+        if p.size == 0 and p.writers > 0:
+            return nil
+        p.rwait.remove_at(0)
+        let n = imin(w[2], p.size)
+        let chunk = sslcore.concat([])
+        if n > 0:
+            chunk = pipe_take(p, n)
+        let r = wr(w[0], w[1], chunk) if n > 0 else 0
+        lx.reply(w[0].pid, r if r < 0 else n)
+
+func pipe_take(p, n):
+    let all = sslcore.concat(p.data)
+    let out = all.slice(0, n)
+    let rest = all.slice(n)
+    p.data = [rest] if len(rest) > 0 else []
+    p.size = len(rest)
+    return out
+
+func sys_pipe(g, a):
+    let p = new_pipe()
+    p.data = []
+    let r = g.alloc_fd({kind: "pipe", pipe: p, end: "r"})
+    let w = g.alloc_fd({kind: "pipe", pipe: p, end: "w"})
+    let b = []
+    for i in range(8):
+        b.append(0)
+    put32(b, 0, r)
+    put32(b, 4, w)
+    return wr(g, a[0], sslcore.concat([b]))
+
+# ---- processes ----
+func sys_getppid(g, a):
+    return g.parent if g.parent != 0 else 1
+
+func sys_fork(g, a):
+    let pid = lx.fork(g.pid)
+    if pid < 0:
+        return -ENOMEM
+    let c = Guest(pid, 0)
+    release_fds(c)
+    c.parent = g.pid
+    c.cwd = g.cwd
+    c.brk = g.brk
+    c.brk_end = g.brk_end
+    c.mmap_next = g.mmap_next
+    c.exe = g.exe
+    for fd in g.fds:
+        let f = g.fds[fd]
+        if f != nil:
+            c.fds[fd] = f
+            f.refs += 1
+    guests[pid] = c
+    g.children[pid] = true
+    return pid
+
+func sys_wait4(g, a):
+    let want = a[0]
+    let sp = a[1]
+    for z in g.zombies:
+        if want == -1 or want == z:
+            let st = g.zombies[z]
+            g.zombies[z] = nil
+            g.children[z] = nil
+            if sp != 0:
+                let sb = []
+                for i in range(4):
+                    sb.append((st >> (8 * i)) & 255)
+                wr(g, sp, sslcore.concat([sb]))
+            return z
+    if len(g.children) == 0:
+        return -ECHILD
+    if (a[2] & 1) != 0:       # WNOHANG
+        return 0
+    g.waiting = [want, sp, a[2]]
+    return nil
+
+func sys_kill(g, a):
+    let t = guests[a[0]]
+    if t == nil:
+        return -3
+    let sig = a[1]
+    if sig == 0 or sig == 17 or sig == 28 or sig == 23 or sig == 18:
+        return 0
+    lx.kill(t.pid, 128 + sig)
+    ended(t, sig)
+    return 0
+
+# the strings of a NULL-terminated array of C string pointers
+func string_vec(g, addr):
+    let out = []
+    if addr == 0:
+        return out
+    for i in range(4096):
+        let p = rd(g, addr + 8 * i, 8)
+        if p == nil:
+            return nil
+        let v = u64(p, 0)
+        if v == 0:
+            return out
+        let s = cstr(g, v)
+        if s == nil:
+            return nil
+        out.append(s)
+    return nil
+
+func sys_execve(g, a):
+    let path = cstr(g, a[0])
+    if path == nil:
+        return -EFAULT
+    let argv = string_vec(g, a[1])
+    let envp = string_vec(g, a[2])
+    if argv == nil or envp == nil:
+        return -EFAULT
+    let p = abspath(g, path)
+    let img = nil
+    try:
+        img = read_file(p)
+    catch e:
+        return -errno_of(e.kind)
+    # a script: #!interpreter [argument]
+    if len(img) > 2 and img[0] == 35 and img[1] == 33:
+        let eol = 0
+        while eol < len(img) and img[eol] != 10:
+            eol += 1
+        let line = sslcore.to_text(img.slice(2, eol)).trim().split(" ")
+        let nargv = [line[0]]
+        if len(line) > 1 and line[1] != "":
+            nargv.append(line[1])
+        nargv.append(p)
+        for i in range(1, len(argv)):
+            nargv.append(argv[i])
+        argv = nargv
+        try:
+            img = read_file(line[0])
+        catch e:
+            return -errno_of(e.kind)
+        p = line[0]
+    lx.reset(g.pid)
+    let r = setup_image(g.pid, img, p, argv, envp, g)
+    if type(r) == "string":
+        log("exec " .. p .. ": " .. r)
+        finish(g, 127, 127 << 8)
+        return nil
+    lx.setfs(g.pid, 0)
+    lx.start(g.pid, r[0], r[1])
+    return nil
+
+# a program that is told to sleep: it stays blocked until its time has come
+let sleepers = []
+func sleep_for(g, ms):
+    sleepers.append([psys.ms() + ms, g])
+    return nil
+
+func wake_sleepers():
+    let now = psys.ms()
+    let keep = []
+    for s in sleepers:
+        if s[0] <= now:
+            if guests[s[1].pid] == s[1]:
+                lx.reply(s[1].pid, 0)
+        else:
+            keep.append(s)
+    sleepers = keep
+
+func next_wake():
+    let best = 0
+    for s in sleepers:
+        let d = imax(1, s[0] - psys.ms())
+        if best == 0 or d < best:
+            best = d
+    return best
 
 func sys_uname(g, a):
     let b = []
@@ -918,15 +1186,16 @@ func sys_nanosleep(g, a):
     let ts = rd(g, a[0], 16)
     if ts == nil:
         return -EFAULT
-    psys.sleep_ms(u64(ts, 0) * 1000 + u64(ts, 8) // 1000000)
-    return 0
+    return sleep_for(g, u64(ts, 0) * 1000 + u64(ts, 8) // 1000000)
 
 func sys_clock_nanosleep(g, a):
     let ts = rd(g, a[2], 16)
     if ts == nil:
         return -EFAULT
-    psys.sleep_ms(u64(ts, 0) * 1000 + u64(ts, 8) // 1000000)
-    return 0
+    let ms = u64(ts, 0) * 1000 + u64(ts, 8) // 1000000
+    if (a[1] & 1) != 0:           # TIMER_ABSTIME
+        ms = imax(0, ms - psys.ms())
+    return sleep_for(g, ms)
 
 func sys_getrandom(g, a):
     let n = imin(a[1], 1 << 20)
@@ -994,7 +1263,15 @@ func setup():
     table[21] = sys_access
     table[25] = sys_mremap
     table[28] = sys_zero
+    table[22] = sys_pipe
+    table[293] = sys_pipe
     table[32] = sys_dup
+    table[57] = sys_fork
+    table[58] = sys_fork
+    table[59] = sys_execve
+    table[61] = sys_wait4
+    table[62] = sys_kill
+    table[110] = sys_getppid
     table[33] = sys_dup2
     table[35] = sys_nanosleep
     table[39] = sys_getpid
@@ -1015,7 +1292,6 @@ func setup():
     table[104] = sys_getuid
     table[107] = sys_getuid
     table[108] = sys_getuid
-    table[110] = sys_getpid
     table[111] = sys_getpid
     table[131] = sys_zero
     table[158] = sys_arch_prctl
@@ -1083,16 +1359,19 @@ log("serving as \"linux\", pid " .. to_string(psys.pid()))
 let running = true
 while running:
     io.flush()
-    let m = ipc.recv_from()
+    let tmo = next_wake()
+    let m = ipc.recv_from(true, tmo)
+    wake_sleepers()
+    if m == nil:
+        continue
     let src = m[0]
     let text = m[1]
     let g = guests[src]
     if g != nil:
         if text.starts_with("X\t"):
-            # the kernel ended it (a fault, or it was killed)
-            guests[src] = nil
-            if g.client != 0:
-                ipc.send(g.client, "exit\t" .. to_string(src) .. "\t" .. text.slice(2))
+            # the kernel ended it (a fault)
+            let code = to_int(text.slice(2))
+            ended(g, 11 if code == 139 else code)
         else:
             serve_call(g, text.split("\t"))
     elif text.starts_with("X\t"):

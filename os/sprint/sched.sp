@@ -310,7 +310,24 @@ func lx_syscall(p, nr):
     if nr == 1046:   # lx_start(pid, rip, rsp): let it run
         kproc.setup_user(q, a1, a2)
         q.state = "run"
-        order.append(q.pid)
+        if not order.contains(q.pid):
+            order.append(q.pid)
+        set_ret(p, 0)
+        return true
+    if nr == 1050:   # lx_fork(pid) -> child pid: a copy of the program's memory and registers (the child sees 0 in rax); it runs at once
+        let c = kproc.fork(q, k.pid_new(me))
+        k.load_add(me, 1)
+        c.cpu = me
+        procs[c.pid] = c
+        order.append(c.pid)
+        p.children[c.pid] = true
+        c.state = "run"
+        set_ret(c, 0)
+        set_ret(p, c.pid)
+        return true
+    if nr == 1051:   # lx_reset(pid): throw the program's memory away (execve); it stays stopped until lx_start
+        q.reset_space()
+        q.state = "lxwait"
         set_ret(p, 0)
         return true
     if nr == 1047:   # lx_reply(pid, value): answer the system call it is waiting on
@@ -345,7 +362,7 @@ func syscall(p):
             return false
         p.exit_code = 137
         return false
-    if nr >= 1040 and nr < 1050:
+    if nr >= 1040 and nr < 1060:
         return lx_syscall(p, nr)
     if nr == 35:   # nanosleep(&ts, nil)
         let ts = p.space.read64(hw.peek64(p.ctx + kproc.CTX_RDI))
