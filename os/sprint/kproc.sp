@@ -64,6 +64,8 @@ export class Process:
     let ports = []       # I/O port ranges [first, count, ...] this process may use (a driver)
     let rbuf = 0         # where a blocked msg_recv wants its message
     let rcap = 0
+    let mm = nil         # a thread of a Linux program: the process whose memory (space, regions) it shares
+    let live = 1         # (the owner of the memory) threads that still use it
     let lx = false       # may run Linux programs (the personality server linuxd)
     let handler = 0      # a Linux program: the pid of the server that answers its system calls (0 = an ordinary process)
     let mwake = 0        # when a blocked msg_recv with a timeout gives up (microseconds; 0 = never)
@@ -79,13 +81,19 @@ export class Process:
         self.children = {}
         self.exited = {}
         self.ports = []
+    func owner(self):
+        return self if self.mm == nil else self.mm
     func add_region(self, start, end, flags):
+        if self.mm != nil:
+            return self.mm.add_region(start, end, flags)
         let r = Region()
         r.start = start
         r.end = end
         r.flags = flags
         self.regions.append(r)
     func find_region(self, v):
+        if self.mm != nil:
+            return self.mm.find_region(v)
         for r in self.regions:
             if v >= r.start and v < r.end:
                 return r
@@ -198,6 +206,18 @@ export class Process:
         self.regions = keep
         return a
     func destroy(self):
+        if self.mm != nil:
+            # a thread: the memory is shared; the last one out frees it
+            hw.ctx_free(self.ctx)
+            self.mm.live -= 1
+            if self.mm.live == 0 and self.mm.state == "zombie":
+                self.mm.space.destroy()
+            return nil
+        if self.live > 1:
+            # the process ended but threads still run on its memory: keep it until they are gone
+            self.live -= 1
+            hw.ctx_free(self.ctx)
+            return nil
         shm.detach_all(self)
         self.space.destroy()
         hw.ctx_free(self.ctx)
@@ -219,25 +239,42 @@ export func setup_user(p, rip, sp):
     hw.poke16(p.ctx + CTX_FX, 0x37F)
     hw.poke32(p.ctx + CTX_FX + 24, 0x1F80)
 
+# a thread: a new process that shares src's memory; registers are copied (the thread sees 0 in rax and starts on stack sp)
+export func clone_thread(src, pid, sp):
+    let owner = src.owner()
+    let c = Process(pid, src.name)
+    c.space.destroy()
+    c.space = owner.space
+    c.mm = owner
+    owner.live += 1
+    c.parent = src.pid
+    c.handler = src.handler
+    hw.memcpy(c.ctx, src.ctx, 768)
+    hw.poke64(c.ctx + CTX_RAX, 0)
+    if sp != 0:
+        hw.poke64(c.ctx + CTX_RSP, sp)
+    return c
+
 # fork: a new process (pid) with a copy of src's regions, mapped pages and registers
 export func fork(src, pid):
     let c = Process(pid, src.name)
+    let o = src.owner()
     c.parent = src.pid
     c.handler = src.handler
     c.lx = false
-    c.brk = src.brk
-    c.brk_base = src.brk_base
-    c.mmap_next = src.mmap_next
-    for r in src.regions:
+    c.brk = o.brk
+    c.brk_base = o.brk_base
+    c.mmap_next = o.mmap_next
+    for r in o.regions:
         c.add_region(r.start, r.end, r.flags)
         let a = r.start
         while a < r.end:
-            let p = src.space.translate(a)
+            let p = o.space.translate(a)
             if p != nil:
                 let q = kmem.alloc()
                 c.space.pages.append(q)
                 hw.memcpy(q, p & ~4095, 4096)
-                c.space.map(a, q, src.space.flags_of(a) & 0xFFF & ~vmm.P)
+                c.space.map(a, q, o.space.flags_of(a) & 0xFFF & ~vmm.P)
             a += 4096
     hw.memcpy(c.ctx, src.ctx, 768)
     hw.poke64(c.ctx + CTX_CR3, c.space.pml4)

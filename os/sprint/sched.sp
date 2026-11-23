@@ -177,8 +177,8 @@ func finish(p):
     # free the address space now and tell the parent how it ended; the process is gone
     let code = p.exit_code
     let handler = p.handler
-    p.destroy()
     p.state = "zombie"
+    p.destroy()
     reap(p.pid)
     if handler != 0:
         send_to(handler, p.pid, "X\t" .. to_string(code))      # a Linux program ended (also when it crashed): its server hears about it
@@ -282,30 +282,31 @@ func lx_syscall(p, nr):
     if q == nil:
         set_ret(p, -3)
         return true
+    let m = q.owner()          # (the memory of a thread is its process's)
     if nr == 1041:   # lx_map(pid, addr, len, prot): a zero-filled region (pages appear when touched); prot bit 2 = writable
         let flags = vmm.U | (vmm.W if (a3 & 2) != 0 else 0)
         if (a1 & 4095) != 0 or a2 <= 0 or a1 < vmm.USER_BASE:
             set_ret(p, -22)
             return true
-        q.munmap(a1, a2)
-        q.add_region(a1, a1 + ((a2 + 4095) & ~4095), flags)
+        m.munmap(a1, a2)
+        m.add_region(a1, a1 + ((a2 + 4095) & ~4095), flags)
         set_ret(p, 0)
         return true
     if nr == 1042:   # lx_unmap(pid, addr, len)
-        q.munmap(a1, a2)
+        m.munmap(a1, a2)
         set_ret(p, 0)
         return true
     if nr == 1043:   # lx_protect(pid, addr, len, prot)
-        q.mprotect(a1, a2, vmm.U | (vmm.W if (a3 & 2) != 0 else 0))
+        m.mprotect(a1, a2, vmm.U | (vmm.W if (a3 & 2) != 0 else 0))
         set_ret(p, 0)
         return true
     if nr == 1044:   # lx_write(pid, addr, buf, n): copy n bytes from our buf into the program
         let n = hw.peek64(p.ctx + kproc.CTX_R10)
-        set_ret(p, 0 if copy_between(p, a2, q, a1, n) else -14)
+        set_ret(p, 0 if copy_between(p, a2, m, a1, n) else -14)
         return true
     if nr == 1045:   # lx_read(pid, addr, buf, n): copy n bytes from the program into our buf
         let n = hw.peek64(p.ctx + kproc.CTX_R10)
-        set_ret(p, 0 if copy_between(q, a1, p, a2, n) else -14)
+        set_ret(p, 0 if copy_between(m, a1, p, a2, n) else -14)
         return true
     if nr == 1046:   # lx_start(pid, rip, rsp): let it run
         kproc.setup_user(q, a1, a2)
@@ -319,11 +320,29 @@ func lx_syscall(p, nr):
         k.load_add(me, 1)
         c.cpu = me
         procs[c.pid] = c
-        order.append(c.pid)
         p.children[c.pid] = true
-        c.state = "run"
+        c.state = "stopped"          # lx_resume lets it run, once the server has recorded it
         set_ret(c, 0)
         set_ret(p, c.pid)
+        return true
+    if nr == 1052:   # lx_clone(pid, sp) -> tid: a thread on the same memory, stopped until lx_resume
+        let c = kproc.clone_thread(q, k.pid_new(me), a1)
+        k.load_add(me, 1)
+        c.cpu = me
+        procs[c.pid] = c
+        p.children[c.pid] = true
+        c.state = "stopped"
+        set_ret(p, c.pid)
+        return true
+    if nr == 1053:   # lx_resume(pid)
+        q.state = "run"
+        if not order.contains(q.pid):
+            order.append(q.pid)
+        set_ret(p, 0)
+        return true
+    if nr == 1054:   # lx_setsp(pid, sp)
+        hw.poke64(q.ctx + kproc.CTX_RSP, a1)
+        set_ret(p, 0)
         return true
     if nr == 1051:   # lx_reset(pid): throw the program's memory away (execve); it stays stopped until lx_start
         q.reset_space()

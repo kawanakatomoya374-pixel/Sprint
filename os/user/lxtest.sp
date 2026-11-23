@@ -32,7 +32,7 @@ func run(path, args, env):
             io.flush()
             return to_int(q[2])
 
-let progs = ["/bin/hello", "/bin/files", "/bin/proc", "/bin/hello_dyn"]
+let progs = ["/bin/hello", "/bin/files", "/bin/proc", "/bin/hello_dyn", "/bin/glibc", "/bin/threads", "/bin/threads_glibc"]
 for p in progs:
     run(p, [p, "one", "two words"], ["HOME=/root", "LANG=C"])
 print("lxtest: missing program:", run("/bin/nothere", ["x"], []))

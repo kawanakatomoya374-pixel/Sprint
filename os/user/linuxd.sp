@@ -40,7 +40,11 @@ const ENOSYS = 38
 const ENOTEMPTY = 39
 
 let fs = nil
-let guests = {}           # pid -> Guest
+let guests = {}           # pid of the first thread -> Guest (a process)
+let tmap = {}             # thread id -> the Guest it belongs to
+let clear_tids = {}       # thread id -> address to clear (and wake) when the thread ends
+let cur_tid = 0           # the thread whose system call is being served
+let futex_q = {}          # "pid:address" -> [[tid, bitset], ...]
 let table = {}            # system call number -> function(g, a)
 let verbose = false
 
@@ -119,12 +123,18 @@ class Guest:
     let parent = 0
     let children = nil        # pid -> true: started by this program and not yet waited for
     let zombies = nil         # pid -> exit status of children that ended before the wait
-    let waiting = nil         # a blocked wait4: [pid filter, status address, options]
+    let waiting = nil         # a blocked wait4: [pid filter, status address, options, thread]
+    let tids = nil            # thread id -> true
+    let nthreads = 1
+    let sigs = nil            # signal -> handler address (1 = ignore)
     func init(self, pid, client):
         self.pid = pid
         self.client = client
         self.children = {}
         self.zombies = {}
+        self.tids = {}
+        self.tids[pid] = true
+        self.sigs = {}
         self.fds = {}
         self.alloc_fd({kind: "stdin"})
         self.alloc_fd({kind: "console", fd: 1})
@@ -368,6 +378,7 @@ func start_program(client, path, argv, envp):
         lx.kill(pid, 127)
         return r
     guests[pid] = g
+    tmap[pid] = g
     let slash = last_slash(path)
     g.cwd = path.slice(0, slash) if slash > 0 else "/"
     lx.start(pid, r[0], r[1])
@@ -485,7 +496,7 @@ func sys_read(g, a):
         if p.size == 0:
             if p.writers == 0:
                 return 0
-            p.rwait.append([g, a[1], a[2]])
+            p.rwait.append([g, a[1], a[2], cur_tid])
             return nil
         let chunk = pipe_take(p, imin(a[2], p.size))
         let e0 = wr(g, a[1], chunk)
@@ -927,6 +938,13 @@ func finish(g, code, status):
 
 func ended(g, status):
     guests[g.pid] = nil
+    for t in g.tids:
+        if t != g.pid:
+            lx.kill(t, 0)
+        tmap[t] = nil
+        clear_tids[t] = nil
+    lx.kill(g.pid, 0)
+    g.tids = {}
     release_fds(g)
     for c in g.children:
         let ch = guests[c]
@@ -943,7 +961,7 @@ func ended(g, status):
                 for i in range(4):
                     sb.append((status >> (8 * i)) & 255)
                 wr(par, w[1], sslcore.concat([sb]))
-            lx.reply(par.pid, g.pid)
+            lx.reply(w[3], g.pid)
         else:
             par.zombies[g.pid] = status
     if g.client != 0:
@@ -965,7 +983,7 @@ func pipe_wake(p):
         if n > 0:
             chunk = pipe_take(p, n)
         let r = wr(w[0], w[1], chunk) if n > 0 else 0
-        lx.reply(w[0].pid, r if r < 0 else n)
+        lx.reply(w[3], r if r < 0 else n)
 
 func pipe_take(p, n):
     let all = sslcore.concat(p.data)
@@ -991,8 +1009,8 @@ func sys_pipe(g, a):
 func sys_getppid(g, a):
     return g.parent if g.parent != 0 else 1
 
-func sys_fork(g, a):
-    let pid = lx.fork(g.pid)
+func do_fork(g, sp, tls):
+    let pid = lx.fork(cur_tid)
     if pid < 0:
         return -ENOMEM
     let c = Guest(pid, 0)
@@ -1009,8 +1027,79 @@ func sys_fork(g, a):
             c.fds[fd] = f
             f.refs += 1
     guests[pid] = c
+    tmap[pid] = c
     g.children[pid] = true
+    if sp != 0:
+        lx.setsp(pid, sp)
+    if tls != 0:
+        lx.setfs(pid, tls)
+    lx.resume(pid)
     return pid
+
+func sys_fork(g, a):
+    return do_fork(g, 0, 0)
+
+func sys_clone(g, a):
+    let flags = a[0]
+    if (flags & 0x10000) == 0:         # not a thread: a process (a plain fork, or posix_spawn's vfork-style clone on its own stack)
+        return do_fork(g, a[1], a[4] if (flags & 0x80000) != 0 else 0)
+    let tid = lx.clone(cur_tid, a[1])
+    if tid < 0:
+        return -ENOMEM
+    tmap[tid] = g
+    g.tids[tid] = true
+    g.nthreads += 1
+    if (flags & 0x80000) != 0:         # CLONE_SETTLS
+        lx.setfs(tid, a[4])
+    let idb = []
+    for i in range(4):
+        idb.append((tid >> (8 * i)) & 255)
+    if (flags & 0x100000) != 0:        # CLONE_PARENT_SETTID
+        wr(g, a[2], sslcore.concat([idb]))
+    if (flags & 0x1000000) != 0:       # CLONE_CHILD_SETTID
+        wr(g, a[3], sslcore.concat([idb]))
+    if (flags & 0x200000) != 0:        # CLONE_CHILD_CLEARTID
+        clear_tids[tid] = a[3]
+    lx.resume(tid)
+    return tid
+
+func sys_gettid(g, a):
+    return cur_tid
+
+func sys_set_tid_address(g, a):
+    clear_tids[cur_tid] = a[0]
+    return cur_tid
+
+func sys_exit_thread(g, a):
+    # a thread of a process with other threads ends alone; the last one (or the leader) ends the process
+    if g.nthreads > 1 and cur_tid != g.pid:
+        let addr = clear_tids[cur_tid]
+        if addr != nil and addr != 0:
+            wr(g, addr, sslcore.concat([[0, 0, 0, 0]]))
+            futex_wake(to_string(g.pid) .. ":" .. to_string(addr), 1)
+        clear_tids[cur_tid] = nil
+        tmap[cur_tid] = nil
+        g.tids[cur_tid] = nil
+        g.nthreads -= 1
+        lx.kill(cur_tid, 0)
+        return nil
+    finish(g, a[0] & 255, (a[0] & 255) << 8)
+    return nil
+
+# rt_sigaction(sig, act, oldact, size): the handler is remembered (it cannot be delivered yet); SIG_IGN is honoured by kill()
+func sys_sigaction(g, a):
+    if a[2] != 0:
+        wr(g, a[2], sslcore.concat([[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]]))
+    if a[1] != 0:
+        let act = rd(g, a[1], 8)
+        if act == nil:
+            return -EFAULT
+        g.sigs[a[0]] = u64(act, 0)
+    return 0
+
+func sys_sched_getaffinity(g, a):
+    wr(g, a[2], sslcore.concat([[1, 0, 0, 0, 0, 0, 0, 0]]))
+    return 8
 
 func sys_wait4(g, a):
     let want = a[0]
@@ -1030,19 +1119,39 @@ func sys_wait4(g, a):
         return -ECHILD
     if (a[2] & 1) != 0:       # WNOHANG
         return 0
-    g.waiting = [want, sp, a[2]]
+    g.waiting = [want, sp, a[2], cur_tid]
     return nil
+
+func deliver_signal(t, sig):
+    if sig == 0 or sig == 17 or sig == 28 or sig == 23 or sig == 18 or sig == 20:
+        return 0
+    let h = t.sigs[sig]
+    if h == 1:
+        return 0
+    if h != nil and h > 1:
+        log("signal " .. to_string(sig) .. " for pid " .. to_string(t.pid) .. " has a handler; handlers are not delivered yet")
+        return 0
+    lx.kill(t.pid, 128 + sig)
+    ended(t, sig)
+    return 0
 
 func sys_kill(g, a):
     let t = guests[a[0]]
     if t == nil:
         return -3
-    let sig = a[1]
-    if sig == 0 or sig == 17 or sig == 28 or sig == 23 or sig == 18:
-        return 0
-    lx.kill(t.pid, 128 + sig)
-    ended(t, sig)
-    return 0
+    return deliver_signal(t, a[1])
+
+func sys_tgkill(g, a):          # tgkill(tgid, tid, sig)
+    let t = guests[a[0]]
+    if t == nil:
+        return -3
+    return deliver_signal(t, a[2])
+
+func sys_tkill(g, a):
+    let t = tmap[a[0]]
+    if t == nil:
+        return -3
+    return deliver_signal(t, a[1])
 
 # the strings of a NULL-terminated array of C string pointers
 func string_vec(g, addr):
@@ -1105,9 +1214,10 @@ func sys_execve(g, a):
     return nil
 
 # a program that is told to sleep: it stays blocked until its time has come
+# timers: [deadline ms, thread, result, futex key (or nil)]; when one fires the thread's blocked system call returns `result`
 let sleepers = []
 func sleep_for(g, ms):
-    sleepers.append([psys.ms() + ms, g])
+    sleepers.append([psys.ms() + ms, cur_tid, 0, nil])
     return nil
 
 func wake_sleepers():
@@ -1115,8 +1225,10 @@ func wake_sleepers():
     let keep = []
     for s in sleepers:
         if s[0] <= now:
-            if guests[s[1].pid] == s[1]:
-                lx.reply(s[1].pid, 0)
+            if tmap[s[1]] != nil:
+                if s[3] != nil:
+                    futex_drop(s[3], s[1])
+                lx.reply(s[1], s[2])
         else:
             keep.append(s)
     sleepers = keep
@@ -1128,6 +1240,136 @@ func next_wake():
         if best == 0 or d < best:
             best = d
     return best
+
+# ---- futexes: a thread that waits stays blocked until another one wakes it (or the timeout) ----
+func futex_drop(key, tid):
+    let l = futex_q[key]
+    if l == nil:
+        return nil
+    let keep = []
+    for w in l:
+        if w[0] != tid:
+            keep.append(w)
+    futex_q[key] = keep
+
+func futex_wake(key, n):
+    let l = futex_q[key]
+    let woken = 0
+    if l == nil:
+        return 0
+    while len(l) > 0 and woken < n:
+        let w = l.remove_at(0)
+        lx.reply(w[0], 0)
+        woken += 1
+        # its timeout (if any) is cancelled
+        let keep = []
+        for s in sleepers:
+            if not (s[1] == w[0] and s[3] != nil):
+                keep.append(s)
+        sleepers = keep
+    return woken
+
+func read_i32(g, addr):
+    let b = rd(g, addr, 4)
+    if b == nil:
+        return nil
+    let v = u32(b, 0)
+    return v - 4294967296 if v >= 2147483648 else v
+
+func sys_futex(g, a):
+    let op = a[1] & 127
+    let key = to_string(g.pid) .. ":" .. to_string(a[0])
+    if op == 0 or op == 9:         # FUTEX_WAIT, FUTEX_WAIT_BITSET
+        let cur = read_i32(g, a[0])
+        if cur == nil:
+            return -EFAULT
+        let want = a[2]
+        if want >= 2147483648:
+            want -= 4294967296
+        if cur != want:
+            return -EAGAIN
+        if futex_q[key] == nil:
+            futex_q[key] = []
+        futex_q[key].append([cur_tid, 0xffffffff])
+        if a[3] != 0:
+            let ts = rd(g, a[3], 16)
+            if ts == nil:
+                return -EFAULT
+            let ms = u64(ts, 0) * 1000 + u64(ts, 8) // 1000000
+            if op == 9:
+                ms = imax(0, ms - psys.ms())
+            sleepers.append([psys.ms() + ms, cur_tid, -110, key])
+        return nil
+    if op == 1 or op == 10:        # FUTEX_WAKE, FUTEX_WAKE_BITSET
+        return futex_wake(key, a[2])
+    if op == 3 or op == 4:         # FUTEX_REQUEUE, FUTEX_CMP_REQUEUE
+        if op == 4:
+            let cur = read_i32(g, a[0])
+            let want = a[5]
+            if want >= 2147483648:
+                want -= 4294967296
+            if cur != want:
+                return -EAGAIN
+        let key2 = to_string(g.pid) .. ":" .. to_string(a[4])
+        let n = futex_wake(key, a[2])
+        let l = futex_q[key]
+        if l != nil:
+            let moved = 0
+            while len(l) > 0 and moved < a[3]:
+                if futex_q[key2] == nil:
+                    futex_q[key2] = []
+                futex_q[key2].append(l.remove_at(0))
+                moved += 1
+            n += moved
+        return n
+    if op == 5:                    # FUTEX_WAKE_OP
+        let key2 = to_string(g.pid) .. ":" .. to_string(a[4])
+        let v3 = a[5]
+        let wop = (v3 >> 28) & 15
+        let cmp = (v3 >> 24) & 15
+        let oparg = (v3 >> 12) & 0xfff
+        let cmparg = v3 & 0xfff
+        if oparg >= 2048:
+            oparg -= 4096
+        if cmparg >= 2048:
+            cmparg -= 4096
+        if (wop & 8) != 0:
+            oparg = 1 << oparg
+            wop = wop & 7
+        let old = read_i32(g, a[4])
+        if old == nil:
+            return -EFAULT
+        let nv = oparg
+        if wop == 1:
+            nv = old + oparg
+        elif wop == 2:
+            nv = old | oparg
+        elif wop == 3:
+            nv = old & ~oparg
+        elif wop == 4:
+            nv = old ^ oparg
+        let nb = []
+        for i in range(4):
+            nb.append((nv >> (8 * i)) & 255)
+        wr(g, a[4], sslcore.concat([nb]))
+        let n = futex_wake(key, a[2])
+        let hit = false
+        if cmp == 0:
+            hit = old == cmparg
+        elif cmp == 1:
+            hit = old != cmparg
+        elif cmp == 2:
+            hit = old < cmparg
+        elif cmp == 3:
+            hit = old <= cmparg
+        elif cmp == 4:
+            hit = old > cmparg
+        elif cmp == 5:
+            hit = old >= cmparg
+        if hit:
+            n += futex_wake(key2, a[3])
+        return n
+    return -ENOSYS
 
 func sys_uname(g, a):
     let b = []
@@ -1235,12 +1477,6 @@ func sys_sysinfo(g, a):
     put32(b, 104, 1)
     return wr(g, a[0], sslcore.concat([b]))
 
-func sys_futex(g, a):
-    let op = a[1] & 127
-    if op == 0:           # FUTEX_WAIT in a single thread: the value would never change
-        return -EAGAIN
-    return 0
-
 func setup():
     table[0] = sys_read
     table[1] = sys_write
@@ -1254,7 +1490,13 @@ func setup():
     table[10] = sys_mprotect
     table[11] = sys_munmap
     table[12] = sys_brk
-    table[13] = sys_zero
+    table[13] = sys_sigaction
+    table[24] = sys_zero
+    table[56] = sys_clone
+    table[200] = sys_tkill
+    table[204] = sys_sched_getaffinity
+    table[234] = sys_tgkill
+    table[273] = sys_zero
     table[14] = sys_zero
     table[16] = sys_ioctl
     table[17] = sys_pread
@@ -1275,7 +1517,7 @@ func setup():
     table[33] = sys_dup2
     table[35] = sys_nanosleep
     table[39] = sys_getpid
-    table[60] = sys_exit
+    table[60] = sys_exit_thread
     table[63] = sys_uname
     table[72] = sys_fcntl
     table[77] = sys_ftruncate
@@ -1295,10 +1537,10 @@ func setup():
     table[111] = sys_getpid
     table[131] = sys_zero
     table[158] = sys_arch_prctl
-    table[186] = sys_getpid
+    table[186] = sys_gettid
     table[202] = sys_futex
     table[217] = sys_getdents64
-    table[218] = sys_getpid
+    table[218] = sys_set_tid_address
     table[228] = sys_clock_gettime
     table[230] = sys_clock_nanosleep
     table[231] = sys_exit
@@ -1329,7 +1571,7 @@ func serve_call(g, q):
             log("pid " .. to_string(g.pid) .. ": system call " .. to_string(nr) .. " failed inside linuxd: " .. to_string(e))
             r = -5
     if r != nil:
-        lx.reply(g.pid, r)
+        lx.reply(cur_tid, r)
 
 func serve_request(src, text):
     let q = text.split("\t")
@@ -1366,13 +1608,14 @@ while running:
         continue
     let src = m[0]
     let text = m[1]
-    let g = guests[src]
+    let g = tmap[src]
     if g != nil:
         if text.starts_with("X\t"):
-            # the kernel ended it (a fault)
+            # the kernel ended it (a fault): the whole process goes
             let code = to_int(text.slice(2))
             ended(g, 11 if code == 139 else code)
         else:
+            cur_tid = src
             serve_call(g, text.split("\t"))
     elif text.starts_with("X\t"):
         pass          # a program we already finished

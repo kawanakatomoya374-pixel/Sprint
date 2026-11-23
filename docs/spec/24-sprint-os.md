@@ -170,3 +170,18 @@ Windows のエクスプローラーに似た GUI。ロジックと描画は `std
 - **試験**: `tests/cases/stdlib/explorer.sp`（メモリ上の SprintFS に合成イベントを送る。移動・コピー・削除・並べ替え・アドレスバー・メニュー・ドラッグ）、`make os-explorer-test`（実際の `fsd` と SprintFS のディスクの上で 70000 バイトのバイナリのコピー・移動・名前の変更・削除をし、ホストがディスクを fsck して読み戻す。デスクトップのアイコンのダブルクリックで窓が開き、ディスクの内容が見える）。
 - **アプリのインストール先**: `cosapps.BackendSink(fs, root)` がパックをファイルシステム（`explorer.VolumeBackend` や `fsclient`）へ直接書く。
 - **未実装**: 日付（`fsd` が返す mtime をそのまま出すが、ホストで作ったファイルは空）、ファイルを開くアプリ（今はログに出すだけ）、ストア画面、Ctrl/Shift 付きのクリック（`guid` がポインタイベントに修飾キーを載せない）。
+
+## Linux 互換層
+
+x86-64 の Linux プログラム（musl / glibc、静的 PIE と動的リンク、スレッド、fork / exec）が SprintOS 上で動く。カーネルに Linux の知識は入れず、**人格サーバー `linuxd`**（`os/user/linuxd.sp`、全部 Sprint）が Linux の意味づけを持つ。C-OS の `cos_linux.c`（カーネル内の C）を参考に、サーバーとして作り直した。
+
+**カーネルの仕組み（`lx_` システムコール 1040〜1054、`linuxd` だけが使える。`os/sprint/sched.sp` の `lx_syscall`、`os/sprint/kproc.sp`）**
+- Linux プログラムは `handler`（= `linuxd` の pid）を持つ普通のプロセス。それが `syscall` 命令を実行すると、カーネルは処理せず `"番号<TAB>引数 6 個"` のメッセージを `linuxd` へ送り、プログラムは `lxwait` で止まる。`lx_reply` で結果を返すと再開する。**返信しなければ止まったまま**なので、`futex` や `wait4`・パイプの読み・`nanosleep` のようなブロックする呼び出しは、サーバーが返信を後回しにするだけで実現できる（サーバーは止まらない）。
+- `lx_create`（空のアドレス空間）、`lx_map` / `lx_unmap` / `lx_protect`（遅延割り当ての領域）、`lx_write` / `lx_read`（他のプロセスのメモリとの間のコピー）、`lx_start`（rip / rsp を決めて走らせる）、`lx_fork`（メモリとレジスタの複製）、`lx_reset`（execve 用にメモリを捨てる）、`lx_clone`（メモリを共有するスレッド。共有するメモリは最後のスレッドが抜けるまで残る）、`lx_resume`、`lx_setfs`（スレッドポインタ）、`lx_setsp`、`lx_kill`。プログラムが落ちたり終わったりすると `"X<TAB>状態"` が `linuxd` に届く。プログラムは `linuxd` と同じ CPU に置かれる（プロセスの CPU 間移動がないため。他のプロセスのメモリを直接コピーするのに都合がよい）。
+- `ipc` の隣に Sprint のモジュール `lx`（`os/user/udev.c`）。
+
+**`linuxd` がやること**: ELF ローダー（PIE と `PT_INTERP`。固定アドレスの実行ファイルは 512 GiB 未満にカーネルの恒等写像があるため `-static-pie` / `-pie` が要る）、初期スタック（argv・envp・auxv）、ファイルディスクリプタ表（ファイル・ディレクトリ・コンソール・パイプ・`/dev/null` `zero` `urandom`。参照カウントで `dup` と fork を扱う）、パスと cwd、ファイルシステムは `fsd` 経由（`open` `read` `write` `pread` `lseek` `stat` `fstat` `newfstatat` `getdents64` `mkdir` `unlink` `rmdir` `rename` `ftruncate` `access` `readlink` `getcwd` `chdir`）、メモリ（`brk` `mmap` 匿名・ファイル `munmap` `mprotect` `mremap`）、プロセス（`fork` `vfork` `clone`（スレッドと posix_spawn 型）`execve`（`#!` つき）`wait4` `exit` `exit_group` `kill` `tgkill` `getppid`）、`pipe` `pipe2` `dup` `dup2` `fcntl`、`futex`（WAIT / WAKE / REQUEUE / CMP_REQUEUE / WAKE_OP / BITSET、タイムアウト）、`set_tid_address`（スレッド終了時に値を 0 にして起こす）、時刻・乱数・`uname`・`prlimit64` など。クライアントは `"run<TAB>パス<TAB>引数<US>…<TAB>環境<US>…"` を `"linux"` へ送る（`os/user/lxtest.sp` が例）。
+
+**試験**: `make os-linux-test`（`os/tests/linux_test.py`）。musl-gcc で作った静的 PIE（hello、ファイル操作、fork / exec / パイプ / wait / sleep、pthread）と動的 PIE（musl の ld.so）、gcc で作った glibc の動的 PIE（`ld-linux-x86-64.so.2` + `libc.so.6` をディスクへ入れる）とその pthread 版が動き、ホストがディスクの結果を読み戻して fsck する。
+
+**未実装**: シグナルの配送（`rt_sigaction` のハンドラは覚えるだけ。`kill` は既定動作の終了と無視のみ）、ソケット（ネットワークスタックを `linuxd` から使う）、`epoll` / `poll` / `select`、`mmap` の共有ファイルマッピング、`/proc`、マルチスレッドからの `execve`、固定アドレスの実行ファイル、ルートファイルシステムの同梱、`ptrace`。C-OS のアプリパック（Firefox など）はこれらが揃ってからの話。

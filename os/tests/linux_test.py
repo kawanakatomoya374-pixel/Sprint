@@ -2,7 +2,7 @@
 """Linux programs on SprintOS. Static-pie programs built with musl-gcc are put on a SprintFS disk; init=lxtest starts the file system server and linuxd (the Linux personality
 server, Sprint). The kernel forwards each program's `syscall` instruction to linuxd as a message; linuxd answers it (ELF loading, memory, files, time, ...) with the lx
 mechanisms (map / copy / start / reply). The host checks what the programs printed and what they left on the disk."""
-import os, subprocess, sys, tempfile
+import os, shutil, subprocess, sys, tempfile
 IMG = sys.argv[1]
 SP = os.environ.get("SPRINT", "build/sprint")
 OUT = os.path.join(os.path.dirname(IMG), "shots")
@@ -13,7 +13,10 @@ def check(c, what):
     if not c: fails.append(what)
 tmp = tempfile.mkdtemp()
 src = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "tests", "linux")
-for name, flags in (("hello", ["-static-pie"]), ("files", ["-static-pie"]), ("proc", ["-static-pie"]), ("hello_dyn", ["-pie", "-fPIE"])):
+glibc_ok = subprocess.run(["gcc", "-O2", "-pie", "-fPIE", "-o", os.path.join(tmp, "glibc"), os.path.join(src, "glibc.c"), "-lm"], capture_output=True).returncode == 0
+glibc_ok = glibc_ok and subprocess.run(["gcc", "-O2", "-pie", "-fPIE", "-pthread", "-o", os.path.join(tmp, "threads_glibc"), os.path.join(src, "threads.c")], capture_output=True).returncode == 0
+check(glibc_ok, "gcc builds glibc dynamic PIE programs")
+for name, flags in (("hello", ["-static-pie"]), ("files", ["-static-pie"]), ("proc", ["-static-pie"]), ("threads", ["-static-pie", "-pthread"]), ("hello_dyn", ["-pie", "-fPIE"])):
     r = subprocess.run(["musl-gcc"] + flags + ["-O2", "-o", os.path.join(tmp, name), os.path.join(src, name.replace("_dyn", "") + ".c")], capture_output=True, text=True)
     check(r.returncode == 0, "musl-gcc builds %s (%s)" % (name, " ".join(flags)))
 fsimg = os.path.join(tmp, "fs.img")
@@ -22,7 +25,12 @@ def tool(*a):
 tool("mkfs", "24"); tool("mkdir", "/bin"); tool("mkdir", "/lx")
 open(os.path.join(tmp, "input.txt"), "w").write("hello from the SprintFS disk\nsecond line\n")
 tool("mkdir", "/lib"); import shutil; shutil.copy("/lib/ld-musl-x86_64.so.1", os.path.join(tmp, "ld-musl")); tool("put", os.path.join(tmp, "ld-musl"), "/lib/ld-musl-x86_64.so.1")
-tool("put", os.path.join(tmp, "proc"), "/bin/proc"); tool("put", os.path.join(tmp, "hello_dyn"), "/bin/hello_dyn")
+if glibc_ok:
+    tool("mkdir", "/lib64"); tool("mkdir", "/lib/x86_64-linux-gnu")
+    for host, guest in (("/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2", "/lib64/ld-linux-x86-64.so.2"), ("/lib/x86_64-linux-gnu/libc.so.6", "/lib/x86_64-linux-gnu/libc.so.6")):
+        shutil.copy(os.path.realpath(host), os.path.join(tmp, "glibc_lib")); tool("put", os.path.join(tmp, "glibc_lib"), guest)
+    tool("put", os.path.join(tmp, "glibc"), "/bin/glibc"); tool("put", os.path.join(tmp, "threads_glibc"), "/bin/threads_glibc")
+tool("put", os.path.join(tmp, "threads"), "/bin/threads"); tool("put", os.path.join(tmp, "proc"), "/bin/proc"); tool("put", os.path.join(tmp, "hello_dyn"), "/bin/hello_dyn")
 tool("put", os.path.join(tmp, "hello"), "/bin/hello"); tool("put", os.path.join(tmp, "files"), "/bin/files"); tool("put", os.path.join(tmp, "input.txt"), "/lx/input.txt")
 ser = os.path.join(OUT, "linux.log")
 if os.path.exists(ser): os.remove(ser)
@@ -58,6 +66,9 @@ check("slept about right" in L, "nanosleep blocks the program, not the server")
 check("blocking pipe reads: 3 ticks" in L, "a pipe read blocks until the writer writes")
 check("hello from a Linux program on SprintOS" in L.split("dynamic")[0] or "uname: Linux" in L, "(static programs ran)")
 check("lxtest: /bin/hello_dyn exited with 7" in L, "a dynamically linked (musl ld.so) program runs and exits")
+check("glibc hello, argc=3" in L and "sqrt(2)=1.414214 strlen=3" in L and "lxtest: /bin/glibc exited with 3" in L, "a glibc dynamically linked program (ld-linux, libc.so.6) runs")
+check("threads done: counter=2000 sum=12 main tls=0" in L and "short threads: 20 counter=12000" in L, "pthreads (clone with shared memory), mutex + condition variable (futex), thread-local storage, join")
+check(L.count("threads done: counter=2000 sum=12 main tls=0") == 2 and L.count("short threads: 20 counter=12000") == 2, "the same threads program built against glibc (clone3 falls back to clone, robust lists, rseq refused)")
 check("lxtest: /bin/nothere: cannot read" in L, "a missing program is reported")
 check("lxtest: done" in L, "the test finished")
 # the host looks at the disk
