@@ -62,6 +62,7 @@ export class Process:
     let ports = []       # I/O port ranges [first, count, ...] this process may use (a driver)
     let rbuf = 0         # where a blocked msg_recv wants its message
     let rcap = 0
+    let mwake = 0        # when a blocked msg_recv with a timeout gives up (microseconds; 0 = never)
     func init(self, pid, name):
         self.pid = pid
         self.name = name

@@ -351,6 +351,44 @@ static SpStatus h_iopb_set(SpVM *vm, int argc, const SpValue *argv, SpValue *ret
     *ret = sp_nil();
     return SP_OK;
 }
+/* set_ioapic(address): the I/O APIC's registers (already mapped uncached); ioapic_rd(reg) / ioapic_wr(reg, value): its indirect registers */
+static SpStatus h_set_ioapic(SpVM *vm, int argc, const SpValue *argv, SpValue *ret) {
+    (void)argc;
+    ARG_INT(0, a);
+    g_ioapic = (volatile uint32_t *)(uintptr_t)a;
+    *ret = sp_nil();
+    return SP_OK;
+}
+static SpStatus h_ioapic_rd(SpVM *vm, int argc, const SpValue *argv, SpValue *ret) {
+    (void)argc;
+    ARG_INT(0, reg);
+    *ret = sp_int(g_ioapic ? ioapic_rd((uint32_t)reg) : 0);
+    return SP_OK;
+}
+static SpStatus h_ioapic_wr(SpVM *vm, int argc, const SpValue *argv, SpValue *ret) {
+    (void)argc;
+    ARG_INT(0, reg);
+    ARG_INT(1, v);
+    if (g_ioapic) ioapic_wr((uint32_t)reg, (uint32_t)v);
+    *ret = sp_nil();
+    return SP_OK;
+}
+/* irq_mask(gsi, masked): mask or unmask one I/O APIC input; irq_take(): the bit mask of inputs that interrupted since the last call */
+static SpStatus h_irq_mask(SpVM *vm, int argc, const SpValue *argv, SpValue *ret) {
+    (void)argc;
+    ARG_INT(0, gsi);
+    ARG_INT(1, m);
+    if (gsi >= 0 && gsi < 24) ioapic_set_mask((uint32_t)gsi, m != 0);
+    *ret = sp_nil();
+    return SP_OK;
+}
+static SpStatus h_irq_take(SpVM *vm, int argc, const SpValue *argv, SpValue *ret) {
+    (void)vm;
+    (void)argc;
+    (void)argv;
+    *ret = sp_int((int64_t)__atomic_exchange_n(&g_irq_pending, 0, __ATOMIC_ACQ_REL));
+    return SP_OK;
+}
 static SpStatus h_cpu_id(SpVM *vm, int argc, const SpValue *argv, SpValue *ret) {
     (void)vm;
     (void)argc;
@@ -529,7 +567,7 @@ static const SpNativeDesc hw_fns[] = {
     {"mem_info", 0, 0, 0, SP_NATIVE_ALLOCATES, h_mem_info}, {"serial", 1, 1, 0, 0, h_serial},
     {"log_read", 1, 1, 0, SP_NATIVE_ALLOCATES, h_log_read}, {"cmdline", 0, 0, 0, SP_NATIVE_ALLOCATES, h_cmdline},
     {"ctx_new", 0, 0, 0, 0, h_ctx_new}, {"ctx_free", 1, 1, 0, 0, h_ctx_free}, {"enter", 1, 1, 0, 0, h_enter},
-    {"kernel_cr3", 0, 0, 0, 0, h_kernel_cr3}, {"iopb_set", 4, 4, 0, 0, h_iopb_set}, {"cpu_id", 0, 0, 0, 0, h_cpu_id}, {"invlpg", 1, 1, 0, 0, h_invlpg},
+    {"kernel_cr3", 0, 0, 0, 0, h_kernel_cr3}, {"iopb_set", 4, 4, 0, 0, h_iopb_set}, {"set_ioapic", 1, 1, 0, 0, h_set_ioapic}, {"ioapic_rd", 1, 1, 0, 0, h_ioapic_rd}, {"ioapic_wr", 2, 2, 0, 0, h_ioapic_wr}, {"irq_mask", 2, 2, 0, 0, h_irq_mask}, {"irq_take", 0, 0, 0, 0, h_irq_take}, {"cpu_id", 0, 0, 0, 0, h_cpu_id}, {"invlpg", 1, 1, 0, 0, h_invlpg},
     {"idle", 0, 0, 0, 0, h_idle}, {"irq_count", 1, 1, 0, 0, h_irq_count}, {"set_lapic", 1, 1, 0, 0, h_set_lapic},
     {"memset", 3, 3, 0, 0, h_memset}, {"memcpy", 3, 3, 0, 0, h_memcpy}, {"str_at", 2, 2, 0, SP_NATIVE_ALLOCATES, h_str_at},
     {"poke_str", 2, 2, 0, 0, h_poke_str}, {"user_mem", 0, 0, 0, SP_NATIVE_ALLOCATES, h_user_mem},

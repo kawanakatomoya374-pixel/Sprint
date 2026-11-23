@@ -4,7 +4,6 @@ import kmem
 import kproc
 import shm
 import vmm
-import ps2
 import rtc
 
 const ENOENT = -2
@@ -16,8 +15,6 @@ const ENOSYS = -38
 const EPERM = -1
 const FB_BASE = vmm.USER_BASE + 0x20000000
 
-let input_dev = nil
-let input_buf = []
 
 export func log(s):
     hw.serial("[kernel] " .. s .. "\n")
@@ -71,28 +68,6 @@ func sys_fb_map(p, out):
     p.space.write64(out + 16, info[1])
     p.space.write64(out + 24, info[2])
     return 0
-
-# input(buf, cap): events from the keyboard and mouse as text lines; returns the number of bytes stored
-func sys_input(p, buf, cap):
-    if not p.gui:
-        return EPERM
-    let info = hw.fb_info()
-    if input_dev == nil:
-        input_dev = ps2.Input(info[0], info[1])
-    for ev in input_dev.poll():
-        input_buf.append(ps2.encode(ev))
-    if len(input_buf) == 0:
-        return 0
-    let out = ""
-    let used = 0
-    while len(input_buf) > 0 and used + len(input_buf[0]) + 1 <= cap:
-        out = out .. input_buf[0] .. "\n"
-        used += len(input_buf[0]) + 1
-        input_buf.remove_at(0)
-    if used == 0:
-        return -22
-    p.space.write(buf, out)
-    return used
 
 # returns the syscall result; sets p.exit_code when the process ends
 export func dispatch(p):
@@ -152,8 +127,6 @@ export func dispatch(p):
         return n
     if nr == 1002:
         return sys_fb_map(p, arg(p, 0))
-    if nr == 1003:
-        return sys_input(p, arg(p, 0), arg(p, 1))
     if nr == 1010:   # shm_create(size, out): out = [id, address, bytes]
         let r = shm.create(p, arg(p, 0))
         if r[0] > 0:

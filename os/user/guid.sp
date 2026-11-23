@@ -408,8 +408,30 @@ func show(rx, ry, rw, rh):
     if gpu != nil:
         ipc.send(gpu, "flush\t" .. to_string(rx) .. "\t" .. to_string(ry) .. "\t" .. to_string(rw) .. "\t" .. to_string(rh))
 
-# ---- main loop ----------------------------------------------------------------------------------
+# ---- the input driver: events arrive as messages (inputd is interrupt driven), the pointer position is kept here ----
 let input = uinput.Input(W, H)
+let input_pid = nil
+for i in range(100):
+    input_pid = ipc.lookup("input")
+    if input_pid != nil:
+        break
+    psys.sleep_ms(20)
+if input_pid == nil:
+    log("no input driver")
+else:
+    io.flush()
+    ipc.send(input_pid, "sub\t" .. to_string(W) .. "\t" .. to_string(H))
+    while true:
+        let m = ipc.recv_from()
+        if m[0] == input_pid:
+            let f = m[1].split("\t")
+            input.mx = to_int(f[1])
+            input.my = to_int(f[2])
+            break
+
+# ---- main loop ----------------------------------------------------------------------------------
+# The process sleeps in ipc.recv_from() until something happens: an input event from inputd, a request from a client, or the 20 ms frame tick (a timer
+# interrupt of the kernel). No device is polled.
 desk.draw()
 show(0, 0, W, H)
 set_pointer("arrow")
@@ -418,14 +440,26 @@ log("ready after " .. to_string(psys.ms()) .. " ms")
 
 let last = psys.ms()
 let frames = 0
+let evs = []
 while desk.running:
-    pump_clients()
-    let evs = input.poll()
+    let wait = 20 - (psys.ms() - last)
+    if wait < 1:
+        wait = 1
+    io.flush()
+    let m = ipc.recv_from(true, wait)
+    while m != nil:
+        if m[0] == input_pid and m[1].starts_with("in\t"):
+            for e in input.feed(m[1].slice(3, len(m[1]))):
+                evs.append(e)
+        else:
+            serve(m[0], m[1])
+        m = ipc.recv_from(false)
     let moved = false
     for ev in evs:
         if ev.type == "mouse_move":
             moved = true
         desk.dispatch(ev)
+    evs = []
     desk.pump()
     let now = psys.ms()
     if now - last >= 20:
@@ -440,6 +474,4 @@ while desk.running:
     if moved:
         cursor_to(input.mx, input.my)
         set_pointer(desk.cursor_name())
-    if len(evs) == 0:
-        psys.sleep_ms(4)
 log("stopped after " .. to_string(frames) .. " frames")

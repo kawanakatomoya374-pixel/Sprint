@@ -113,4 +113,10 @@ UEFI ローダー（`BOOTX64.EFI`）は **Sprint 製の署名ツール**（`os/b
 
 検証: `make os-gpu-test`（`virtio-vga` 上で、`gputest` が 4 色の帯を描いて `flush` → QEMU の screendump にその画素が出る、矩形だけの `flush`、カーソル画像の受理。続けて通常の `boot` を `-vga none -device virtio-vga` で起動し、デスクトップが GPU サーバ経由で描かれ、ダブルクリックでターミナルが開き、ホストの画面にそのウィンドウが出る）。
 
+**割り込み駆動の入力（`inputd`）**: キーボードとマウスはポーリングしない。カーネルは I/O APIC（`os/sprint/ioapic.sp`。MADT から場所と割り込みソースのオーバーライドを読む）を設定して、ドライバが取った入力をベクタ 0x40+n で CPU へ送り、割り込みが来るとその入力をマスクして、持ち主のドライバへ**メッセージ `irq<TAB>n`**（送信元 0）を送る。ドライバが機器を処理して `ipc.irq_ack(n)` を呼ぶとマスクを外す（レベルトリガの機器が割り込みを出し続けて嵐になるのを防ぐ）。CPU が `hlt` で眠っていても、割り込みはビットマスク（`hw.irq_take`）に残り、次のスケジューラ呼び出しで配られる。
+
+- syscall 1030 `irq_register(irq, pci)`（プログラム名ごとの `IRQS` 表で許可。ISA の irq は MADT のオーバーライドで GSI に直す）、1031 `irq_ack(gsi)`。
+- `msg_recv` に**タイムアウト**（r8、マイクロ秒）を追加。`ipc.recv_from(block, timeout_ms)`。
+- `inputd`（`os/user/inputd.sp`、旧カーネル内 `ps2.sp`）は 8042 の割り込み（IRQ1/IRQ12）を有効にし、`"input"` として登録、`sub` で購読した GUI サーバへイベントを `in<TAB>…` で送る。`guid` は `ipc.recv_from()` で眠り、入力・クライアントの要求・20 ms のフレームタイマ（カーネルのタイマ割り込み）のどれかで起きる。カーネルから PS/2 のコードと `input` syscall は無くなった。
+
 既知の問題: 2 CPU のセルフテストが約 1 割の確率で、`burner` プロセスの Ring 3 のページフォルト（cr2=0）で落ちる。サーバ分離の前から出ていた現象で（変更前の木でも 14 回中 2 回）、原因は未調査。

@@ -134,8 +134,43 @@ void cpu_capture_fs(void) {
 uint8_t *cpu_iopb(int id) { return g_tss[id].iopb; }
 
 /* an interrupt arrived while the kernel was idle (hlt): count it; the Sprint scheduler looks at the counters */
+/* device interrupts (vectors IRQ_BASE .. IRQ_BASE + 23 = I/O APIC inputs 0..23): the pin is masked here (a level-triggered device keeps asserting
+ * until its driver has served it; the driver unmasks it again with irq_unmask once it has) and noted in g_irq_pending for the scheduler. */
+volatile uint64_t g_irq_pending;
+volatile uint32_t *g_ioapic;
+static volatile int g_ioapic_lock;
+static void ioapic_lock(void) {
+    while (__atomic_exchange_n(&g_ioapic_lock, 1, __ATOMIC_ACQUIRE)) __builtin_ia32_pause();
+}
+static void ioapic_unlock(void) { __atomic_store_n(&g_ioapic_lock, 0, __ATOMIC_RELEASE); }
+uint32_t ioapic_rd(uint32_t reg) {
+    ioapic_lock();
+    g_ioapic[0] = reg;
+    uint32_t v = g_ioapic[4];
+    ioapic_unlock();
+    return v;
+}
+void ioapic_wr(uint32_t reg, uint32_t v) {
+    ioapic_lock();
+    g_ioapic[0] = reg;
+    g_ioapic[4] = v;
+    ioapic_unlock();
+}
+void ioapic_set_mask(uint32_t gsi, int masked) {
+    if (!g_ioapic) return;
+    ioapic_lock();
+    g_ioapic[0] = 0x10 + 2 * gsi;
+    uint32_t lo = g_ioapic[4];
+    g_ioapic[0] = 0x10 + 2 * gsi;
+    g_ioapic[4] = masked ? (lo | 0x10000u) : (lo & ~0x10000u);
+    ioapic_unlock();
+}
 void kernel_irq(uint64_t vec);
 void kernel_irq(uint64_t vec) {
+    if (vec >= IRQ_BASE && vec < IRQ_BASE + 24) {
+        ioapic_set_mask((uint32_t)(vec - IRQ_BASE), 1);
+        __atomic_fetch_or(&g_irq_pending, 1ull << (vec - IRQ_BASE), __ATOMIC_RELEASE);
+    }
     g_irq_count[vec & 255]++;
     volatile uint32_t *lapic = (volatile uint32_t *)(uintptr_t)0xFEE00000u;
     if (lapic_present) lapic[0xB0 / 4] = 0; /* EOI */

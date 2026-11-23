@@ -1,8 +1,15 @@
-# ps2: keyboard and mouse drivers for the PC's 8042 controller, written in Sprint on top of hw.inb/outb.
-# Input(w, h).poll() returns gui events (mouse_move / mouse_down / mouse_up / wheel / key / text) for
-# everything the devices reported since the last call. Polling only - there are no interrupts.
-import hw
+# inputd: the keyboard and mouse driver server. A user process (not part of the kernel) that owns the PC's 8042 controller (the kernel opens its
+# I/O ports and routes its two interrupts to this process), turns what the devices report into gui events, and sends them to the GUI server.
+# Interrupt driven: the process sleeps in ipc.recv_from() until the kernel posts "irq<TAB>1" (keyboard) or "irq<TAB>12" (mouse); it then reads
+# what the controller has buffered, acknowledges the interrupt (ipc.irq_ack) and sends the events as one message. Nothing here polls a device.
+#
+# Protocol: the GUI server sends "sub<TAB>width<TAB>height" (answered "ok<TAB>x<TAB>y"); events then arrive as "in<TAB>" + lines of
+# "move<TAB>x<TAB>y" | "down<TAB>x<TAB>y<TAB>button<TAB>mods<TAB>clicks" | "up..." | "wheel..." | "key<TAB>name" | "text<TAB>s", separated by newlines.
+import io
+import ipc
 import math
+import psys
+import uio
 
 # event constructors (the same shapes the gui module uses)
 func ev_key(name):
@@ -38,34 +45,34 @@ const CMD = 0x64
 
 func wait_in():
     for i in range(200000):
-        if hw.inb(CMD) & 2 == 0:
+        if uio.inb(CMD) & 2 == 0:
             return true
     return false
 
 func wait_out():
     for i in range(200000):
-        if hw.inb(CMD) & 1 != 0:
+        if uio.inb(CMD) & 1 != 0:
             return true
     return false
 
 func send_cmd(c):
     wait_in()
-    hw.outb(CMD, c)
+    uio.outb(CMD, c)
 
 func send_data(d):
     wait_in()
-    hw.outb(DATA, d)
+    uio.outb(DATA, d)
 
 func read_data():
     if wait_out():
-        return hw.inb(DATA)
+        return uio.inb(DATA)
     return -1
 
 func flush():
     for i in range(64):
-        if hw.inb(CMD) & 1 == 0:
+        if uio.inb(CMD) & 1 == 0:
             return nil
-        hw.inb(DATA)
+        uio.inb(DATA)
 
 # a byte to the mouse (through the controller); returns its answer (0xFA = ACK)
 func mouse_cmd(b):
@@ -109,6 +116,11 @@ export class Input:
         self.my = height // 2
         self.pkt = []
         self.start()
+    func set_size(self, width, height):
+        self.width = width
+        self.height = height
+        self.mx = width // 2
+        self.my = height // 2
     func start(self):
         send_cmd(0xAD)
         send_cmd(0xA7)
@@ -117,7 +129,7 @@ export class Input:
         let cfg = read_data()
         if cfg < 0:
             cfg = 0x45
-        cfg = (cfg | 0x40) & ~0x33        # keep translation to set 1, no interrupts, clocks on
+        cfg = (cfg | 0x43) & ~0x30        # keep translation to set 1, interrupts for the keyboard (irq 1) and the mouse (irq 12), clocks on
         send_cmd(0x60)
         send_data(cfg)
         send_cmd(0xAE)
@@ -144,13 +156,13 @@ export class Input:
         if self.shift:
             m.append("Shift")
         return m.join("+")
-    # events from everything the controller has buffered
-    func poll(self):
+    # events from everything the controller has buffered (called after an interrupt: it drains the output buffer)
+    func drain(self):
         let out = []
         let n = 0
-        while hw.inb(CMD) & 1 != 0 and n < 256:
-            let st = hw.inb(CMD)
-            let b = hw.inb(DATA)
+        while uio.inb(CMD) & 1 != 0 and n < 256:
+            let st = uio.inb(CMD)
+            let b = uio.inb(DATA)
             n += 1
             if st & 0x20 != 0:
                 self.mouse_byte(b, out)
@@ -247,7 +259,7 @@ export class Input:
             if changed & bit != 0:
                 let btn = 1 if bit == 1 else (3 if bit == 2 else 2)
                 if nb & bit != 0:
-                    let now = hw.ticks_ms()
+                    let now = psys.ms()
                     if btn == self.last_click_btn and now - self.last_click_ms < 400 and math.abs(self.mx - self.last_click_x) < 5 and math.abs(self.my - self.last_click_y) < 5:
                         self.click_count += 1
                     else:
@@ -262,3 +274,39 @@ export class Input:
         self.buttons = nb
         if wheel != 0:
             out.append(ev_wheel(self.mx, self.my, wheel))
+
+
+# ---- the service --------------------------------------------------------------------------------------------------------------------
+func log(t):
+    print("[inputd] " .. t)
+    io.flush()
+
+let dev = Input(1024, 768)
+let irq_kbd = ipc.irq_register(1, false)
+let irq_mouse = ipc.irq_register(12, false)
+ipc.register("input")
+log("keyboard and mouse ready, interrupts " .. to_string(irq_kbd) .. " and " .. to_string(irq_mouse) .. (", wheel" if dev.has_wheel else ""))
+let subscriber = 0
+let running = true
+while running:
+    io.flush()
+    let m = ipc.recv_from()
+    let src = m[0]
+    let q = m[1].split("\t")
+    if src == 0:
+        let gsi = to_int(q[1])
+        let evs = dev.drain()
+        ipc.irq_ack(gsi)
+        if subscriber != 0 and len(evs) > 0:
+            let lines = []
+            for e in evs:
+                lines.append(encode(e))
+            ipc.send(subscriber, "in\t" .. lines.join("\n"))
+    elif q[0] == "sub":
+        subscriber = src
+        dev.set_size(to_int(q[1]), to_int(q[2]))
+        ipc.send(src, "ok\t" .. to_string(dev.mx) .. "\t" .. to_string(dev.my))
+    elif q[0] == "quit":
+        ipc.send(src, "ok")
+        running = false
+log("bye")

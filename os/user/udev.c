@@ -20,6 +20,14 @@ static long sc4(long n, long a, long b, long c, long d) {
     return r;
 }
 
+static long sc5(long n, long a, long b, long c, long d, long e) {
+    long r;
+    register long r10 __asm__("r10") = d;
+    register long r8 __asm__("r8") = e;
+    __asm__ volatile("syscall" : "=a"(r) : "a"(n), "D"(a), "S"(b), "d"(c), "r"(r10), "r"(r8) : "rcx", "r11", "memory");
+    return r;
+}
+
 static struct { uint8_t *addr; uint32_t w, h, pitch; } g_fb;
 
 static SpStatus need_i(SpVM *vm, SpValue v, int64_t *out) {
@@ -357,12 +365,15 @@ static SpStatus i_canvas_to_shm(SpVM *vm, int argc, const SpValue *argv, SpValue
     *ret = sp_nil();
     return SP_OK;
 }
-/* recv_from(block = true): [sender pid, message], or nil when none is waiting and block is false. The sender is the kernel's word, not the message's. */
+/* recv_from(block = true, timeout_ms = 0): [sender pid, message], or nil when none is waiting and block is false, or when the timeout (blocking, > 0) ran out. The sender
+ * is the kernel's word, not the message's; interrupts arrive from sender 0 as "irq<TAB>n". */
 static SpStatus i_recv_from(SpVM *vm, int argc, const SpValue *argv, SpValue *ret) {
     static char buf[4096];
     int nb = argc > 0 && argv[0].type == SP_T_BOOL && !argv[0].as.b;
     int64_t from = 0;
-    long n = sc4(1014, (long)(uintptr_t)buf, (long)sizeof buf, nb, (long)(uintptr_t)&from);
+    int64_t tmo = 0;
+    if (argc > 1 && argv[1].type == SP_T_INT) tmo = argv[1].as.i;
+    long n = sc5(1014, (long)(uintptr_t)buf, (long)sizeof buf, nb, (long)(uintptr_t)&from, (long)(tmo * 1000));
     if (n < 0) {
         *ret = sp_nil();
         return SP_OK;
@@ -374,6 +385,24 @@ static SpStatus i_recv_from(SpVM *vm, int argc, const SpValue *argv, SpValue *re
     if (st != SP_OK) return st;
     (void)sp_array_push(vm, *ret, sp_int(from));
     (void)sp_array_push(vm, *ret, msg);
+    return SP_OK;
+}
+/* irq_register(irq, pci): take interrupt irq (an ISA irq; with pci true a global system interrupt) -> the global interrupt number; irq_ack(n) after serving the device */
+static SpStatus i_irq_register(SpVM *vm, int argc, const SpValue *argv, SpValue *ret) {
+    (void)argc;
+    int64_t irq;
+    if (need_i(vm, argv[0], &irq) != SP_OK) return SP_E_RUNTIME;
+    int pci = argv[1].type == SP_T_BOOL && argv[1].as.b;
+    long r = sc3(1030, (long)irq, pci, 0);
+    if (r < 0) return sp_throw(vm, "OSError", "ipc.irq_register: error %ld", r);
+    *ret = sp_int(r);
+    return SP_OK;
+}
+static SpStatus i_irq_ack(SpVM *vm, int argc, const SpValue *argv, SpValue *ret) {
+    (void)argc;
+    int64_t gsi;
+    if (need_i(vm, argv[0], &gsi) != SP_OK) return SP_E_RUNTIME;
+    *ret = sp_int(sc3(1031, (long)gsi, 0, 0));
     return SP_OK;
 }
 /* register(name): this process serves `name`; lookup(name): the pid serving it, or nil */
@@ -398,7 +427,7 @@ static SpStatus i_lookup(SpVM *vm, int argc, const SpValue *argv, SpValue *ret) 
 }
 static const SpNativeDesc ipc_fns[] = {
     {"shm_to_canvas", 2, 2, 0, 0, i_shm_to_canvas}, {"canvas_to_shm", 2, 2, 0, 0, i_canvas_to_shm},
-    {"recv_from", 0, 1, 0, SP_NATIVE_ALLOCATES, i_recv_from}, {"register", 1, 1, 0, 0, i_register}, {"lookup", 1, 1, 0, 0, i_lookup},
+    {"recv_from", 0, 2, 0, SP_NATIVE_ALLOCATES, i_recv_from}, {"irq_register", 2, 2, 0, 0, i_irq_register}, {"irq_ack", 1, 1, 0, 0, i_irq_ack}, {"register", 1, 1, 0, 0, i_register}, {"lookup", 1, 1, 0, 0, i_lookup},
     {"shm_create", 1, 1, 0, SP_NATIVE_ALLOCATES, i_shm_create}, {"shm_open", 1, 1, 0, SP_NATIVE_ALLOCATES, i_shm_open},
     {"shm_close", 1, 1, 0, 0, i_shm_close}, {"shm_read", 3, 3, 0, SP_NATIVE_ALLOCATES, i_shm_read},
     {"shm_write", 3, 3, 0, 0, i_shm_write}, {"shm_get", 2, 2, 0, 0, i_shm_get}, {"shm_set", 3, 3, 0, 0, i_shm_set},

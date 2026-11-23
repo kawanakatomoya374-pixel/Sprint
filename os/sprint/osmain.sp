@@ -5,6 +5,7 @@ import lapic
 import acpi
 import sched
 import ksys
+import ioapic
 
 func log(s):
     ksys.log(s)
@@ -14,6 +15,7 @@ let img = hw.initrd()
 log("userland image: " .. to_string(img[1]) .. " bytes")
 let per_ms = lapic.start(10)
 log("local APIC timer: " .. to_string(per_ms) .. " ticks/ms")
+log("I/O APIC: " .. to_string(ioapic.init()) .. " inputs")
 hw.set_timer(per_ms * 10)
 sched.init(img)
 # kernel command line: init=NAME picks the first user program (default: boot)

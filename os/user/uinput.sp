@@ -10,7 +10,9 @@ export class Input:
         self.mx = width // 2
         self.my = height // 2
     func poll(self):
-        let text = gdev.input()
+        return self.feed(gdev.input())
+    # gui events from text lines sent by the input driver (inputd)
+    func feed(self, text):
         let out = []
         if len(text) == 0:
             return out
