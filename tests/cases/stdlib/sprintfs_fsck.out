@@ -1,0 +1,14 @@
+start true 2 2 1
+damaged false true
+  found: inode 4: link count 5, expected 2
+  found: inode 6 is allocated but not reachable from the root
+  found: 3 allocated blocks belong to no inode (leaked)
+  found: the free block count is 933, expected 936
+  fixed: inode 4: link count set to 2
+  fixed: orphan inode 6 freed
+  fixed: 3 leaked blocks freed
+repaired true []
+two two 2 ["alias", "one", "two"]
+bit flip false true
+backup superblock 256 []
+EIO

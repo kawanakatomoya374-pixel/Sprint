@@ -26,3 +26,4 @@
 - [15.21 asm（x86 / x86-64 アセンブラ、同梱module）](15-stdlib/21-asm.md)
 - [15.22 hash（SHA-256）](15-stdlib/22-hash.md)
 - [15.23 image（BMP / PNG / JPEG デコーダー）](15-stdlib/23-image.md)
+- [15.24 sprintfs（SprintFS、ジャーナル付きファイルシステム）](15-stdlib/24-sprintfs.md)

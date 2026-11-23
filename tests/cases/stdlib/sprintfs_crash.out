@@ -1,0 +1,2 @@
+workload writes: true
+crash points: 184 inconsistent: 0 transactions replayed: true

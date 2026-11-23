@@ -122,8 +122,43 @@ static int s_join(VM *vm, int argc, SpValue *argv, SpValue *ret) {
     return arr_join(vm, AS_ARRAY(argv[0]), AS_STR(argv[1]), ret);
 }
 
+/* from_bytes(arr): a string from bytes 0..255 (an array or a typed.u8); invalid UTF-8 is a ValueError. to_bytes(s): the bytes of a string as an array. */
+static int s_from_bytes(VM *vm, int argc, SpValue *argv, SpValue *ret) {
+    (void)argc;
+    int64_t n = 0;
+    int is_arr = argv[0].type == T_ARRAY;
+    if (is_arr) n = AS_ARRAY(argv[0])->len;
+    else if (argv[0].type == T_NATIVE && typed_kind(argv[0]) >= 0 && typed_kind(argv[0]) <= 8) n = typed_len(argv[0]);
+    else return vm_set_error(vm, E_TYPE, "from_bytes() needs an array of bytes or a typed array, not %s", type_name(argv[0]));
+    char *buf = malloc((size_t)(n > 0 ? n : 1));
+    if (!buf) return vm_set_error(vm, E_MEMORY, "out of memory");
+    for (int64_t i = 0; i < n; i++) {
+        SpValue e;
+        if (is_arr) e = array_get(AS_ARRAY(argv[0]), i);
+        else if (!typed_peek(argv[0], v_int(i), &e)) e = v_nil();
+        if (e.type != T_INT || e.as.i < 0 || e.as.i > 255) { free(buf); return vm_set_error(vm, E_VALUE, "byte %lld is not an int in 0..255", (long long)i); }
+        buf[i] = (char)e.as.i;
+    }
+    size_t bad;
+    if (!utf8_validate(buf, (size_t)n, &bad)) { free(buf); return vm_set_error(vm, E_VALUE, "the bytes are not valid UTF-8 (offset %zu)", bad); }
+    *ret = vstr(vm, buf, (size_t)n);
+    free(buf);
+    return 0;
+}
+static int s_to_bytes(VM *vm, int argc, SpValue *argv, SpValue *ret) {
+    (void)argc;
+    if (need_str(vm, argv[0], "string")) return 1;
+    const SString *s = AS_STR(argv[0]);
+    SArray *a = vm_new_array(vm, (int64_t)s->len);
+    if (!a) return vm_set_error(vm, E_MEMORY, "out of memory");
+    for (size_t i = 0; i < s->len; i++)
+        if (array_push(vm, a, v_int((unsigned char)s->dp[i]))) return 1;
+    *ret = v_obj(T_ARRAY, a);
+    return 0;
+}
+
 const NativeDesc str_fns[] = {
-    {"format", 1, -1, s_format}, {"from_codepoint", 1, 1, s_from_codepoint},
+    {"format", 1, -1, s_format}, {"from_codepoint", 1, 1, s_from_codepoint}, {"from_bytes", 1, 1, s_from_bytes}, {"to_bytes", 1, 1, s_to_bytes},
     {"join", 2, 2, s_join}, {NULL, 0, 0, NULL}};
 
 

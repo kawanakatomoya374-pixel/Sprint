@@ -1,0 +1,35 @@
+hello, SprintFS ["a"] ["b", "hello.txt"] 15 dir
+hello, SprintFS and more
+[2, 3, 4] 4 5
+[1, 2, 3, 4, 5, 101, 110, 100]
+true false true false
+big file true 5
+sparse 20494 0 116 1
+truncate down 5000 2 true
+truncate up 9000 0
+many 300 12288
+after removing half 150
+2 true
+1 hello, SprintFS and more
+/a/hard hello, SprintFS and more symlink file dir
+ELOOP
+true
+["rel", "rw.bin"] ["c", "moved"] hello, SprintFS and more 5
+1 []
+EINVAL
+ENOTEMPTY
+EEXIST
+ENOENT
+EISDIR
+ENOTDIR
+EEXIST
+EISDIR
+384 1000 100 111 222
+["user.note", "user.tag"] [99, 104, 97, 110, 103, 101, 100] [1, 2, 3]
+["user.note"]
+ENOENT
+space returned true true
+ENOSPC
+after a failed write the file system is intact true
+after unmount fsck clean
+1 150 9000 [99, 104, 97, 110, 103, 101, 100]

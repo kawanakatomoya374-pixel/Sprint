@@ -49,7 +49,7 @@ export func image_hash(pe):
     for i in range(nsec):
         let h = sec0 + i * 40
         secs.append([u32(pe, h + 20), u32(pe, h + 16)])      # [PointerToRawData, SizeOfRawData]
-    secs.sort((a, b) => a[0] - b[0])
+    secs.sort((a, b) => a[0] < b[0])
     let end = headers
     for s in secs:
         if s[1] > 0:
