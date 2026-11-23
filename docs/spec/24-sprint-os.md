@@ -151,3 +151,11 @@ x86-64 の JIT（領域 JIT・TraceJIT・純関数 JIT）は、カーネル自�
 - **Sprint 側**: DER（`sslasn1`）、X.509（`sslx509`: PEM、署名検証（RSA PKCS#1 v1.5 / PSS、ECDSA、Ed25519）、チェーン検証、期間、ホスト名（SAN・ワイルドカード・IP）、CA と経路長）、TLS 1.3（`ssltls`: レコード層、鍵スケジュール、クライアント、テスト用の小さなサーバー、KeyUpdate）、入口（`sprintssl`: `connect`、`TcpTransport`（`netstack` の TCP を載せる）、`http_get`）。
 - **確認**: `make test` が `sprintssl/tests/*.sp`（既知解、X.509 のチェーン、メモリ内のクライアント↔サーバー）を回す。`make os-net-test` は QEMU のゲスト（SprintOS）から、ホスト上の Python `ssl` サーバー（ECDSA P-256 + 中間 CA、RSA、Ed25519。200000 バイトの本文、信頼できないチェーンの拒否）と、**GitHub Pages**（`octocat.github.io`。ホストの TCP 中継を通すが、TLS はゲストと GitHub の間で完結し、実際の証明書チェーン Let's Encrypt → ISRG Root X1 を検証する）へ HTTPS で接続する。
 - **限界**: TLS 1.2・再開・クライアント証明書・HelloRetryRequest・失効確認は無い。秘密のスカラーを使う ECDH は定数時間ではない。QEMU の既定 CPU には RDRAND が無く、乱数の質は呼び出し側が与える種（`sslcore.seed`）次第（テスト用）。ルート証明書の一式はまだ SprintOS に同梱していない（呼び出し側が渡す）。
+
+## アプリのダウンロード（C-OS Apps）
+
+`stdlib/cosapps.sp` は C-OS-APPS（GitHub Pages: `https://kawanakatomoya374-pixel.github.io/C-OS-APPS/`）のクライアント。形式は C-OS の `tools/linux_pack.py` / `sign_linuxpack.py` と同じ: マニフェスト（テキスト、`--SIG--` の行、128 桁の 16 進 = ECDSA P-256 の r‖s。署名対象は標識の前の本文の SHA-256）、`COSAPPS 1`（カタログ）と `COSLP 1`（パック）、zlib のチャンク（レコード: u16 パス長・パス・u8 種別・u64 ファイルサイズ・u64 オフセット・u32 長さ・データ。最後の `.manifest` がリンクと実行ビット）。C-OS リリース鍵（公開鍵 3 本）は `cosapps.sp` に埋め込み、実際の `catalog.manifest` / `linuxpack.manifest` が 3 本目の鍵で検証できることを確認した。
+
+`catalog(src)` は署名を確かめてアプリ一覧を返し、`install(src, "apps/lua", sink)` はマニフェストの署名、チャンクのサイズと SHA-256、zlib（C の `sslcore.inflate`、Adler-32 つき）、レコードの範囲を確かめて `sink`（`MemSink`: メモリ上にファイルを組み立てる）へ渡す。パスに `..` や先頭の `/` があれば拒否する。`HttpsSource` は `sprintssl` で HTTPS 取得する。試験: `sprintssl/tests/cosapps_test.sp`（実データのコピー。1 バイト変えたカタログ・チャンク・マニフェストを拒否）、`os-net-test`（ゲストが GitHub Pages から実カタログ 14 件と Lua パック 2.4 MB を取得し、31 ファイル 5048159 バイトを展開）。
+
+未実装: SprintFS へ書く sink と、インストール先（`root=`）の扱い、ファイルマネージャー（Windows 風 GUI）。

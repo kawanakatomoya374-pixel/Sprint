@@ -1,0 +1,5 @@
+COSLP 1
+pack name=sprint title=Sprint version=2 serial=1793222320 chunks=1 files=3 bytes=9719 download=9704 root=/apps/sprint exec= icon=icon.png
+chunk file=sprint.p0001.bin size=9704 sha256=ac177416bf5d5a5d178dd0d9b704b1012d386c558f73f418f2f73ee09cb9e737 raw=9818
+--SIG--
+c46095249d587550deabb03973deaf828742364441e8a845d15a22aa676df823796c88c24c3f0068eed264353671879256e9bb53f9244dfb9cfda6060c85c2be

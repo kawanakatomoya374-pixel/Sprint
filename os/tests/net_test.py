@@ -86,8 +86,8 @@ for i, n in enumerate(("ec", "rsa", "ed")): tls_serve(18443 + i, n)
 # a relay to GitHub Pages through the environment's HTTP proxy (CONNECT), only when a proxy is configured; the guest does the TLS itself
 import urllib.parse
 PROXY = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
-def relay():
-    ls = socket.socket(); ls.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); ls.bind(("127.0.0.1", 18500)); ls.listen(4)
+def relay(port, target):
+    ls = socket.socket(); ls.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); ls.bind(("127.0.0.1", port)); ls.listen(8)
     def pump(a, b):
         try:
             while True:
@@ -104,12 +104,12 @@ def relay():
             if PROXY:
                 p = urllib.parse.urlparse(PROXY)
                 u = socket.create_connection((p.hostname, p.port), timeout=20)
-                u.sendall(b"CONNECT octocat.github.io:443 HTTP/1.1\r\nHost: octocat.github.io:443\r\n\r\n")
+                u.sendall(("CONNECT %s:443 HTTP/1.1\r\nHost: %s:443\r\n\r\n" % (target, target)).encode())
                 r = b""
                 while b"\r\n\r\n" not in r: r += u.recv(1024)
                 if b" 200" not in r.split(b"\r\n")[0]: raise OSError("proxy refused")
             else:
-                u = socket.create_connection(("octocat.github.io", 443), timeout=10)
+                u = socket.create_connection((target, 443), timeout=10)
             threading.Thread(target=pump, args=(c, u), daemon=True).start()
             threading.Thread(target=pump, args=(u, c), daemon=True).start()
         except OSError:
@@ -118,7 +118,8 @@ def relay():
         try: c, _ = ls.accept()
         except OSError: return
         threading.Thread(target=handle, args=(c,), daemon=True).start()
-threading.Thread(target=relay, daemon=True).start()
+threading.Thread(target=relay, args=(18500, "octocat.github.io"), daemon=True).start()
+threading.Thread(target=relay, args=(18501, "kawanakatomoya374-pixel.github.io"), daemon=True).start()
 def have_internet():
     try:
         s = socket.create_connection(urllib.parse.urlparse(PROXY).hostname and (urllib.parse.urlparse(PROXY).hostname, urllib.parse.urlparse(PROXY).port) or ("octocat.github.io", 443), timeout=5); s.close(); return True
@@ -133,7 +134,7 @@ for model in ("e1000", "e1000e"):
                           "-display", "none", "-no-reboot", "-serial", "file:" + ser, "-device", "isa-debug-exit,iobase=0xf4,iosize=4"],
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     reply = b""
-    deadline = time.time() + 150
+    deadline = time.time() + 400
     connected = False
     while time.time() < deadline and q.poll() is None:
         L = open(ser, errors="replace").read() if os.path.exists(ser) else ""
@@ -171,6 +172,9 @@ for model in ("e1000", "e1000e"):
         check("nettest: github.io TLS_" in L and "status 200" in L.split("nettest: github.io", 1)[-1].split("\n")[0], "[%s] HTTPS GET of a GitHub Pages site (octocat.github.io): real certificate chain (RSA, Let's Encrypt, cross-signed by ISRG Root X1), TLS 1.3" % model)
     else:
         print("skip [%s] GitHub Pages (no network / proxy here)" % model)
+    if INTERNET:
+        check("nettest: cosapps catalog 14 apps, signature ok" in L, "[%s] C-OS Apps: the signed catalog is downloaded over HTTPS from GitHub Pages and verified with the C-OS release key (ECDSA P-256)" % model)
+        check("nettest: cosapps pack lua 31 files 5048159 bytes" in L, "[%s] C-OS Apps: the Lua pack (2.4 MB zlib chunk) is downloaded, SHA-256 and signature checked, inflated and unpacked: 31 files" % model)
     check("nettest: tls wrong root refused:" in L, "[%s] TLS 1.3: a server certificate that does not chain to the trusted root is refused" % model)
     check("nettest: tcp client 40000 bytes back, match true" in L, "[%s] TCP client: 40000 bytes to the host and the transformed bytes back, intact" % model)
     check("nettest: tcp server got 1000 bytes" in L and reply == (b"hello from the host " * 50).upper(), "[%s] TCP server: the host connects through QEMU's port forward, and gets its data back" % model)

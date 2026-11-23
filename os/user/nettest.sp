@@ -11,6 +11,7 @@ import sslcore
 import sprintssl
 import urtc
 import testroots
+import cosapps
 
 const HOST = "10.0.2.2"
 
@@ -117,6 +118,21 @@ if got:
         catch e:
             say("nettest: github.io failed:", to_string(e))
         st.tcp_close(tg)
+    # the C-OS app store on GitHub Pages: the signed catalog and the Lua pack, downloaded, verified (ECDSA release key, SHA-256 of the chunk) and unpacked
+    let store_roots = sprintssl.load_roots(testroots.ISRG_ROOT_X1)
+    let store = cosapps.HttpsSource("kawanakatomoya374-pixel.github.io", "/C-OS-APPS/", () => sprintssl.TcpTransport(st, st.tcp_connect(host, 18501, 5000)), store_roots, now)
+    try:
+        let t4 = sys.ms()
+        let apps = cosapps.catalog(store)
+        say("nettest: cosapps catalog", len(apps), "apps, signature ok, first:", apps[0].id)
+        let sink = cosapps.MemSink()
+        let pk = cosapps.install(store, "apps/lua", sink)
+        let nbytes = 0
+        for fp in sink.files:
+            nbytes += len(sink.files[fp])
+        say("nettest: cosapps pack", pk.name, to_string(len(sink.files)) .. " files", to_string(nbytes) .. " bytes", "in", sys.ms() - t4, "ms")
+    catch e:
+        say("nettest: cosapps failed:", to_string(e))
     let tc2 = st.tcp_connect(host, 18443, 5000)
     let tt2 = sprintssl.TcpTransport(st, tc2)
     try:

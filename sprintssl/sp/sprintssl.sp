@@ -127,16 +127,22 @@ export func http_get(conn, host, path, timeout = 10000):
         body = sslcore.concat(out)
     elif headers["content-length"] != nil:
         let want = to_int(headers["content-length"])
-        while len(body) < want:
-            let p = conn.read(16384, timeout)
+        let have = len(body)
+        parts.append(body)
+        while have < want:
+            let p = conn.read(65536, timeout)
             if p == nil or len(p) == 0:
                 break
-            body = sslcore.concat([body, p])
+            parts.append(p)
+            have += len(p)
+        body = sslcore.concat(parts)
         body = body.slice(0, want if want < len(body) else len(body))
     else:
+        parts.append(body)
         while true:
-            let p = conn.read(16384, timeout)
+            let p = conn.read(65536, timeout)
             if p == nil or len(p) == 0:
                 break
-            body = sslcore.concat([body, p])
+            parts.append(p)
+        body = sslcore.concat(parts)
     return {status: status, headers: headers, body: body}

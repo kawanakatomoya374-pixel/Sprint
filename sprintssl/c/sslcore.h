@@ -50,4 +50,7 @@ int ssl_ec_pub(int curve, uint8_t *out, const uint8_t *priv, size_t vl);        
 /* ---- random numbers ---- */
 void ssl_random(uint8_t *out, size_t n);
 void ssl_random_seed(const uint8_t *p, size_t n);
+
+/* ---- zlib ---- */
+int ssl_zlib_inflate(const uint8_t *in, size_t n, uint8_t **out, size_t *outlen, size_t maxout); /* 0 on success; free(*out) */
 #endif

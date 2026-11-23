@@ -357,7 +357,22 @@ static int sc_to_str(VM *vm, int argc, SpValue *argv, SpValue *ret) {     /* byt
     return 0;
 }
 
+static int sc_inflate(VM *vm, int argc, SpValue *argv, SpValue *ret) {   /* zlib stream -> bytes; nil when the data is broken */
+    NEED(d, 0, "data");
+    int64_t max = 1 << 30;
+    if (argc > 1 && need_int(vm, argv[1], "max", &max)) { DONE(d); return 1; }
+    uint8_t *out = NULL;
+    size_t n = 0;
+    int r = ssl_zlib_inflate(d.p, d.n, &out, &n, (size_t)max);
+    DONE(d);
+    if (r) { *ret = v_nil(); return 0; }
+    *ret = typed_u8_from(vm, out, n);
+    free(out);
+    return 0;
+}
+
 const NativeDesc lib_sslcore_fns[] = {
+    {"inflate", 1, 2, sc_inflate},
     {"hash", 2, 2, sc_hash}, {"hmac", 3, 3, sc_hmac}, {"hkdf_extract", 3, 3, sc_hkdf_extract}, {"hkdf_expand", 4, 4, sc_hkdf_expand},
     {"gcm_seal", 4, 4, sc_gcm_seal}, {"gcm_open", 4, 4, sc_gcm_open}, {"chacha_seal", 4, 4, sc_chacha_seal}, {"chacha_open", 4, 4, sc_chacha_open},
     {"x25519", 2, 2, sc_x25519}, {"x25519_base", 1, 1, sc_x25519_base},
