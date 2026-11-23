@@ -33,7 +33,7 @@ let me = lapic.id()
 let started = 1
 let idx = 1
 for apic in ids:
-    if apic != me and idx < 16:
+    if apic != me and idx < 8:
         if hw.ap_start(apic, idx):
             started += 1
         else:

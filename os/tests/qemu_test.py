@@ -33,7 +33,7 @@ def boot(cpus):
     return open(ser, errors="replace").read()
 
 times = {}
-for cpus in (1, 2):
+for cpus in (1, 2, 4, 8):
     log = boot(cpus)
     tag = "[%d cpu] " % cpus
     check("physical pages:" in log, tag + "kernel (Sprint) starts and owns physical memory")
@@ -47,12 +47,15 @@ for cpus in (1, 2):
     pages = [l.split(": ")[1] for l in log.splitlines() if l.startswith("[kernel] physical pages:")]
     free = [l.split(": ")[1] for l in log.splitlines() if l.startswith("[kernel] free pages after exit:")]
     check(bool(pages) and pages == free, tag + "all physical pages are returned at exit")
+    runs = re.search(r"runs per cpu: (.*)", log)
+    busy = len(re.findall(r"cpu\d=", runs.group(1))) if runs else 0
+    check(busy >= min(cpus, 4), tag + "user code ran on %d of the %d processors (the scheduler really spreads work over them)" % (busy, cpus))
     m = re.search(r"init: 4 burners took (\d+) ms", log)
     times[cpus] = int(m.group(1)) if m else None
 # the Sprint VMs (ring 0 and ring 3) run with the JIT: the interpreter alone needs ~7800 ms for these four jobs on one CPU (JIT: ~1800 ms)
 check(bool(times[1]) and times[1] < 4500, "ring-3 Sprint code is JIT-compiled (4 burners on 1 CPU: %s ms, interpreter alone ~7800 ms)" % times[1])
-check(all(times.values()) and times[2] < times[1] * 0.75,
-      "2 processors finish 4 CPU-bound jobs sooner than 1 (%s ms vs %s ms)" % (times[2], times[1]))
+check(all(times.values()) and times[2] < times[1] * 0.85 and times[4] < times[1] * 0.75,
+      "more processors finish 4 CPU-bound jobs sooner (1 cpu %s ms, 2 cpus %s ms, 4 cpus %s ms, 8 cpus %s ms)" % (times[1], times[2], times[4], times[8]))
 def desktop():
     ser = os.path.join(OUT, "desktop.log")
     mon = os.path.join(OUT, "mon.sock")

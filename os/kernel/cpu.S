@@ -85,6 +85,8 @@ save_user:
     movq %cr2, %rdx
     movq %rdx, CTX_CR2(%rax)
     fxsave CTX_FX(%rax)
+    movq %gs:PC_KCR3, %rdx              /* leave the process's page tables at once: the kernel may free them (process exit) or reuse their pages while this */
+    movq %rdx, %cr3                     /* CPU is still in the kernel, or idle in hlt, and an interrupt must not find its own mapping gone */
     movl $0xC0000100, %ecx              /* back to the kernel's own FS base (libc's thread pointer) */
     movl %gs:PC_KFS, %eax
     movl %gs:PC_KFS+4, %edx

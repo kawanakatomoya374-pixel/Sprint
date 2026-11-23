@@ -17,6 +17,7 @@ let next_pid = 1
 let image = nil
 let preemptions = 0
 export let switches = 0
+let cpu_runs = {}     # cpu -> how many times it was given a process to run
 
 func log(s):
     ksys.log(s)
@@ -291,6 +292,7 @@ export func pick(cpu):
             io_apply(cpu, p)
             cur[cpu] = p
             switches += 1
+            cpu_runs[cpu] = (cpu_runs[cpu] if cpu in cpu_runs else 0) + 1
             return p.ctx
     if alive() == 0:
         done()
@@ -298,6 +300,11 @@ export func pick(cpu):
 
 func done():
     log("scheduler: " .. to_string(switches) .. " switches, " .. to_string(preemptions) .. " timer preemptions, " .. to_string((hw.ticks_us() - t_start) // 1000) .. " ms")
+    let per = []
+    for c in range(8):
+        if c in cpu_runs:
+            per.append("cpu" .. to_string(c) .. "=" .. to_string(cpu_runs[c]))
+    log("runs per cpu: " .. per.join(" "))
     log("free pages after exit: " .. to_string(kmem.free_count()))
     hw.poweroff()
 

@@ -4,11 +4,11 @@
 #include <stdint.h>
 #include "cpu_defs.h"
 
-enum { MAX_CPUS = 32 };
+enum { MAX_CPUS = 8 }; /* the most processors SprintOS drives */
 
 typedef struct PerCpu {
-    uint64_t self, kctx_rsp, cur_ctx, rsp0, uscratch, id, kfs;
-    uint64_t pad[9];
+    uint64_t self, kctx_rsp, cur_ctx, rsp0, uscratch, id, kfs, kcr3;
+    uint64_t pad[8];
 } PerCpu;
 _Static_assert(sizeof(PerCpu) == PC_SIZE, "PerCpu size");
 

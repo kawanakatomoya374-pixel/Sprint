@@ -33,6 +33,7 @@ static uint64_t g_kernel_fs;
 volatile uint64_t g_irq_count[256];
 int lapic_present;
 extern const uint64_t isr_table[256];
+extern char pml4[];
 extern void syscall_entry(void);
 
 static void wrmsr_(uint32_t msr, uint64_t v) {
@@ -97,6 +98,7 @@ void cpu_init(int id) {
     pc->self = (uint64_t)(uintptr_t)pc;
     pc->id = (uint64_t)id;
     pc->rsp0 = (uint64_t)(uintptr_t)&g_trap_stack[id][TRAP_STACK];
+    pc->kcr3 = (uint64_t)(uintptr_t)pml4; /* the kernel's own page tables: every trap from ring 3 returns to them (see cpu.S) */
     if (id == 0) {
         uint64_t fs = rdmsr_(0xC0000100);
         g_kernel_fs = fs;

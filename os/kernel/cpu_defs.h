@@ -10,6 +10,7 @@
 #define PC_USCRATCH 32
 #define PC_ID 40
 #define PC_KFS 48
+#define PC_KCR3 56
 #define PC_SIZE 128
 
 /* thread context: what a thread's CPU state looks like while it is not running in ring 3 */
