@@ -1,10 +1,14 @@
 # uefi_loader: the Sprint OS UEFI loader and kernel file (see uefiboot.sp for the description), as a module so that the plain UEFI
 # image and the hybrid BIOS + UEFI image share it.
 #
-#   let u = uefi_loader.build(elf_bytes, info, "init=boot")
+#   let u = uefi_loader.build(elf_bytes, info, "init=boot", kernel_elf64_bytes)
 #   u.efi      \EFI\BOOT\BOOTX64.EFI (a PE32+ file)
-#   u.kbin     \SPRINTOS.BIN: the kernel's PT_LOAD segments, concatenated
+#   u.kbin     \SPRINTOS.BIN: the kernel's PT_LOAD segments, concatenated, then the relocation table (u32 entries, see elf32.relocs)
+#
+# The kernel is relocatable: the loader asks the firmware for a free block anywhere below 4 GiB, copies the segments there and adds the
+# displacement to every address the kernel holds (the table comes from the 64-bit kernel.elf, linked with -Wl,-q).
 import asm
+import elf32
 import typed
 import uefi_pe
 
@@ -21,21 +25,33 @@ func db_string(s):
     return "db " .. parts.join(", ") .. ", 0"
 
 
-export func build(elf, info, cmdline):
+export func build(elf, info, cmdline, elf64):
     let entry = info.entry
     let segs = []
-    let kbin_size = 0
+    let seg_bytes = 0
+    let minp = info.segs[0].paddr
+    let maxend = 0
     for i in range(len(info.segs)):
         let t = info.segs[i]
-        segs.append({off: t.off, paddr: t.paddr, filesz: t.filesz, memsz: t.memsz, fileoff: kbin_size})
-        kbin_size += t.filesz
+        segs.append({off: t.off, paddr: t.paddr, filesz: t.filesz, memsz: t.memsz, fileoff: seg_bytes})
+        seg_bytes += t.filesz
+        if t.paddr < minp:
+            minp = t.paddr
+        if t.paddr + t.memsz > maxend:
+            maxend = t.paddr + t.memsz
+    let rel = elf32.relocs(elf64, minp)
+    let kbin_size = seg_bytes + 4 * len(rel)
+    let kimg_pages = (maxend - minp + 4095) // 4096
     let kbin = typed.u8(kbin_size)
     for s in segs:
         for i in range(s.filesz):
             kbin[s.fileoff + i] = elf[s.off + i]
+    for k in range(len(rel)):
+        for j in range(4):
+            kbin[seg_bytes + 4 * k + j] = (rel[k] >> (8 * j)) & 255
     let ktable = ""
     for s in segs:
-        ktable = ktable .. "    dd " .. to_string(s.fileoff) .. ", " .. to_string(s.paddr) .. ", " .. to_string(s.filesz) .. ", " .. to_string(s.memsz) .. "\n"
+        ktable = ktable .. "    dd " .. to_string(s.fileoff) .. ", " .. to_string(s.paddr - minp) .. ", " .. to_string(s.filesz) .. ", " .. to_string(s.memsz) .. "\n"
     
     # ---- the trampoline: UEFI long mode -> 32-bit protected mode -> the kernel ------------------------------
     let tramp_src = """
@@ -66,7 +82,7 @@ export func build(elf, info, cmdline):
         wrmsr
         xor eax, eax
         mov cr4, eax
-        ; the kernel's segments: copy from the file buffer to their addresses, zero the bss (no page tables to protect any more)
+        ; the kernel's segments: copy from the file buffer to base + their offset, zero the bss (no page tables to protect any more)
         lea ebx, [ebp + t_ktable]
         mov eax, [ebp + t_nseg]
         mov [ebp + t_cnt], eax
@@ -74,11 +90,13 @@ export func build(elf, info, cmdline):
         mov esi, [ebx]
         add esi, [ebp + t_kbuf]
         mov edi, [ebx + 4]
+        add edi, [ebp + t_base]
         mov ecx, [ebx + 8]
         cld
         rep movsb
         mov edi, [ebx + 4]
         add edi, [ebx + 8]
+        add edi, [ebp + t_base]
         mov ecx, [ebx + 12]
         sub ecx, [ebx + 8]
         xor eax, eax
@@ -86,6 +104,31 @@ export func build(elf, info, cmdline):
         add ebx, 16
         dec dword [ebp + t_cnt]
         jnz .cs
+        ; relocation: every slot that holds an address of the image moves by the displacement (new base - link base)
+        mov ebx, [ebp + t_kbuf]
+        add ebx, [ebp + t_reloff]
+        mov ecx, [ebp + t_relcnt]
+        mov edx, [ebp + t_delta]
+        mov esi, [ebp + t_base]
+    .rl:
+        test ecx, ecx
+        jz .rld
+        mov eax, [ebx]
+        mov edi, eax
+        and edi, 0x7fffffff
+        add edi, esi
+        test eax, 0x80000000
+        jnz .w8
+        add [edi], edx
+        jmp .rn
+    .w8:
+        add [edi], edx
+        adc dword [edi + 4], 0
+    .rn:
+        add ebx, 4
+        dec ecx
+        jmp .rl
+    .rld:
         mov ebx, [ebp + t_mbi]
         mov edi, [ebp + t_entry]
         mov eax, 0x36d76289             ; Multiboot2 bootloader magic
@@ -101,6 +144,10 @@ export func build(elf, info, cmdline):
     t_mbi: dd 0
     t_entry: dd 0
     t_kbuf: dd 0
+    t_base: dd 0
+    t_delta: dd 0
+    t_reloff: dd """ .. to_string(seg_bytes) .. """
+    t_relcnt: dd """ .. to_string(len(rel)) .. """
     t_nseg: dd """ .. to_string(len(segs)) .. """
     t_cnt: dd 0
     align 16
@@ -213,6 +260,17 @@ export func build(elf, info, cmdline):
         call [rax + 40]
         test rax, rax
         jnz fail_kbuf
+        mov qword [kbase], 0xffffffff   ; the relocated kernel: any free block below 4 GiB (the identity map the kernel builds covers it)
+        mov ecx, 1
+        mov edx, 2
+        mov r8d, """ .. to_string(kimg_pages) .. """
+        lea r9, [kbase]
+        mov rax, [bs]
+        call [rax + 40]
+        test rax, rax
+        jnz fail_kbuf
+        cmp qword [kbase], """ .. to_string(minp) .. """   ; relocation adds a non-negative displacement
+        jb fail_range
         mov rcx, [image]
         lea rdx, [guid_loaded]
         lea r8, [loaded]
@@ -286,7 +344,13 @@ export func build(elf, info, cmdline):
         mov rdi, [tramp]
         mov eax, [mbi]
         mov [rdi + """ .. to_string(TL["t_mbi"]) .. """], eax
-        mov dword [rdi + """ .. to_string(TL["t_entry"]) .. """], """ .. to_string(entry) .. """
+        mov eax, [kbase]
+        mov [rdi + """ .. to_string(TL["t_base"]) .. """], eax
+        sub eax, """ .. to_string(minp) .. """
+        mov [rdi + """ .. to_string(TL["t_delta"]) .. """], eax
+        mov eax, [kbase]
+        add eax, """ .. to_string(entry - minp) .. """
+        mov [rdi + """ .. to_string(TL["t_entry"]) .. """], eax
         mov eax, [kbuf]
         mov [rdi + """ .. to_string(TL["t_kbuf"]) .. """], eax
         lea rax, [rdi + """ .. to_string(TL["t_gdt"]) .. """]
@@ -403,59 +467,6 @@ export func build(elf, info, cmdline):
         mov rax, rdi
         sub rax, r10
         mov [r10 + 4], eax
-        ; every kernel range (and nothing else we need) must be memory that is free once boot services are gone
-        lea r14, [ktable]
-        mov r15d, """ .. to_string(len(segs)) .. """
-    .chkseg:
-        mov r8d, [r14 + 4]
-        mov r9d, [r14 + 12]
-        add r9, r8
-        mov rax, [kbuf]                 ; the file buffer must not overlap the destination
-        mov rdx, rax
-        add rdx, """ .. to_string(kpages * 4096) .. """
-        cmp rax, r9
-        jae .kbok
-        cmp rdx, r8
-        ja fail_range
-    .kbok:
-        mov rsi, [mmbuf]
-        mov r11, [mmcount]
-    .chkd:
-        test r11, r11
-        jz .chknext
-        mov rax, [rsi + 8]
-        mov rdx, [rsi + 24]
-        shl rdx, 12
-        add rdx, rax
-        cmp rax, r9
-        jae .chkdn
-        cmp rdx, r8
-        jbe .chkdn
-        mov eax, [rsi]
-        cmp eax, 7
-        je .chkdn
-        cmp eax, 1
-        jb .bad
-        cmp eax, 4
-        jbe .chkdn
-    .bad:
-        push rax
-        mov rax, [rsi + 8]
-        call puthex
-        mov rax, [rsi + 24]
-        shl rax, 12
-        call puthex
-        pop rax
-        call puthex
-        jmp fail_range
-    .chkdn:
-        add rsi, [descsz]
-        dec r11
-        jmp .chkd
-    .chknext:
-        add r14, 16
-        dec r15d
-        jnz .chkseg
         mov rdi, [mbi_cur]
         mov rax, [mmcount]
         imul rax, 24
@@ -500,28 +511,6 @@ export func build(elf, info, cmdline):
         add rsp, 56
         ret
     
-    puthex:                             ; rax -> 16 hex digits + CRLF
-        sub rsp, 56
-        lea rdx, [hexbuf]
-        mov ecx, 16
-    .d:
-        rol rax, 4
-        mov r8d, eax
-        and r8d, 15
-        lea r9, [hexdigits]
-        movzx r8d, byte [r9 + r8]
-        mov [rdx], r8w
-        add rdx, 2
-        dec ecx
-        jnz .d
-        lea rdx, [hexbuf]
-        call puts
-        add rsp, 56
-        ret
-    hexdigits: db "0123456789abcdef"
-    hexbuf: times 16 dw 0
-        dw 13, 10, 0
-    
     puts:                               ; rdx = UTF-16 string
         sub rsp, 56
         mov rax, [systab]
@@ -540,6 +529,7 @@ export func build(elf, info, cmdline):
     fb_addr: dq 0
     taddr: dq 0
     kbuf: dq 0
+    kbase: dq 0
     loaded: dq 0
     sfs: dq 0
     root: dq 0
@@ -573,7 +563,7 @@ export func build(elf, info, cmdline):
         db 0xbc, 0x22, 0x00, 0x80, 0xc7, 0x3c, 0x88, 0x81
     kname: """ .. u16s("\\SPRINTOS.BIN") .. """
     msg_banner: """ .. u16s("Sprint OS UEFI loader (Sprint)\r\n") .. """
-    msg_range: """ .. u16s("Sprint loader: the kernel's address range is not free memory\r\n") .. """
+    msg_range: """ .. u16s("Sprint loader: no usable block for the kernel\r\n") .. """
     msg_kbuf: """ .. u16s("Sprint loader: cannot allocate the file buffer\r\n") .. """
     msg_low: """ .. u16s("Sprint loader: cannot allocate low memory\r\n") .. """
     msg_file: """ .. u16s("Sprint loader: cannot read SPRINTOS.BIN\r\n") .. """

@@ -5,10 +5,10 @@
 #   partition 1   GPT "BIOS boot" partition: BIOS stage 2 and the kernel segments            <- BIOS: stage 1 reads it
 #   partition 2   EFI System Partition (FAT32): \EFI\BOOT\BOOTX64.EFI and \SPRINTOS.BIN      <- UEFI: boots this (diskimg.sp, uefi_loader.sp)
 #
-# Both loaders enter the same kernel through its Multiboot2 entry. The kernel is the 16 MiB-linked build (the firmware of UEFI machines keeps
-# memory near 8 MiB; a BIOS machine does not care where the kernel sits), so one kernel file serves both paths.
+# Both loaders enter the same kernel through its Multiboot2 entry: the BIOS loader copies it to its link address (1 MiB), the UEFI loader
+# relocates it into a free block the firmware chose (the table comes from the 64-bit kernel.elf, linked with -Wl,-q).
 #
-# usage: sprint run --allow-read=DIR --allow-write=DIR os/boot/hybridboot.sp KERNEL32.ELF OUT.IMG "kernel command line"
+# usage: sprint run --allow-read=DIR --allow-write=DIR os/boot/hybridboot.sp KERNEL32.ELF OUT.IMG "kernel command line" KERNEL64.ELF
 import bios_loader
 import diskimg
 import elf32
@@ -24,7 +24,8 @@ let info = elf32.parse(elf, kernel_path)
 
 const BIOS_START = 2048          # the BIOS boot partition begins at 1 MiB
 let b = bios_loader.build(elf, info, cmdline, BIOS_START)
-let u = uefi_loader.build(elf, info, cmdline)
+let elf64 = fs.read_bytes(sys.args[3])      # the 64-bit kernel.elf (relocations)
+let u = uefi_loader.build(elf, info, cmdline, elf64)
 # the ESP follows, 1 MiB aligned
 let esp_start = (BIOS_START + b.sectors + 2047) // 2048 * 2048
 let d = diskimg.Disk(81920, esp_start)

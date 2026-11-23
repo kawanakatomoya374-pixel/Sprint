@@ -10,7 +10,7 @@
 # Multiboot2 entry (eax = 0x36d76289, ebx = the information structure) - the convention the GRUB and BIOS paths use, so the kernel
 # is unchanged. The code is in uefi_loader.sp (shared with the hybrid image, hybridboot.sp).
 #
-# usage: sprint run --allow-read=DIR --allow-write=DIR os/boot/uefiboot.sp KERNEL32.ELF OUT.IMG "kernel command line"
+# usage: sprint run --allow-read=DIR --allow-write=DIR os/boot/uefiboot.sp KERNEL32.ELF OUT.IMG "kernel command line" KERNEL64.ELF
 import diskimg
 import elf32
 import fs
@@ -22,7 +22,8 @@ let out_path = sys.args[1]
 let cmdline = sys.args[2] if len(sys.args) > 2 else "init=boot"
 let elf = fs.read_bytes(kernel_path)
 let info = elf32.parse(elf, kernel_path)
-let u = uefi_loader.build(elf, info, cmdline)
+let elf64 = fs.read_bytes(sys.args[3])      # the 64-bit kernel.elf (relocations)
+let u = uefi_loader.build(elf, info, cmdline, elf64)
 let d = diskimg.Disk(81920)
 let efi_dir = d.mkdir(d.root, "EFI")
 let boot_dir = d.mkdir(efi_dir, "BOOT")

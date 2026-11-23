@@ -1,7 +1,8 @@
 ENTRY(_start)
 SECTIONS
 {
-    . = 1M;   /* BIOS / GRUB; the UEFI build uses a copy of this script linked at 16 MiB (firmware owns memory near 8 MiB) */
+    . = 1M;   /* the link address; a UEFI loader relocates the kernel (kernel.elf keeps its relocations) */
+    __image_start = .;
     .multiboot2 : { KEEP(*(.multiboot2)) }
     .text : ALIGN(4096) { *(.text .text.*) }
     .rodata : ALIGN(4096) { *(.rodata .rodata.*) }

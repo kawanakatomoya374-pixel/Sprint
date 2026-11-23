@@ -329,11 +329,30 @@ long ksyscall(long n, long a1, long a2, long a3, long a4, long a5, long a6) {
 typedef struct __attribute__((packed)) MbTag { uint32_t type, size; } MbTag;
 
 uint64_t g_rsdp;
+/* usable memory minus the ranges that must stay untouched (the kernel image, the boot information): everything else above 1 MiB is free,
+ * wherever the loader put the kernel */
+typedef struct Excl { uint64_t lo, hi; } Excl;
+static void add_free(uint64_t lo, uint64_t hi, const Excl *ex, int n) {
+    for (int i = 0; i < n; i++) {
+        if (hi <= ex[i].lo || lo >= ex[i].hi) continue;
+        if (lo < ex[i].lo) add_free(lo, ex[i].lo, ex + i + 1, n - i - 1);
+        if (hi > ex[i].hi) add_free(ex[i].hi, hi, ex + i + 1, n - i - 1);
+        return;
+    }
+    if (hi > lo) {
+        range_free(lo, hi - lo);
+        g_mem_total += hi - lo;
+    }
+}
+
+extern char __image_start[];
 static void parse_boot_info(uint64_t mbi) {
-    uint64_t heap_lo = ((uint64_t)(uintptr_t)_end + PAGE - 1) & ~(uint64_t)(PAGE - 1);
     uint32_t total = *(uint32_t *)(uintptr_t)mbi;
-    uint64_t mbi_end = mbi + total;
-    if (mbi >= heap_lo && mbi < heap_lo + (64u << 20)) heap_lo = (mbi_end + PAGE - 1) & ~(uint64_t)(PAGE - 1);
+    Excl ex[2];
+    ex[0].lo = (uint64_t)(uintptr_t)__image_start & ~(uint64_t)(PAGE - 1);
+    ex[0].hi = ((uint64_t)(uintptr_t)_end + PAGE - 1) & ~(uint64_t)(PAGE - 1);
+    ex[1].lo = mbi & ~(uint64_t)(PAGE - 1);
+    ex[1].hi = (mbi + total + PAGE - 1) & ~(uint64_t)(PAGE - 1);
     const MbTag *t = (const MbTag *)(uintptr_t)(mbi + 8);
     while (t->type != 0) {
         const uint8_t *p = (const uint8_t *)t;
@@ -353,15 +372,11 @@ static void parse_boot_info(uint64_t mbi) {
                 uint64_t base = *(const uint64_t *)e, len = *(const uint64_t *)(e + 8);
                 uint32_t ty = *(const uint32_t *)(e + 16);
                 if (ty != 1) continue;
-                uint64_t lo = base < heap_lo ? heap_lo : base, hi = base + len;
+                uint64_t lo = base < (1ull << 20) ? (1ull << 20) : base, hi = base + len;   /* nothing below 1 MiB: BIOS data, the AP trampoline */
                 if (hi > (4ull << 30)) hi = 4ull << 30; /* only the first 4 GiB is mapped */
-                if (hi <= lo) continue;
                 lo = (lo + PAGE - 1) & ~(uint64_t)(PAGE - 1);
                 hi &= ~(uint64_t)(PAGE - 1);
-                if (hi > lo) {
-                    range_free(lo, hi - lo);
-                    g_mem_total += hi - lo;
-                }
+                add_free(lo, hi, ex, 2);
             }
         }
         t = (const MbTag *)((const uint8_t *)t + ((t->size + 7u) & ~7u));

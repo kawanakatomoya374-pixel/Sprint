@@ -20,9 +20,9 @@
 
 ローダーは次を行う: GOP で 1024x768 のモードを選び、構成テーブルから ACPI RSDP を探し、`SPRINTOS.BIN`（カーネルの `PT_LOAD` セグメントを連結したもの。アドレスと大きさの表はローダーが持つ）を起動元のボリュームから読み、Multiboot2 の情報構造（コマンドライン・フレームバッファ・RSDP・メモリマップ）を 1 MiB 未満に作り、`ExitBootServices` を呼ぶ。その後、低メモリに置いた小さなトランポリンが、32 ビット保護モードへ降りてページングとロングモードを切り、カーネルのセグメントを所定のアドレスへコピーして（bss をゼロ埋めし、UEFI のページテーブルを壊す心配がない）、`eax = 0x36d76289`、`ebx` = 情報構造でカーネルの Multiboot2 入口へ飛ぶ。カーネルは BIOS / GRUB と同じものを使う。
 
-カーネルを 1 MiB に置くと、ファームウェアの領域（OVMF は ACPI NVS を 8 MiB に置く）と衝突するので、**UEFI 用のカーネルは 16 MiB にリンク**する（`os/link.ld` の `1M` を置き換えた `link-uefi.ld`）。ローダーは `ExitBootServices` の前に、カーネルの各アドレス範囲がメモリマップ上「起動後に解放できる種別」であること、ファイルバッファと重ならないことを検査し、違えば衝突した領域を表示して戻る。
+**カーネルは再配置可能**: ファームウェアは自分の領域（OVMF は ACPI NVS を 8 MiB に置く）を持つので、カーネルを 1 MiB 固定には置けない。カーネルは `-Wl,-q`（`--emit-relocs`）でリンクされ、64 ビットの `kernel.elf` が再配置情報を保つ（`kernel32.elf` は `objcopy` で再配置セクションを除いた変換）。イメージ生成時に Sprint（`elf32.relocs`）が、イメージ内のアドレスを持つスロット（`R_X86_64_64` は 8 バイト、`R_X86_64_32/32S` は 4 バイト。PC 相対・TLS・絶対シンボルは対象外。約 9000 件）を表にして `SPRINTOS.BIN` の末尾に付ける。ローダーは `AllocatePages(AllocateMaxAddress, 4 GiB 未満)` でファームウェアが確保した空きブロックへセグメントを置き、トランポリン（ページングを切った 32 ビット）が表の全スロットに「新しい基点 − リンク基点」を足してから、新しい入口へ飛ぶ。カーネルの空きメモリ計算は、配置場所に依存しないよう、カーネルのイメージ（`__image_start`〜`_end`）と Multiboot2 情報だけを除外し、1 MiB 以上の残りを全部使う（以前は `_end` より上だけだった）。QEMU/OVMF（256 MiB）では約 192 MiB 付近に置かれて動く。
 
-制約: カーネルは位置固定（16 MiB）なので、その範囲をファームウェアが予約している機種では起動できない（再配置可能なカーネルが要る）。Secure Boot 未対応。実機では未検証。
+制約: 位置はファームウェア任せだが、4 GiB 未満の連続した空きブロック（約 24 MiB）が要る。Secure Boot 未対応。実機では未検証。
 
 ## ハイブリッドイメージ（os/boot/hybridboot.sp、`make os-hybrid`）
 
@@ -35,7 +35,7 @@
 | パーティション1 | GPT の「BIOS boot」領域（LBA 2048〜）: BIOS ステージ2とカーネルのセグメント | ステージ1が読む |
 | パーティション2 | ESP（FAT32）: `\EFI\BOOT\BOOTX64.EFI` と `\SPRINTOS.BIN` | UEFI ファームウェアが起動する |
 
-どちらのローダーも同じカーネルの Multiboot2 入口に入る。カーネルは UEFI 用の 16 MiB リンク版を両方で共用する（BIOS 側はアドレスを気にしない）ので、カーネルのビルドは1つで済む。`os/boot/bios_loader.sp` / `uefi_loader.sp` / `elf32.sp` / `diskimg.sp` は、単独の BIOS イメージ（`sprintboot.sp`）・単独の UEFI イメージ（`uefiboot.sp`）・ハイブリッド（`hybridboot.sp`）が共有するモジュールで、単独イメージの出力はモジュール化の前後でバイト単位で変わらない。`make os-hybrid-test` は同じイメージを SeaBIOS で、続いて OVMF で起動して同じ検査を行う（`os-hybrid-run` / `os-hybrid-uefi-run` で手動起動）。
+どちらのローダーも同じカーネルの Multiboot2 入口に入る。カーネルは両方で同じもの（BIOS 側は 1 MiB に置き、UEFI 側は再配置して置く）で、カーネルのビルドは1つで済む。`os/boot/bios_loader.sp` / `uefi_loader.sp` / `elf32.sp` / `diskimg.sp` は、単独の BIOS イメージ（`sprintboot.sp`）・単独の UEFI イメージ（`uefiboot.sp`）・ハイブリッド（`hybridboot.sp`）が共有するモジュールで、単独イメージの出力はモジュール化の前後でバイト単位で変わらない。`make os-hybrid-test` は同じイメージを SeaBIOS で、続いて OVMF で起動して同じ検査を行う（`os-hybrid-run` / `os-hybrid-uefi-run` で手動起動）。
 
 ## JIT
 

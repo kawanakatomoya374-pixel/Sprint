@@ -67,15 +67,8 @@ $(OSB)/initrd.o: os/kernel/initrd.S $(OSB)/userland.elf
 	$(OSCC) -static -fno-pie -I$(OSB) -c -o $@ $<
 
 $(OSB)/kernel.elf: $(OSKOBJ) os/link.ld
-	$(OSCC) -static -nostartfiles -fno-pie -no-pie -Wl,-T,os/link.ld -Wl,-z,max-page-size=4096 -o $@ $(OSKOBJ) -lgcc
-	objcopy -O elf32-i386 $@ $(OSB)/kernel32.elf
-
-# the same objects linked at 16 MiB for UEFI: firmware keeps (ACPI NVS, runtime) memory inside the first 24 MiB
-$(OSB)/link-uefi.ld: os/link.ld
-	sed 's/\. = 1M;/. = 0x1000000;/' $< > $@
-$(OSB)/kernel-uefi.elf: $(OSKOBJ) $(OSB)/link-uefi.ld
-	$(OSCC) -static -nostartfiles -fno-pie -no-pie -Wl,-T,$(OSB)/link-uefi.ld -Wl,-z,max-page-size=4096 -o $@ $(OSKOBJ) -lgcc
-	objcopy -O elf32-i386 $@ $(OSB)/kernel-uefi32.elf
+	$(OSCC) -static -nostartfiles -fno-pie -no-pie -Wl,-T,os/link.ld -Wl,-z,max-page-size=4096 -Wl,-q -o $@ $(OSKOBJ) -lgcc
+	objcopy -R '.rela*' -O elf32-i386 $@ $(OSB)/kernel32.elf   # kernel.elf keeps its relocations (-q): the UEFI loader relocates the kernel
 
 $(OSB)/sprintos.iso: $(OSB)/kernel.elf os/boot/grub.cfg
 	rm -rf $(OSB)/iso && mkdir -p $(OSB)/iso/boot/grub
@@ -97,18 +90,19 @@ $(OSB)/sprintos-test.img: $(OSB)/kernel.elf os/boot/sprintboot.sp stdlib/asm.sp 
 	$(BUILD)/sprint run --allow-read=$(OSB) --allow-write=$(OSB) os/boot/sprintboot.sp $(OSB)/kernel32.elf $@ "init=init"
 
 # ---- UEFI: a GPT disk image with an EFI System Partition, loader and image generator written in Sprint (os/boot/uefiboot.sp) ----
-UEFI_SP  := os/boot/uefiboot.sp os/boot/uefi_pe.sp os/boot/diskimg.sp stdlib/asm.sp
-$(OSB)/sprintos-uefi.img: $(OSB)/kernel-uefi.elf $(UEFI_SP) $(BUILD)/sprint
-	$(BUILD)/sprint run --allow-read=$(OSB) --allow-write=$(OSB) os/boot/uefiboot.sp $(OSB)/kernel-uefi32.elf $@ "init=boot"
-$(OSB)/sprintos-uefi-test.img: $(OSB)/kernel-uefi.elf $(UEFI_SP) $(BUILD)/sprint
-	$(BUILD)/sprint run --allow-read=$(OSB) --allow-write=$(OSB) os/boot/uefiboot.sp $(OSB)/kernel-uefi32.elf $@ "init=init"
+# the kernel is relocatable (kernel.elf keeps its relocations): the loader picks a free block, the table comes from the 64-bit kernel.elf
+UEFI_SP  := os/boot/uefiboot.sp os/boot/uefi_loader.sp os/boot/elf32.sp os/boot/uefi_pe.sp os/boot/diskimg.sp stdlib/asm.sp
+$(OSB)/sprintos-uefi.img: $(OSB)/kernel.elf $(UEFI_SP) $(BUILD)/sprint
+	$(BUILD)/sprint run --allow-read=$(OSB) --allow-write=$(OSB) os/boot/uefiboot.sp $(OSB)/kernel32.elf $@ "init=boot" $(OSB)/kernel.elf
+$(OSB)/sprintos-uefi-test.img: $(OSB)/kernel.elf $(UEFI_SP) $(BUILD)/sprint
+	$(BUILD)/sprint run --allow-read=$(OSB) --allow-write=$(OSB) os/boot/uefiboot.sp $(OSB)/kernel32.elf $@ "init=init" $(OSB)/kernel.elf
 
 # ---- hybrid: one disk image that boots under BIOS and under UEFI (os/boot/hybridboot.sp) ----
 HYBRID_SP := os/boot/hybridboot.sp os/boot/bios_loader.sp os/boot/uefi_loader.sp os/boot/elf32.sp os/boot/uefi_pe.sp os/boot/diskimg.sp stdlib/asm.sp
-$(OSB)/sprintos-hybrid.img: $(OSB)/kernel-uefi.elf $(HYBRID_SP) $(BUILD)/sprint
-	$(BUILD)/sprint run --allow-read=$(OSB) --allow-write=$(OSB) os/boot/hybridboot.sp $(OSB)/kernel-uefi32.elf $@ "init=boot"
-$(OSB)/sprintos-hybrid-test.img: $(OSB)/kernel-uefi.elf $(HYBRID_SP) $(BUILD)/sprint
-	$(BUILD)/sprint run --allow-read=$(OSB) --allow-write=$(OSB) os/boot/hybridboot.sp $(OSB)/kernel-uefi32.elf $@ "init=init"
+$(OSB)/sprintos-hybrid.img: $(OSB)/kernel.elf $(HYBRID_SP) $(BUILD)/sprint
+	$(BUILD)/sprint run --allow-read=$(OSB) --allow-write=$(OSB) os/boot/hybridboot.sp $(OSB)/kernel32.elf $@ "init=boot" $(OSB)/kernel.elf
+$(OSB)/sprintos-hybrid-test.img: $(OSB)/kernel.elf $(HYBRID_SP) $(BUILD)/sprint
+	$(BUILD)/sprint run --allow-read=$(OSB) --allow-write=$(OSB) os/boot/hybridboot.sp $(OSB)/kernel32.elf $@ "init=init" $(OSB)/kernel.elf
 
 .PHONY: os os-check os-kernel os-user os-iso os-run os-test os-img os-img-run os-img-test os-uefi os-uefi-run os-uefi-test os-hybrid os-hybrid-run os-hybrid-uefi-run os-hybrid-test
 # `make os`: check the tools, then build the bootable ISO
