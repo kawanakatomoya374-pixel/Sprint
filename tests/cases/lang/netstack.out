@@ -1,0 +1,15 @@
+dhcp true 10.0.2.15 255.255.255.0 10.0.2.2 10.0.2.2 3600
+ping ok true
+ping nobody -1
+dns 93.184.216.34
+dns literal 1.2.3.4
+udp echo [1, 2, 3, 4, 5] 10.0.2.2 7
+udp none nil
+tcp 10 bytes back 10 match true
+tcp after close 0 TIME_WAIT
+tcp 20000 bytes back 20000 match true
+tcp after close 0 TIME_WAIT
+tcp 20000 bytes back 20000 match true
+tcp after close 0 TIME_WAIT
+frames dropped true
+refused nil
