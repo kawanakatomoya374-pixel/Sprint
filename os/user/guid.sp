@@ -1,7 +1,10 @@
-# Sprint OS: the desktop, a ring-3 process. It owns the framebuffer (mapped by the kernel), reads keyboard and
-# mouse events through the input system call, and draws the window system (wm) and its applications. The
-# shell and file system (proc, vfs) are plain Sprint libraries running inside this process.
+# Sprint OS: guid, the GUI server, a ring-3 process. It owns the framebuffer (mapped by the kernel), reads keyboard and
+# mouse events through the input system call, draws the window system (wm) with its built-in applications, and serves
+# other processes over messages (name "gui", see guiclient.sp): a client draws into a buffer it shares with guid, guid frames
+# the window and sends the pointer and keyboard events back. The kernel knows nothing about windows.
 import gdev
+import ipc
+import fsclient
 import io
 import gui
 import gfx
@@ -14,7 +17,7 @@ import urtc as rtc
 import uinput
 
 func log(s):
-    print("[desktop] " .. s)
+    print("[guid] " .. s)
     io.flush()
 
 let info = gdev.fb_map()
@@ -69,6 +72,45 @@ shell.install("date", hw_date)
 shell.install("poweroff", hw_poweroff)
 shell.install("reboot", hw_reboot)
 shell.install("motd", hw_motd)
+
+# the disk: the file system server (fsd) is another process; these commands talk to it over messages
+let disk = nil
+func disk_conn():
+    if disk == nil:
+        disk = fsclient.connect(1500)
+    return disk
+
+func disk_path(args, i, default):
+    return args[i] if len(args) > i else default
+
+func hw_dls(sys, args):
+    try:
+        for e in disk_conn().listdir(disk_path(args, 0, "/")):
+            sys.print(("d " if e.kind == "dir" else "- ") .. to_string(e.size) .. "\t" .. e.name)
+    catch e:
+        sys.print("dls: " .. e.message)
+
+func hw_dcat(sys, args):
+    try:
+        for l in disk_conn().read_file(disk_path(args, 0, "/")).split("\n"):
+            sys.print(l)
+    catch e:
+        sys.print("dcat: " .. e.message)
+
+func hw_dput(sys, args):
+    if len(args) < 2:
+        sys.print("usage: dput PATH TEXT...")
+        return nil
+    try:
+        disk_conn().write_file(args[0], args.slice(1, len(args)).join(" ") .. "\n")
+        disk_conn().sync()
+        sys.print("wrote " .. args[0])
+    catch e:
+        sys.print("dput: " .. e.message)
+
+shell.install("dls", hw_dls)
+shell.install("dcat", hw_dcat)
+shell.install("dput", hw_dput)
 
 let desk = wm.Desktop(W, H)
 desk.show_cursor = false          # the pointer is drawn by hw, straight onto the framebuffer
@@ -212,6 +254,97 @@ desk.add_icon("System", 20, 190, open_monitor)
 desk.add_icon("Paint", 20, 248, open_paint)
 desk.add_icon("Calendar", 20, 306, open_calendar)
 desk.add_icon("About", 20, 364, open_about)
+
+# ---- windows of other processes (the GUI protocol) ---------------------------------------------------------
+# A client process draws into a shared buffer; this widget shows a copy of it and turns its own events into messages for the client.
+class RemoteView extends gui.Widget:
+    let win = nil
+    override func init(self, win):
+        super(0, 0, win.w, win.h)
+        self.win = win
+        self.focusable = true
+    override func draw_self(self, c, ax, ay):
+        c.blit(self.win.canvas, ax, ay)
+    func ptr(self, kind, px, py, button):
+        send_event(self.win, "ptr\t" .. kind .. "\t" .. to_string(px - self.abs_x()) .. "\t" .. to_string(py - self.abs_y()) .. "\t" .. to_string(button))
+    override func on_mouse_down(self, px, py, button):
+        self.pressed = true
+        self.ptr("down", px, py, button)
+    override func on_drag(self, px, py):
+        if self.pressed:
+            self.ptr("move", px, py, 1)
+    override func on_mouse_up(self, px, py, button, inside):
+        if self.pressed:
+            self.pressed = false
+            self.ptr("up", px, py, button)
+    override func on_key(self, k):
+        send_event(self.win, "key\t" .. k)
+    override func on_text(self, s):
+        send_event(self.win, "text\t" .. s)
+
+let remote = {}        # window id -> {id, pid, w, h, canvas, seg, view, frame}
+let next_win = 1
+
+func send_event(win, text):
+    ipc.send(win.pid, "ev\t" .. to_string(win.id) .. "\t" .. text)
+
+func remote_open(src, q):
+    let w = to_int(q[2])
+    let h = to_int(q[3])
+    if w < 8 or h < 8 or w > 2000 or h > 2000:
+        return "err\tEINVAL\tbad window size"
+    let seg = ipc.shm_open(to_int(q[4]))
+    if seg[1] < w * h * 4:
+        return "err\tEINVAL\tbuffer too small"
+    let win = {id: next_win, pid: src, w: w, h: h, canvas: gfx.canvas(w, h, 0x000000), seg: seg, view: nil, frame: nil}
+    next_win += 1
+    ipc.shm_to_canvas(seg[0], win.canvas)
+    win.view = RemoteView(win)
+    let p = place()
+    win.frame = desk.open_window(q[1], p[0], p[1], w + 12, h + 34, win.view)
+    func closed(f):
+        send_event(win, "close")
+        ipc.shm_close(seg[0])
+        remote[to_string(win.id)] = nil
+        log("window " .. to_string(win.id) .. " closed")
+        return true
+    win.frame.on_close = closed
+    remote[to_string(win.id)] = win
+    log("window " .. to_string(win.id) .. " of pid " .. to_string(src) .. " opened (" .. to_string(w) .. "x" .. to_string(h) .. ")")
+    return "ok\t" .. to_string(win.id)
+
+# one message from a client; the answer for requests that have one
+func serve(src, text):
+    let q = text.split("\t")
+    if q[0] == "open":
+        ipc.send(src, remote_open(src, q))
+        return nil
+    let win = remote[q[1]] if len(q) > 1 and q[1] in remote else nil
+    if win == nil or win.pid != src:
+        return nil
+    if q[0] == "present":
+        ipc.shm_to_canvas(win.seg[0], win.canvas)
+        win.view.dirty()
+    elif q[0] == "title":
+        win.frame.title = q[2]
+        desk.redraw()
+    elif q[0] == "close":
+        ipc.shm_close(win.seg[0])
+        remote[q[1]] = nil
+        desk.close_frame(win.frame)
+
+func pump_clients():
+    while true:
+        let m = ipc.recv_from(false)
+        if m == nil:
+            return nil
+        serve(m[0], m[1])
+
+func open_demo(ic = nil):
+    log("open Demo")
+    psys.spawn("gdemo")
+desk.add_icon("Demo", 20, 422, open_demo)
+ipc.register("gui")
 desk.set_clock(rtc.clock_text())
 func update_clock(a):
     desk.set_clock(rtc.clock_text())
@@ -241,6 +374,7 @@ log("ready after " .. to_string(psys.ms()) .. " ms")
 let last = psys.ms()
 let frames = 0
 while desk.running:
+    pump_clients()
     let evs = input.poll()
     let moved = false
     for ev in evs:

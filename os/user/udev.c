@@ -313,12 +313,35 @@ static SpStatus i_send(SpVM *vm, int argc, const SpValue *argv, SpValue *ret) {
 static SpStatus i_recv(SpVM *vm, int argc, const SpValue *argv, SpValue *ret) {
     static char buf[4096];
     int nb = argc > 0 && argv[0].type == SP_T_BOOL && !argv[0].as.b;
-    long n = sc3(1014, (long)(uintptr_t)buf, (long)sizeof buf, nb);
+    long n = sc4(1014, (long)(uintptr_t)buf, (long)sizeof buf, nb, 0);
     if (n < 0) {
         *ret = sp_nil();
         return SP_OK;
     }
     return sp_new_string(vm, buf, (size_t)n, ret);
+}
+/* shm_to_canvas(va, canvas) / canvas_to_shm(canvas, va): copy a window's pixels (0xRRGGBB words, row after row) between a shared segment and a canvas */
+static SpStatus i_shm_to_canvas(SpVM *vm, int argc, const SpValue *argv, SpValue *ret) {
+    (void)argc;
+    int w, h;
+    const uint32_t *px = gfx_canvas_pixels(argv[1], &w, &h);
+    if (!px) return sp_throw(vm, "TypeError", "ipc.shm_to_canvas: expected a canvas");
+    const uint8_t *src = shm_span(vm, argv[0], sp_int(0), (int64_t)w * h * 4, "shm_to_canvas");
+    if (!src) return SP_E_RUNTIME;
+    memcpy((uint32_t *)(uintptr_t)px, src, (size_t)w * (size_t)h * 4);
+    *ret = sp_nil();
+    return SP_OK;
+}
+static SpStatus i_canvas_to_shm(SpVM *vm, int argc, const SpValue *argv, SpValue *ret) {
+    (void)argc;
+    int w, h;
+    const uint32_t *px = gfx_canvas_pixels(argv[0], &w, &h);
+    if (!px) return sp_throw(vm, "TypeError", "ipc.canvas_to_shm: expected a canvas");
+    uint8_t *dst = shm_span(vm, argv[1], sp_int(0), (int64_t)w * h * 4, "canvas_to_shm");
+    if (!dst) return SP_E_RUNTIME;
+    memcpy(dst, px, (size_t)w * (size_t)h * 4);
+    *ret = sp_nil();
+    return SP_OK;
 }
 /* recv_from(block = true): [sender pid, message], or nil when none is waiting and block is false. The sender is the kernel's word, not the message's. */
 static SpStatus i_recv_from(SpVM *vm, int argc, const SpValue *argv, SpValue *ret) {
@@ -360,6 +383,7 @@ static SpStatus i_lookup(SpVM *vm, int argc, const SpValue *argv, SpValue *ret) 
     return SP_OK;
 }
 static const SpNativeDesc ipc_fns[] = {
+    {"shm_to_canvas", 2, 2, 0, 0, i_shm_to_canvas}, {"canvas_to_shm", 2, 2, 0, 0, i_canvas_to_shm},
     {"recv_from", 0, 1, 0, SP_NATIVE_ALLOCATES, i_recv_from}, {"register", 1, 1, 0, 0, i_register}, {"lookup", 1, 1, 0, 0, i_lookup},
     {"shm_create", 1, 1, 0, SP_NATIVE_ALLOCATES, i_shm_create}, {"shm_open", 1, 1, 0, SP_NATIVE_ALLOCATES, i_shm_open},
     {"shm_close", 1, 1, 0, 0, i_shm_close}, {"shm_read", 3, 3, 0, SP_NATIVE_ALLOCATES, i_shm_read},

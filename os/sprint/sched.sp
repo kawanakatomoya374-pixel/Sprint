@@ -21,7 +21,7 @@ func log(s):
     ksys.log(s)
 
 # what a program may do beyond computing: the framebuffer and input (gui), and the I/O ports of a driver
-const GUI = ["desktop", "guid"]
+const GUI = ["guid"]
 const PORTS = {fsd: [0x1F0, 8, 0x3F6, 1, 0x170, 8, 0x376, 1]}
 let names = {}        # service name -> pid
 let io_open = {}      # cpu -> the port ranges currently open in its I/O permission bitmap

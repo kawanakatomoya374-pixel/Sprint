@@ -59,7 +59,14 @@ def desktop():
     for f in (ser, mon):
         if os.path.exists(f):
             os.remove(f)
-    q = subprocess.Popen(["qemu-system-x86_64", "-m", "512", "-smp", "2"] + disk(DESK) + ["-display", "none", "-no-reboot",
+    # a second disk with a SprintFS volume (made on the host): the desktop's terminal reaches it through the file system server
+    fsimg = os.path.join(OUT, "data.img")
+    spx = os.environ.get("SPRINT", "build/sprint")
+    hello = os.path.join(OUT, "hello.txt")
+    open(hello, "w").write("hello from the data disk\n")
+    for a in (["mkfs", "8"], ["put", hello, "/hello.txt"]):
+        subprocess.run([spx, "run", "--allow-read=" + OUT, "--allow-write=" + OUT, "tools/sprintfs.sp", fsimg] + a, capture_output=True)
+    q = subprocess.Popen(["qemu-system-x86_64", "-m", "512", "-smp", "2"] + disk(DESK) + ["-drive", "format=raw,file=" + fsimg + ",if=ide,index=1"] + ["-display", "none", "-no-reboot",
                           "-serial", "file:" + ser, "-monitor", "unix:" + mon + ",server,nowait"],
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
@@ -76,10 +83,10 @@ def desktop():
         def log():
             return open(ser, errors="replace").read()
         for _ in range(400):
-            if "[desktop] ready" in log():
+            if "[guid] ready" in log():
                 break
             time.sleep(0.2)
-        check("[desktop] ready" in log(), "ring-3 desktop boots")
+        check("[guid] ready" in log(), "ring-3 desktop boots")
         c("screendump " + os.path.join(OUT, "d0.ppm"), 1)
         data = open(os.path.join(OUT, "d0.ppm"), "rb").read()
         check(len(set(data[20::997])) > 20, "desktop frame is not blank")
@@ -90,14 +97,49 @@ def desktop():
             c("mouse_button 1", 0.08)
             c("mouse_button 0", 0.08)
         time.sleep(1.5)
-        check("[desktop] open Terminal" in log(), "mouse double-click opens an app")
+        check("[guid] open Terminal" in log(), "mouse double-click opens an app")
         c("mouse_move 255 170", 0.3)
         c("mouse_button 1", 0.1)
         c("mouse_button 0", 0.3)
         for k in ("u", "n", "a", "m", "e", "ret"):
             c("sendkey " + k)
         time.sleep(1.5)
-        check("[desktop] $ uname => SprintOS" in log(), "keyboard input reaches the focused window")
+        check("[guid] $ uname => SprintOS" in log(), "keyboard input reaches the focused window")
+        keys = {" ": "spc", "/": "slash", ".": "dot"}
+        for ch in "dcat /hello.txt":
+            c("sendkey " + keys.get(ch, ch), 0.12)
+        c("sendkey ret", 0.3)
+        time.sleep(3)
+        check("[guid] $ dcat /hello.txt => hello from the data disk" in log(), "the terminal reads a file from the disk through the file system server (IPC)")
+        # a window of another process: the Demo icon starts the program gdemo, which opens a window through the GUI server (messages + shared memory)
+        c("mouse_move -255 245", 0.3)
+        for _ in range(2):
+            c("mouse_button 1", 0.08)
+            c("mouse_button 0", 0.08)
+        for _ in range(50):
+            if "[gdemo] window open" in log():
+                break
+            time.sleep(0.2)
+        check("[gdemo] window open" in log() and "of pid" in log(), "a client process opens a window through guid (IPC)")
+        c("mouse_move 167 -280", 0.3)
+        c("mouse_button 1", 0.1)
+        c("mouse_button 0", 0.3)
+        for k in ("a", "b"):
+            c("sendkey " + k, 0.3)
+        time.sleep(1.5)
+        check("[gdemo] pointer down at" in log(), "pointer events reach the client process")
+        check("[gdemo] text a" in log() and "[gdemo] text b" in log(), "keyboard events reach the client process")
+        c("screendump " + os.path.join(OUT, "d1.ppm"), 1)
+        ppm = open(os.path.join(OUT, "d1.ppm"), "rb").read()
+        hdr_end = 0
+        nl = 0
+        while nl < 3:
+            if ppm[hdr_end] == 10:
+                nl += 1
+            hdr_end += 1
+        px = ppm[hdr_end:]
+        green = sum(1 for i in range(0, len(px) - 2, 3) if px[i] == 0x20 and px[i + 1] == 0xb0 and px[i + 2] == 0x50)
+        check(green > 5000, "the client's pixels are on the screen (%d window-green pixels)" % green)
     finally:
         q.kill()
 
