@@ -136,8 +136,29 @@ static int r_choice(VM *vm, int argc, SpValue *argv, SpValue *ret) {
     *ret = array_get(a, rng_int(vm, 0, a->len - 1));
     return 0;
 }
+/* bytes(n): n bytes straight from the operating system's generator (not the seeded PRNG above) - for keys. Needs --allow-random; never deterministic. */
+static int r_bytes(VM *vm, int argc, SpValue *argv, SpValue *ret) {
+    (void)argc;
+    if (!(vm->caps & CAP_RANDOM) || vm->deterministic)
+        return vm_set_error(vm, E_PERM, "random.bytes needs --allow-random (and is never available with --deterministic)");
+    if (argv[0].type != T_INT || argv[0].as.i < 0 || argv[0].as.i > (1 << 20)) return vm_set_error(vm, E_VALUE, "random.bytes(n): n must be an int in 0..1048576");
+    size_t n = (size_t)argv[0].as.i;
+    unsigned char *b = malloc(n ? n : 1);
+    if (!b) return vm_set_error(vm, E_MEMORY, "out of memory");
+    FILE *f = fopen("/dev/urandom", "rb");
+    if (!f || (n && fread(b, 1, n, f) != n)) {
+        if (f) (void)fclose(f);
+        free(b);
+        return vm_set_error(vm, E_IO, "cannot read /dev/urandom");
+    }
+    (void)fclose(f);
+    *ret = typed_u8_from(vm, b, n);
+    free(b);
+    return 0;
+}
+
 const NativeDesc lib_random_fns[] = {
-    {"seed", 1, 1, r_seed}, {"int", 2, 2, r_int}, {"float", 0, 0, r_float},
+    {"seed", 1, 1, r_seed}, {"int", 2, 2, r_int}, {"float", 0, 0, r_float}, {"bytes", 1, 1, r_bytes},
     {"shuffle", 1, 1, r_shuffle}, {"choice", 1, 1, r_choice}, {NULL, 0, 0, NULL}};
 
 /* ================================================================ */

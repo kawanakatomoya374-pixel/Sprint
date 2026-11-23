@@ -157,3 +157,63 @@ export func cert_ids(der):
     if f[0].tag == 0xa0:     # [0] version
         i = 1
     return {serial: slice(der, f[i].off, f[i].end), issuer: slice(der, f[i + 2].off, f[i + 2].end)}
+
+# ---- more writing: INTEGER, BIT STRING, strings, times, base64, PEM, RSA keys ------------------------------------------------------
+export func integer_be(b):
+    let lo = 0
+    while lo < len(b) - 1 and b[lo] == 0:
+        lo += 1
+    let body = slice(b, lo, len(b))
+    if body[0] >= 128:
+        body.insert(0, 0)
+    return tlv(0x02, body)
+
+export func bit_string(b):
+    return tlv(0x03, cat([0], b))
+
+export func utf8(s):
+    let b = []
+    for i in range(len(s)):
+        b.append(s[i])
+    return tlv(0x0c, b)
+
+export func bool_true():
+    return [0x01, 0x01, 0xff]
+
+# "YYMMDDHHMMSSZ" (UTCTime, years 1950..2049) or "YYYYMMDDHHMMSSZ" (GeneralizedTime)
+export func time_of(s):
+    let b = []
+    for i in range(len(s)):
+        b.append(s[i])
+    return tlv(0x17 if len(s) == 13 else 0x18, b)
+
+export func base64_encode(b):
+    let out = ""
+    let i = 0
+    while i < len(b):
+        let n = len(b) - i
+        let v = (b[i] << 16) | ((b[i + 1] if n > 1 else 0) << 8) | (b[i + 2] if n > 2 else 0)
+        out = out .. B64.slice((v >> 18) & 63, ((v >> 18) & 63) + 1) .. B64.slice((v >> 12) & 63, ((v >> 12) & 63) + 1)
+        out = out .. (B64.slice((v >> 6) & 63, ((v >> 6) & 63) + 1) if n > 1 else "=") .. (B64.slice(v & 63, (v & 63) + 1) if n > 2 else "=")
+        i += 3
+    return out
+
+export func pem_encode(label, b):
+    let text = base64_encode(b)
+    let out = "-----BEGIN " .. label .. "-----\n"
+    let i = 0
+    while i < len(text):
+        out = out .. text.slice(i, i + 64 if i + 64 < len(text) else len(text)) .. "\n"
+        i += 64
+    return out .. "-----END " .. label .. "-----\n"
+
+# the RSA private key as PKCS#1 (RSAPrivateKey) and as PKCS#8 (PrivateKeyInfo, what `openssl genrsa` writes)
+export func rsa_pkcs1(key):
+    return seq(tlv(0x02, [0]), integer_be(key.n), integer_be(key.e), integer_be(key.d), integer_be(key.p), integer_be(key.q),
+               integer_be(key.dp), integer_be(key.dq), integer_be(key.qinv))
+
+export func rsa_pkcs8(key):
+    return seq(tlv(0x02, [0]), seq(oid("1.2.840.113549.1.1.1"), null_()), octets(rsa_pkcs1(key)))
+
+export func rsa_public_key(key):
+    return seq(integer_be(key.n), integer_be(key.e))
