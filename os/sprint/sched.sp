@@ -23,8 +23,8 @@ func log(s):
 
 # what a program may do beyond computing: the framebuffer and input (gui), and the I/O ports of a driver
 const GUI = ["guid"]
-const PORTS = {fsd: [0x1F0, 8, 0x3F6, 1, 0x170, 8, 0x376, 1], gpud: [0xCF8, 8], inputd: [0x60, 1, 0x64, 1]}
-const DRIVERS = ["gpud"]       # may map device registers and allocate DMA memory
+const PORTS = {fsd: [0x1F0, 8, 0x3F6, 1, 0x170, 8, 0x376, 1], gpud: [0xCF8, 8], inputd: [0x60, 1, 0x64, 1], netd: [0xCF8, 8]}
+const DRIVERS = ["gpud", "netd"]       # may map device registers and allocate DMA memory
 let names = {}        # service name -> pid
 let io_open = {}      # cpu -> the port ranges currently open in its I/O permission bitmap
 let io_pid = {}       # cpu -> pid they belong to
@@ -46,7 +46,7 @@ func io_apply(cpu, p):
     io_pid[cpu] = want
 
 # interrupts for drivers: the ISA irqs / interrupt inputs a program may take over
-const IRQS = {inputd: [1, 12]}
+const IRQS = {inputd: [1, 12], netd: [10, 11, 16, 17, 18, 19, 20, 21, 22, 23]}
 let irq_owner = {}    # global system interrupt -> pid
 
 # queue a message for q (from the kernel: sender 0, or from process `from`); wakes q if it is waiting
