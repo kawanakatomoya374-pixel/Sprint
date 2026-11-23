@@ -634,7 +634,7 @@ static int fs_write_bytes(VM *vm, int argc, SpValue *argv, SpValue *ret) {
     return ok ? 0 : io_fail(vm, e ? e : EIO, "write", AS_STR(argv[0])->dp);
 }
 
-/* read_bytes(path) -> array of ints 0..255 */
+/* read_bytes(path) -> typed.u8 holding the whole file (1 byte per element) */
 static int fs_read_bytes(VM *vm, int argc, SpValue *argv, SpValue *ret) {
     (void)argc;
     char rp[PATH_MAX];
@@ -642,12 +642,8 @@ static int fs_read_bytes(VM *vm, int argc, SpValue *argv, SpValue *ret) {
     size_t len = 0;
     char *b = sp_read_file(rp, &len);
     if (!b) return io_fail(vm, errno ? errno : EIO, "read", AS_STR(argv[0])->dp);
-    SArray *a = vm_new_array(vm, (int64_t)len);
-    if (!a) { free(b); return vm_set_error(vm, E_MEMORY, "out of memory"); }
-    for (size_t i = 0; i < len; i++)
-        if (array_push(vm, a, v_int((unsigned char)b[i]))) { free(b); return 1; }
+    *ret = typed_u8_from(vm, (const unsigned char *)b, len);
     free(b);
-    *ret = v_obj(T_ARRAY, a);
     return 0;
 }
 

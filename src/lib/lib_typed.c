@@ -126,6 +126,13 @@ static SpValue alloc_typed(VM *vm, TKind kind, int64_t n) {
     return v_obj(T_NATIVE, o);
 }
 
+/* a typed.u8 holding a copy of `n` bytes (fs.read_bytes) */
+SpValue typed_u8_from(VM *vm, const unsigned char *b, size_t n) {
+    SpValue v = alloc_typed(vm, TK_U8, (int64_t)n);
+    if (n > 0) memcpy(tarr(v)->b, b, n);
+    return v;
+}
+
 /* typed.<kind>(n) or typed.<kind>(array) */
 static int make(VM *vm, TKind kind, SpValue arg, SpValue *ret) {
     int64_t n;

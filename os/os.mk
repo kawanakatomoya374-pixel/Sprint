@@ -103,7 +103,14 @@ $(OSB)/sprintos-uefi.img: $(OSB)/kernel-uefi.elf $(UEFI_SP) $(BUILD)/sprint
 $(OSB)/sprintos-uefi-test.img: $(OSB)/kernel-uefi.elf $(UEFI_SP) $(BUILD)/sprint
 	$(BUILD)/sprint run --allow-read=$(OSB) --allow-write=$(OSB) os/boot/uefiboot.sp $(OSB)/kernel-uefi32.elf $@ "init=init"
 
-.PHONY: os os-check os-kernel os-user os-iso os-run os-test os-img os-img-run os-img-test os-uefi os-uefi-run os-uefi-test
+# ---- hybrid: one disk image that boots under BIOS and under UEFI (os/boot/hybridboot.sp) ----
+HYBRID_SP := os/boot/hybridboot.sp os/boot/bios_loader.sp os/boot/uefi_loader.sp os/boot/elf32.sp os/boot/uefi_pe.sp os/boot/diskimg.sp stdlib/asm.sp
+$(OSB)/sprintos-hybrid.img: $(OSB)/kernel-uefi.elf $(HYBRID_SP) $(BUILD)/sprint
+	$(BUILD)/sprint run --allow-read=$(OSB) --allow-write=$(OSB) os/boot/hybridboot.sp $(OSB)/kernel-uefi32.elf $@ "init=boot"
+$(OSB)/sprintos-hybrid-test.img: $(OSB)/kernel-uefi.elf $(HYBRID_SP) $(BUILD)/sprint
+	$(BUILD)/sprint run --allow-read=$(OSB) --allow-write=$(OSB) os/boot/hybridboot.sp $(OSB)/kernel-uefi32.elf $@ "init=init"
+
+.PHONY: os os-check os-kernel os-user os-iso os-run os-test os-img os-img-run os-img-test os-uefi os-uefi-run os-uefi-test os-hybrid os-hybrid-run os-hybrid-uefi-run os-hybrid-test
 # `make os`: check the tools, then build the bootable ISO
 os: os-check os-iso
 	@echo "ISO ready: $(OSB)/sprintos.iso   (try: make os-run)"
@@ -124,6 +131,16 @@ os-img-run: $(OSB)/sprintos.img
 # the same checks as os-test, but booted by the Sprint bootloader from a disk image
 os-img-test: $(OSB)/sprintos-test.img $(OSB)/sprintos.img
 	python3 os/tests/qemu_test.py $(OSB)/sprintos-test.img $(OSB)/sprintos.img
+
+os-hybrid: $(OSB)/sprintos-hybrid.img
+os-hybrid-run: $(OSB)/sprintos-hybrid.img
+	qemu-system-x86_64 -m 256 -drive format=raw,file=$< -serial stdio
+os-hybrid-uefi-run: $(OSB)/sprintos-hybrid.img
+	qemu-system-x86_64 -m 256 -bios $(OVMF) -drive format=raw,file=$< -serial stdio
+# the same image, the same checks: once booted by the BIOS (SeaBIOS), once by UEFI (OVMF)
+os-hybrid-test: $(OSB)/sprintos-hybrid-test.img $(OSB)/sprintos-hybrid.img
+	@echo "== BIOS"; python3 os/tests/qemu_test.py $(OSB)/sprintos-hybrid-test.img $(OSB)/sprintos-hybrid.img
+	@echo "== UEFI"; SPRINT_FIRMWARE=uefi SPRINT_OVMF=$(OVMF) python3 os/tests/qemu_test.py $(OSB)/sprintos-hybrid-test.img $(OSB)/sprintos-hybrid.img
 
 os-uefi: $(OSB)/sprintos-uefi.img
 # OVMF (apt install ovmf) is the UEFI firmware for QEMU

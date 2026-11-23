@@ -1058,6 +1058,7 @@ static inline int typed_is(SpValue v) {
     return v.type == T_NATIVE && (uintptr_t)AS_NATIVE(v)->cls - (uintptr_t)typed_classes < TK_COUNT * sizeof(NativeClass);
 }
 int64_t typed_len(SpValue v);
+SpValue typed_u8_from(VM *vm, const unsigned char *b, size_t n);
 int typed_kind(SpValue v);
 int typed_peek(SpValue o, SpValue k, SpValue *out);
 int typed_poke(SpValue o, SpValue k, SpValue v);

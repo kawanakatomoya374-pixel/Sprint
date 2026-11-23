@@ -24,6 +24,19 @@
 
 制約: カーネルは位置固定（16 MiB）なので、その範囲をファームウェアが予約している機種では起動できない（再配置可能なカーネルが要る）。Secure Boot 未対応。実機では未検証。
 
+## ハイブリッドイメージ（os/boot/hybridboot.sp、`make os-hybrid`）
+
+`build/os/sprintos-hybrid.img` は **1本のディスクで BIOS と UEFI の両方から起動する**（イメージ生成・両方のローダーとも Sprint 製）。
+
+| 場所 | 中身 | 使うのは |
+|---|---|---|
+| LBA 0 | 保護 MBR。ブートコードは BIOS ステージ1（446バイト以内）、パーティション表は 0xEE の1件（起動可フラグ付き） | BIOS が実行する。UEFI はコードを無視する |
+| LBA 1〜33 | GPT ヘッダとパーティション表 | UEFI |
+| パーティション1 | GPT の「BIOS boot」領域（LBA 2048〜）: BIOS ステージ2とカーネルのセグメント | ステージ1が読む |
+| パーティション2 | ESP（FAT32）: `\EFI\BOOT\BOOTX64.EFI` と `\SPRINTOS.BIN` | UEFI ファームウェアが起動する |
+
+どちらのローダーも同じカーネルの Multiboot2 入口に入る。カーネルは UEFI 用の 16 MiB リンク版を両方で共用する（BIOS 側はアドレスを気にしない）ので、カーネルのビルドは1つで済む。`os/boot/bios_loader.sp` / `uefi_loader.sp` / `elf32.sp` / `diskimg.sp` は、単独の BIOS イメージ（`sprintboot.sp`）・単独の UEFI イメージ（`uefiboot.sp`）・ハイブリッド（`hybridboot.sp`）が共有するモジュールで、単独イメージの出力はモジュール化の前後でバイト単位で変わらない。`make os-hybrid-test` は同じイメージを SeaBIOS で、続いて OVMF で起動して同じ検査を行う（`os-hybrid-run` / `os-hybrid-uefi-run` で手動起動）。
+
 ## JIT
 
 カーネル（Ring 0）の Sprint VM も、ユーザープロセス（Ring 3）の Sprint VM も、x86-64 の JIT（領域 JIT・TraceJIT・純関数 JIT）付きでビルドされる。JIT コードは匿名 `mmap` のページに置く: ユーザー側は `mmap` が常に実行可能なページを返し（NX は使わない）、`mprotect` は成功を返す。コンテキストスイッチは `fxsave`/`fxrstor` で SSE の状態を保存するので、float を使う JIT コードも切り替えをまたいで壊れない。`make os-test` / `os-img-test` は、CPU バウンドのジョブ（4本）が 1 CPU で 4.5 秒未満で終わること（インタプリタだけだと約 7.8 秒、JIT で約 1.8 秒）を検査する。

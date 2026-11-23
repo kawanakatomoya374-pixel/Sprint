@@ -4,6 +4,10 @@
 #   let efi = d.mkdir(d.root, "EFI")                   # short (8.3) names only
 #   d.write_file(d.root, "SPRINTOS.BIN", bytes)        # bytes: array or typed.u8
 #   let image = d.finish()                             # typed.u8 of the whole disk (protective MBR, GPT, ESP, backup GPT)
+#
+# Hybrid BIOS + UEFI disk: d.finish({mbr: code_bytes, blob: bytes, start: lba}) also writes `code_bytes` (<= 446) into the protective MBR
+# (a BIOS runs it) and puts `blob` into a GPT "BIOS boot" partition at LBA `start` (before the ESP, which then begins at the Disk's
+# start_lba). A UEFI firmware ignores the MBR code and boots \EFI\BOOT\BOOTX64.EFI from the ESP.
 import typed
 
 const SECTOR = 512
@@ -63,8 +67,10 @@ export class Disk:
     let root = 2
     let fat_off = 0
     let nclusters = 0
+    let start = PART_START
 
-    func init(self, volume_sectors):
+    func init(self, volume_sectors, start_lba = PART_START):
+        self.start = start_lba
         self.sectors = volume_sectors
         self.vol = typed.u8(volume_sectors * SECTOR)
         self.fat_sectors = (volume_sectors + 127) // 128
@@ -85,7 +91,7 @@ export class Disk:
         v[21] = 0xf8
         put16(v, 24, 32)
         put16(v, 26, 64)
-        put32(v, 28, PART_START)
+        put32(v, 28, start_lba)
         put32(v, 32, volume_sectors)
         put32(v, 36, self.fat_sectors)
         put32(v, 44, 2)
@@ -175,32 +181,48 @@ export class Disk:
             v[off + i] = data[i]
         self.add_entry(dir, name, 0x20, c, n)
 
-    # protective MBR + GPT + the volume + the backup GPT
-    func finish(self):
+    # protective MBR + GPT + the volume + the backup GPT; `bios` = {mbr, blob, start} makes the disk bootable by a BIOS as well
+    func finish(self, bios = nil):
         # the backup boot sector and FSInfo (sectors 6 and 7)
         for i in range(SECTOR):
             self.vol[6 * SECTOR + i] = self.vol[i]
             self.vol[7 * SECTOR + i] = self.vol[SECTOR + i]
-        let total = PART_START + self.sectors + 34
+        let total = self.start + self.sectors + 34
         let img = typed.u8(total * SECTOR)
-        # protective MBR: one 0xEE partition covering the disk
+        # protective MBR: one 0xEE partition covering the disk (marked active when it also carries BIOS boot code)
         let m = 446
         img[m + 4] = 0xee
         put32(img, m + 8, 1)
         put32(img, m + 12, total - 1)
         put16(img, 510, 0xaa55)
-        # the partition entry (EFI System Partition)
-        let ent = 2 * SECTOR
-        puts(img, ent, [0x28, 0x73, 0x2a, 0xc1, 0x1f, 0xf8, 0xd2, 0x11, 0xba, 0x4b, 0x00, 0xa0, 0xc9, 0x3e, 0xc9, 0x3b])
-        puts(img, ent + 16, [0x53, 0x70, 0x72, 0x69, 0x6e, 0x74, 0x4f, 0x53, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08])
-        put64(img, ent + 32, PART_START)
-        put64(img, ent + 40, PART_START + self.sectors - 1)
-        let name = "EFI System"
-        for i in range(len(name)):
-            img[ent + 56 + i * 2] = name[i]
+        let parts = []
+        if bios != nil:
+            if len(bios.mbr) > 446:
+                throw error("ValueError", "MBR boot code is " .. to_string(len(bios.mbr)) .. " bytes; the code area is 446")
+            for i in range(len(bios.mbr)):
+                img[i] = bios.mbr[i]
+            img[m] = 0x80
+            let bs = (len(bios.blob) + SECTOR - 1) // SECTOR
+            if bios.start + bs > self.start:
+                throw error("ValueError", "the BIOS boot partition overlaps the ESP")
+            parts.append({type: [0x48, 0x61, 0x68, 0x21, 0x49, 0x64, 0x6f, 0x6e, 0x74, 0x4e, 0x65, 0x65, 0x64, 0x45, 0x46, 0x49],
+                          uniq: 0x11, start: bios.start, sectors: bs, name: "BIOS boot"})
+            for i in range(len(bios.blob)):
+                img[bios.start * SECTOR + i] = bios.blob[i]
+        parts.append({type: [0x28, 0x73, 0x2a, 0xc1, 0x1f, 0xf8, 0xd2, 0x11, 0xba, 0x4b, 0x00, 0xa0, 0xc9, 0x3e, 0xc9, 0x3b],
+                      uniq: 0x01, start: self.start, sectors: self.sectors, name: "EFI System"})
+        for k in range(len(parts)):
+            let p = parts[k]
+            let ent = 2 * SECTOR + k * 128
+            puts(img, ent, p.type)
+            puts(img, ent + 16, [0x53, 0x70, 0x72, 0x69, 0x6e, 0x74, 0x4f, 0x53, p.uniq, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08])
+            put64(img, ent + 32, p.start)
+            put64(img, ent + 40, p.start + p.sectors - 1)
+            for i in range(len(p.name)):
+                img[ent + 56 + i * 2] = p.name[i]
         let entries_crc = crc32(img, 2 * SECTOR, 2 * SECTOR + 128 * 128)
         # the volume
-        let vb = PART_START * SECTOR
+        let vb = self.start * SECTOR
         for i in range(self.sectors * SECTOR):
             img[vb + i] = self.vol[i]
         # backup entries (copy), then both headers
