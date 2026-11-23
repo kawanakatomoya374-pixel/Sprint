@@ -1,0 +1,7 @@
+png_rgba png 5 4 4668470 0 0 0 255 181 179
+png_palette png 6 5 10567139 0 0 0 255 204 255
+bmp_24 bmp 9 7 6479740 0 0 0 255 106 102
+jpeg_420 jpeg 16 16 9640307 0 7 0 255 208 91
+jpeg_progressive jpeg 17 9 10994378 0 16 0 255 164 240
+ValueError
+bmp nil
