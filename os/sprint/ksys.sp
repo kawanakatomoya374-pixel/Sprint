@@ -167,6 +167,37 @@ export func dispatch(p):
         return va
     if nr == 1012:   # shm_close(address)
         return shm.detach(p, arg(p, 0))
+    if nr == 1020:   # mmio_map(phys, bytes) -> address: device registers, uncached (drivers only)
+        if not p.mmio:
+            return EPERM
+        let bytes = arg(p, 1)
+        if bytes <= 0 or bytes > (64 << 20):
+            return -22
+        let n = (bytes + (arg(p, 0) & 4095) + 4095) // 4096
+        let va = p.mmap_next
+        p.mmap_next += n * 4096 + 4096
+        let base = arg(p, 0) & ~4095
+        for i in range(n):
+            p.space.map(va + i * 4096, base + i * 4096, vmm.W | vmm.U | vmm.DEVICE | 0x18)
+        return va + (arg(p, 0) & 4095)
+    if nr == 1021:   # dma_alloc(bytes, out): out = [segment id, address, physical address, bytes] (drivers only; physically contiguous)
+        if not p.dma:
+            return EPERM
+        let n = (arg(p, 0) + 4095) // 4096
+        if n <= 0 or n > 4096:
+            return -22
+        let first = kmem.alloc_contig(n)
+        if first == 0:
+            return ENOMEM
+        let pages = []
+        for i in range(n):
+            pages.append(first + i * 4096)
+        let r = shm.adopt(p, pages)
+        p.space.write64(arg(p, 1), r[0])
+        p.space.write64(arg(p, 1) + 8, r[1])
+        p.space.write64(arg(p, 1) + 16, first)
+        p.space.write64(arg(p, 1) + 24, r[2])
+        return 0
     if nr == 1005:   # poweroff (gui process only)
         if not p.gui:
             return EPERM

@@ -32,3 +32,34 @@ export func free_count():
 
 export func total_count():
     return total
+
+# n physically contiguous zeroed pages (a device's DMA ring), or 0 when no such run is free
+export func alloc_contig(n):
+    if n <= 0 or n > len(free_pages):
+        return 0
+    let sorted = free_pages.copy()
+    sorted.sort((a, b) => a < b)
+    let run = 1
+    let start = 0
+    for i in range(1, len(sorted)):
+        if sorted[i] == sorted[i - 1] + PAGE:
+            run += 1
+        else:
+            run = 1
+            start = i
+        if run >= n:
+            let first = sorted[start]
+            let want = {}
+            for k in range(n):
+                want[to_string(first + k * PAGE)] = true
+            let keep = []
+            for a in free_pages:
+                if not (to_string(a) in want):
+                    keep.append(a)
+            free_pages = keep
+            for k in range(n):
+                hw.memset(first + k * PAGE, 0, PAGE)
+            return first
+    if n == 1 and len(sorted) > 0:
+        return alloc()
+    return 0

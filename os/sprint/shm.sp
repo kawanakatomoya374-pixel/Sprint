@@ -23,6 +23,13 @@ export func create(p, size):
     segs[id] = {pages: pages, refs: 0}
     return [id, attach(p, id), n * 4096]
 
+# turn pages the caller already owns (e.g. a device's DMA memory) into a segment and map it into p: [id, va, bytes]
+export func adopt(p, pages):
+    let id = next_id
+    next_id += 1
+    segs[id] = {pages: pages, refs: 0}
+    return [id, attach(p, id), len(pages) * 4096]
+
 # map segment `id` into p; returns the address (negative errno on failure)
 export func attach(p, id):
     if not (id in segs):

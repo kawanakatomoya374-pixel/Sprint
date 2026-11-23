@@ -22,7 +22,8 @@ func log(s):
 
 # what a program may do beyond computing: the framebuffer and input (gui), and the I/O ports of a driver
 const GUI = ["guid"]
-const PORTS = {fsd: [0x1F0, 8, 0x3F6, 1, 0x170, 8, 0x376, 1]}
+const PORTS = {fsd: [0x1F0, 8, 0x3F6, 1, 0x170, 8, 0x376, 1], gpud: [0xCF8, 8]}
+const DRIVERS = ["gpud"]       # may map device registers and allocate DMA memory
 let names = {}        # service name -> pid
 let io_open = {}      # cpu -> the port ranges currently open in its I/O permission bitmap
 let io_pid = {}       # cpu -> pid they belong to
@@ -55,6 +56,8 @@ export func spawn(mod, parent):
         return -2
     p.parent = parent
     p.gui = GUI.contains(mod)
+    p.mmio = DRIVERS.contains(mod)
+    p.dma = p.mmio
     if mod in PORTS:
         p.ports = PORTS[mod]
     procs[pid] = p

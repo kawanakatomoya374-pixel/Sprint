@@ -102,4 +102,15 @@ UEFI ローダー（`BOOTX64.EFI`）は **Sprint 製の署名ツール**（`os/b
 
 検証: `make os-disk-test`（2 台目の ATA ディスクに SprintFS を作り、`fsd` をカーネルなしで動かして読み書き・300 KB 超のファイル・エラー種別を確かめ、書いた結果をホストが `fsck` で検査する）、`make os-img-test`（デスクトップ上で Demo を起動してクライアントのウィンドウが出る・ポインタとキーが届く・クライアントの画素が画面にある・ターミナルが `fsd` 経由でディスクのファイルを読む）。
 
+**GPU サーバ `gpud`**（`os/user/gpud.sp`、C-OS の `virtio_gpu.c` の 2D 経路が土台）: VirtIO-GPU（QEMU の `virtio-vga` / `virtio-gpu-pci`）を Ring 3 から動かす。PCI 設定空間はポート 0xCF8/0xCFC（`PORTS` で許可）、レジスタは BAR の MMIO、キューとピクセルメモリは物理的に連続な DMA メモリで、カーネルが `gpud` だけに次の 2 つの機構を許す:
+
+- syscall 1020 `mmio_map(phys, bytes)`: デバイスのレジスタをキャッシュ無効（PCD|PWT）で自分のアドレス空間へ写す。
+- syscall 1021 `dma_alloc(bytes)`: 物理連続のページを確保して共有セグメントとして写し、物理アドレスを返す（`kmem.alloc_contig`）。
+
+`gpud` は PCI を走査して virtio-gpu（0x1AF4:0x1050）を見つけ、virtio-pci の capability（common / notify）から modern インターフェースを開き（VERSION_1 のみ、3D なし）、control queue と cursor queue を作り、`GET_DISPLAY_INFO` の画面サイズで 2D リソース＋バッキング（1 エントリ）＋`SET_SCANOUT` を行う。`"gpu"` として登録し、`info`（画面のピクセルメモリを共有セグメントで返す）、`flush x y w h`（`TRANSFER_TO_HOST_2D` + `RESOURCE_FLUSH`）、`cursor_image` / `cursor_move`（ハードウェアカーソル）、`quit` を受ける。デバイスが無ければ `info` に `ENODEV` を返す。
+
+`guid` は起動時に `"gpu"` に問い合わせ、あれば（`gdev.fb_use`）そのピクセルメモリを画面として描き、表示のたびに `flush` を送り、ポインタはハードウェアカーソルにする。無ければ従来どおりカーネルのフレームバッファ。`boot` が `fsd`・`gpud`・`guid` を順に起動し、終了時に `fsd`・`gpud` を止める。
+
+検証: `make os-gpu-test`（`virtio-vga` 上で、`gputest` が 4 色の帯を描いて `flush` → QEMU の screendump にその画素が出る、矩形だけの `flush`、カーソル画像の受理。続けて通常の `boot` を `-vga none -device virtio-vga` で起動し、デスクトップが GPU サーバ経由で描かれ、ダブルクリックでターミナルが開き、ホストの画面にそのウィンドウが出る）。
+
 既知の問題: 2 CPU のセルフテストが約 1 割の確率で、`burner` プロセスの Ring 3 のページフォルト（cr2=0）で落ちる。サーバ分離の前から出ていた現象で（変更前の木でも 14 回中 2 回）、原因は未調査。

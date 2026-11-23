@@ -132,6 +132,13 @@ os-img-test: $(OSB)/sprintos-test.img $(OSB)/sprintos.img
 $(OSB)/sprintos-fstest.img: $(OSB)/kernel.elf os/boot/sprintboot.sp os/boot/bios_loader.sp os/boot/elf32.sp os/boot/boot_menu.sp stdlib/asm.sp $(BUILD)/sprint
 	$(BUILD)/sprint run --allow-read=$(OSB) --allow-write=$(OSB) os/boot/sprintboot.sp $(OSB)/kernel32.elf $@ "init=fstest"
 
+$(OSB)/sprintos-gputest.img: $(OSB)/kernel.elf os/boot/sprintboot.sp os/boot/bios_loader.sp os/boot/elf32.sp os/boot/boot_menu.sp stdlib/asm.sp $(BUILD)/sprint
+	$(BUILD)/sprint run --allow-read=$(OSB) --allow-write=$(OSB) os/boot/sprintboot.sp $(OSB)/kernel32.elf $@ "init=gputest"
+
+# a VirtIO-GPU (virtio-vga): the gpud server drives it from ring 3; QEMU's screendump shows what it displayed
+os-gpu-test: $(OSB)/sprintos-gputest.img $(OSB)/sprintos.img $(BUILD)/sprint
+	python3 os/tests/gpu_test.py $(OSB)/sprintos-gputest.img $(OSB)/sprintos.img
+
 # a second ATA disk formatted with SprintFS: the Sprint kernel mounts it, reads and writes it
 os-disk-test: $(OSB)/sprintos-fstest.img $(BUILD)/sprint
 	python3 os/tests/disk_test.py $(OSB)/sprintos-fstest.img

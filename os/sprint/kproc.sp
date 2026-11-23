@@ -57,6 +57,8 @@ export class Process:
     let inbox = []       # messages waiting (strings)
     let inbox_from = []  # the sender's pid of each
     let rfrom = 0        # where a blocked msg_recv wants the sender's pid (0 = nowhere)
+    let mmio = false     # may map device registers (a driver)
+    let dma = false      # may allocate physically contiguous DMA memory
     let ports = []       # I/O port ranges [first, count, ...] this process may use (a driver)
     let rbuf = 0         # where a blocked msg_recv wants its message
     let rcap = 0

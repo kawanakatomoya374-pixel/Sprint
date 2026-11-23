@@ -20,7 +20,34 @@ func log(s):
     print("[guid] " .. s)
     io.flush()
 
-let info = gdev.fb_map()
+# the display: the GPU server (gpud, a VirtIO-GPU) if the machine has one, else the kernel's framebuffer
+let gpu = nil
+let info = nil
+let gpu_pid = nil
+for i in range(20):
+    gpu_pid = ipc.lookup("gpu")
+    if gpu_pid != nil:
+        break
+    psys.sleep_ms(50)
+if gpu_pid != nil:
+    io.flush()
+    ipc.send(gpu_pid, "info")
+    while true:
+        let m = ipc.recv_from()
+        if m[0] != gpu_pid:
+            continue
+        let r = m[1].split("\t")
+        if r[0] == "ok":
+            let seg = ipc.shm_open(to_int(r[4]))
+            gdev.fb_use(seg[0], to_int(r[1]), to_int(r[2]), to_int(r[3]))
+            info = [to_int(r[1]), to_int(r[2])]
+            gpu = gpu_pid
+            log("display: VirtIO-GPU through gpud")
+        else:
+            log("no GPU (" .. r[2] .. "): using the kernel framebuffer")
+        break
+if info == nil:
+    info = gdev.fb_map()
 if info == nil:
     log("no framebuffer")
     psys.exit(1)
@@ -353,6 +380,7 @@ desk.every(5000, update_clock)
 # ---- the pointer ---------------------------------------------------------------------------------
 let cursor_cache = {}
 let cursor_now = ""
+let cursor_seg = nil
 func set_pointer(name):
     if name == cursor_now:
         return nil
@@ -361,14 +389,31 @@ func set_pointer(name):
         let c = gfx.canvas(24, 24, 0xFF00FF)
         gui.draw_cursor(c, name, 8, 8)
         cursor_cache[name] = c
-    gdev.cursor_image(cursor_cache[name], 8, 8)
+    if gpu != nil:
+        if cursor_seg == nil:
+            cursor_seg = ipc.shm_create(24 * 24 * 4)
+        ipc.canvas_to_shm(cursor_cache[name], cursor_seg[1])
+        ipc.send(gpu, "cursor_image\t" .. to_string(cursor_seg[0]) .. "\t8\t8")
+    else:
+        gdev.cursor_image(cursor_cache[name], 8, 8)
+
+func cursor_to(x, y):
+    if gpu != nil:
+        ipc.send(gpu, "cursor_move\t" .. to_string(x) .. "\t" .. to_string(y))
+    else:
+        gdev.cursor_move(x, y)
+
+func show(rx, ry, rw, rh):
+    gdev.present(desk.canvas, 0, 0, rx, ry, rw, rh)
+    if gpu != nil:
+        ipc.send(gpu, "flush\t" .. to_string(rx) .. "\t" .. to_string(ry) .. "\t" .. to_string(rw) .. "\t" .. to_string(rh))
 
 # ---- main loop ----------------------------------------------------------------------------------
 let input = uinput.Input(W, H)
 desk.draw()
-gdev.present(desk.canvas)
+show(0, 0, W, H)
 set_pointer("arrow")
-gdev.cursor_move(input.mx, input.my)
+cursor_to(input.mx, input.my)
 log("ready after " .. to_string(psys.ms()) .. " ms")
 
 let last = psys.ms()
@@ -390,10 +435,10 @@ while desk.running:
     if desk.needs_draw:
         desk.draw()
         let r = desk.last_rect
-        gdev.present(desk.canvas, 0, 0, r[0], r[1], r[2], r[3])
+        show(r[0], r[1], r[2], r[3])
         frames += 1
     if moved:
-        gdev.cursor_move(input.mx, input.my)
+        cursor_to(input.mx, input.my)
         set_pointer(desk.cursor_name())
     if len(evs) == 0:
         psys.sleep_ms(4)

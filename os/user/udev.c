@@ -87,6 +87,20 @@ static SpStatus d_fb_map(SpVM *vm, int argc, const SpValue *argv, SpValue *ret) 
     return SP_OK;
 }
 
+/* fb_use(address, width, height, pitch): draw into memory the caller already has (the GPU server's shared pixel segment) instead of the kernel's framebuffer */
+static SpStatus d_fb_use(SpVM *vm, int argc, const SpValue *argv, SpValue *ret) {
+    (void)argc;
+    int64_t a, w, h, pitch;
+    if (need_i(vm, argv[0], &a) != SP_OK || need_i(vm, argv[1], &w) != SP_OK || need_i(vm, argv[2], &h) != SP_OK || need_i(vm, argv[3], &pitch) != SP_OK)
+        return SP_E_RUNTIME;
+    g_fb.addr = (uint8_t *)(uintptr_t)a;
+    g_fb.w = (uint32_t)w;
+    g_fb.h = (uint32_t)h;
+    g_fb.pitch = (uint32_t)pitch;
+    *ret = sp_nil();
+    return SP_OK;
+}
+
 /* present(canvas, x = 0, y = 0, rx = 0, ry = 0, rw = canvas width, rh = canvas height) */
 static SpStatus d_present(SpVM *vm, int argc, const SpValue *argv, SpValue *ret) {
     int w, h;
@@ -197,7 +211,7 @@ static SpStatus d_reboot(SpVM *vm, int argc, const SpValue *argv, SpValue *ret) 
 }
 
 static const SpNativeDesc gdev_fns[] = {
-    {"fb_map", 0, 0, 0, SP_NATIVE_ALLOCATES, d_fb_map}, {"present", 1, 7, 0, 0, d_present},
+    {"fb_map", 0, 0, 0, SP_NATIVE_ALLOCATES, d_fb_map}, {"fb_use", 4, 4, 0, 0, d_fb_use}, {"present", 1, 7, 0, 0, d_present},
     {"cursor_image", 3, 3, 0, 0, d_cursor_image}, {"cursor_move", 2, 2, 0, 0, d_cursor_move},
     {"input", 0, 0, 0, SP_NATIVE_ALLOCATES, d_input}, {"mem_info", 0, 0, 0, SP_NATIVE_ALLOCATES, d_mem_info},
     {"rtc", 0, 0, 0, SP_NATIVE_ALLOCATES, d_rtc}, {"poweroff", 0, 0, 0, 0, d_poweroff}, {"reboot", 0, 0, 0, 0, d_reboot},
@@ -426,8 +440,92 @@ static SpStatus u_outw(SpVM *vm, int argc, const SpValue *argv, SpValue *ret) {
     *ret = sp_nil();
     return SP_OK;
 }
+static SpStatus u_inl(SpVM *vm, int argc, const SpValue *argv, SpValue *ret) {
+    (void)argc;
+    int64_t p;
+    if (need_i(vm, argv[0], &p) != SP_OK) return SP_E_RUNTIME;
+    uint32_t v;
+    __asm__ volatile("inl %1, %0" : "=a"(v) : "Nd"((uint16_t)p));
+    *ret = sp_int(v);
+    return SP_OK;
+}
+static SpStatus u_outl(SpVM *vm, int argc, const SpValue *argv, SpValue *ret) {
+    (void)argc;
+    int64_t p, v;
+    if (need_i(vm, argv[0], &p) != SP_OK || need_i(vm, argv[1], &v) != SP_OK) return SP_E_RUNTIME;
+    __asm__ volatile("outl %0, %1" : : "a"((uint32_t)v), "Nd"((uint16_t)p));
+    *ret = sp_nil();
+    return SP_OK;
+}
+/* mmio_map(phys, bytes) -> address (device registers, uncached; drivers only) */
+static SpStatus u_mmio_map(SpVM *vm, int argc, const SpValue *argv, SpValue *ret) {
+    (void)argc;
+    int64_t p, n;
+    if (need_i(vm, argv[0], &p) != SP_OK || need_i(vm, argv[1], &n) != SP_OK) return SP_E_RUNTIME;
+    long r = sc3(1020, (long)p, (long)n, 0);
+    if (r < 0) return sp_throw(vm, "OSError", "uio.mmio_map: error %ld", r);
+    *ret = sp_int(r);
+    return SP_OK;
+}
+/* dma_alloc(bytes) -> [segment id, address, physical address, bytes] (physically contiguous; drivers only) */
+static SpStatus u_dma_alloc(SpVM *vm, int argc, const SpValue *argv, SpValue *ret) {
+    (void)argc;
+    int64_t n;
+    if (need_i(vm, argv[0], &n) != SP_OK) return SP_E_RUNTIME;
+    uint64_t out[4] = {0, 0, 0, 0};
+    long r = sc3(1021, (long)n, (long)(uintptr_t)out, 0);
+    if (r < 0) return sp_throw(vm, "OSError", "uio.dma_alloc: error %ld", r);
+    shm_note(out[1], out[3]);
+    SpStatus st = sp_new_array(vm, 4, ret);
+    if (st != SP_OK) return st;
+    for (int i = 0; i < 4; i++) (void)sp_array_push(vm, *ret, sp_int((int64_t)out[i]));
+    return SP_OK;
+}
+/* raw memory of this process (mapped device registers, DMA memory): peek8..peek64(address), poke8..poke64(address, value) */
+#define MEMOP(N, T)                                                                                                         \
+    static SpStatus u_peek##N(SpVM *vm, int argc, const SpValue *argv, SpValue *ret) {                                      \
+        (void)argc;                                                                                                         \
+        int64_t a;                                                                                                          \
+        if (need_i(vm, argv[0], &a) != SP_OK) return SP_E_RUNTIME;                                                          \
+        *ret = sp_int((int64_t)*(volatile T *)(uintptr_t)a);                                                                \
+        return SP_OK;                                                                                                       \
+    }                                                                                                                       \
+    static SpStatus u_poke##N(SpVM *vm, int argc, const SpValue *argv, SpValue *ret) {                                      \
+        (void)argc;                                                                                                         \
+        int64_t a, v;                                                                                                       \
+        if (need_i(vm, argv[0], &a) != SP_OK || need_i(vm, argv[1], &v) != SP_OK) return SP_E_RUNTIME;                      \
+        *(volatile T *)(uintptr_t)a = (T)v;                                                                                 \
+        *ret = sp_nil();                                                                                                    \
+        return SP_OK;                                                                                                       \
+    }
+MEMOP(8, uint8_t)
+MEMOP(16, uint16_t)
+MEMOP(32, uint32_t)
+MEMOP(64, uint64_t)
+static SpStatus u_peek_str(SpVM *vm, int argc, const SpValue *argv, SpValue *ret) {
+    (void)argc;
+    int64_t a, n;
+    if (need_i(vm, argv[0], &a) != SP_OK || need_i(vm, argv[1], &n) != SP_OK) return SP_E_RUNTIME;
+    return sp_new_string(vm, (const char *)(uintptr_t)a, (size_t)n, ret);
+}
+static SpStatus u_poke_str(SpVM *vm, int argc, const SpValue *argv, SpValue *ret) {
+    (void)argc;
+    int64_t a;
+    if (need_i(vm, argv[0], &a) != SP_OK) return SP_E_RUNTIME;
+    if (argv[1].type != SP_T_STRING) return sp_throw(vm, "TypeError", "uio.poke_str: expected a string");
+    size_t n;
+    const char *s = sp_string_data(argv[1], &n);
+    memcpy((void *)(uintptr_t)a, s, n);
+    *ret = sp_nil();
+    return SP_OK;
+}
 static const SpNativeDesc uio_fns[] = {
     {"inb", 1, 1, 0, 0, u_inb}, {"inw", 1, 1, 0, 0, u_inw}, {"outb", 2, 2, 0, 0, u_outb}, {"outw", 2, 2, 0, 0, u_outw},
+    {"inl", 1, 1, 0, 0, u_inl}, {"outl", 2, 2, 0, 0, u_outl}, {"mmio_map", 2, 2, 0, 0, u_mmio_map},
+    {"dma_alloc", 1, 1, 0, SP_NATIVE_ALLOCATES, u_dma_alloc},
+    {"peek8", 1, 1, 0, 0, u_peek8}, {"peek16", 1, 1, 0, 0, u_peek16}, {"peek32", 1, 1, 0, 0, u_peek32}, {"peek64", 1, 1, 0, 0, u_peek64},
+    {"poke8", 2, 2, 0, 0, u_poke8}, {"poke16", 2, 2, 0, 0, u_poke16}, {"poke32", 2, 2, 0, 0, u_poke32}, {"poke64", 2, 2, 0, 0, u_poke64},
+    {"peek_str", 2, 2, 0, SP_NATIVE_ALLOCATES, u_peek_str}, {"poke_str", 2, 2, 0, 0, u_poke_str},
 };
 
 int udev_register(SpVM *vm) {
