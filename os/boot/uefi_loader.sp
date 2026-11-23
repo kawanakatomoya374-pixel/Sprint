@@ -8,7 +8,10 @@
 # The kernel is relocatable: the loader asks the firmware for a free block anywhere below 4 GiB, copies the segments there and adds the
 # displacement to every address the kernel holds (the table comes from the 64-bit kernel.elf, linked with -Wl,-q).
 import asm
+import boot_menu
 import elf32
+import hash
+import sha256_asm
 import typed
 import uefi_pe
 
@@ -25,7 +28,14 @@ func db_string(s):
     return "db " .. parts.join(", ") .. ", 0"
 
 
+func dd_words(ws):
+    let parts = []
+    for w in ws:
+        parts.append(to_string(w))
+    return "dd " .. parts.join(", ")
+
 export func build(elf, info, cmdline, elf64):
+    let menu = boot_menu.parse(cmdline)
     let entry = info.entry
     let segs = []
     let seg_bytes = 0
@@ -160,7 +170,6 @@ export func build(elf, info, cmdline, elf64):
     let TL = tramp.symbols
     
     # ---- the loader ------------------------------------------------------------------------------------------
-    let cmd_tag = 8 + len(cmdline) + 1
     let kpages = (kbin_size + 4095) // 4096
     let app_src = """
     bits 64
@@ -173,6 +182,32 @@ export func build(elf, info, cmdline, elf64):
         mov [bs], rax
         lea rdx, [msg_banner]
         call puts
+
+        ; ---- Secure Boot lockdown: with Secure Boot on, the command line cannot be edited ----
+        mov qword [varsize], 1
+        lea rcx, [wname_secureboot]
+        lea rdx, [guid_global]
+        xor r8d, r8d
+        lea r9, [varsize]
+        lea rax, [vardata]
+        mov [rsp + 32], rax
+        mov rax, [systab]
+        mov rax, [rax + 88]             ; RuntimeServices
+        call [rax + 72]                 ; GetVariable
+        test rax, rax
+        jnz .nosb
+        cmp byte [vardata], 1
+        jne .nosb
+        mov byte [locked], 1
+    .nosb:
+
+        ; ---- the boot menu (or the one fixed command line) ----
+        lea rax, [menu_cmd""" .. to_string(menu.default) .. """]
+        mov [cmdptr], rax
+        cmp byte [menu_on], 0
+        je .nomenu
+        call run_menu
+    .nomenu:
     
         ; ---- GOP: a 1024x768 mode ----
         lea rcx, [guid_gop]
@@ -306,6 +341,17 @@ export func build(elf, info, cmdline, elf64):
         call [rcx + 32]                 ; Read
         test rax, rax
         jnz fail_file
+        ; ---- the kernel file must be the one this loader was built with (the hash is inside this -- signed -- image) ----
+        lea rdi, [shactx]
+        mov rsi, [kbuf]
+        mov rdx, """ .. to_string(kbin_size) .. """
+        call sha256_all
+        lea rsi, [shactx]
+        lea rdi, [khash]
+        mov ecx, 8
+        cld
+        repe cmpsd
+        jne fail_hash
     
         ; ---- low memory (below 1 MiB) for the Multiboot2 information and the trampoline ----
         mov qword [mbi], 0xfffff
@@ -361,15 +407,28 @@ export func build(elf, info, cmdline, elf64):
         mov dword [rdi], 0
         mov dword [rdi + 4], 0
         add rdi, 8
-        mov dword [rdi], 1
-        mov dword [rdi + 4], """ .. to_string(cmd_tag) .. """
+        mov dword [rdi], 1              ; command line (the chosen entry or the edited text)
+        mov rsi, [cmdptr]
+        mov rcx, rsi
+    .cl:
+        cmp byte [rcx], 0
+        je .cle
+        inc rcx
+        jmp .cl
+    .cle:
+        sub rcx, rsi
+        lea eax, [rcx + 9]              ; tag size = 8 + length + 1
+        mov [rdi + 4], eax
         mov r10, rdi
-        lea rsi, [cmdline]
         add rdi, 8
-        mov ecx, """ .. to_string(len(cmdline) + 1) .. """
+        inc ecx
+        cld
         rep movsb
         mov rdi, r10
-        add rdi, """ .. to_string((cmd_tag + 7) // 8 * 8) .. """
+        mov eax, [r10 + 4]
+        add eax, 7
+        and eax, 0xfffffff8
+        add rdi, rax
         cmp byte [have_fb], 0
         je .nofb
         mov dword [rdi], 8
@@ -503,6 +562,9 @@ export func build(elf, info, cmdline, elf64):
     fail_file:
         lea rdx, [msg_file]
         jmp fail_msg
+    fail_hash:
+        lea rdx, [msg_hash]
+        jmp fail_msg
     fail_mm:
         lea rdx, [msg_mm]
     fail_msg:
@@ -511,6 +573,337 @@ export func build(elf, info, cmdline, elf64):
         add rsp, 56
         ret
     
+
+    putc16:                             ; ecx = character
+        sub rsp, 56
+        mov [chbuf], cx
+        mov word [chbuf + 2], 0
+        lea rdx, [chbuf]
+        call puts
+        add rsp, 56
+        ret
+
+    putnum:                             ; eax (0..99) in decimal
+        sub rsp, 56
+        xor edx, edx
+        mov ecx, 10
+        div ecx
+        mov [numtmp], edx
+        test eax, eax
+        jz .u
+        lea ecx, [rax + 48]
+        call putc16
+    .u: mov ecx, [numtmp]
+        add ecx, 48
+        call putc16
+        add rsp, 56
+        ret
+
+    getkey:                             ; eax = (scan code << 16) | character, 0 when no key is waiting
+        sub rsp, 56
+        mov rax, [systab]
+        mov rcx, [rax + 48]             ; ConIn
+        lea rdx, [keybuf]
+        call [rcx + 8]                  ; ReadKeyStroke
+        test rax, rax
+        jnz .none
+        movzx eax, word [keybuf]
+        shl eax, 16
+        movzx ecx, word [keybuf + 2]
+        or eax, ecx
+        add rsp, 56
+        ret
+    .none:
+        xor eax, eax
+        add rsp, 56
+        ret
+
+    sleep100:
+        sub rsp, 56
+        mov rax, [bs]
+        mov ecx, 100000
+        call [rax + 248]                ; Stall (microseconds)
+        add rsp, 56
+        ret
+
+    clear_screen:
+        sub rsp, 56
+        mov rax, [systab]
+        mov rcx, [rax + 64]
+        call [rcx + 48]                 ; ConOut->ClearScreen
+        add rsp, 56
+        ret
+
+    print_edit:                         ; the edit buffer (ASCII) as UTF-16
+        lea rsi, [editbuf]
+        lea rdi, [abuf]
+    .c: movzx eax, byte [rsi]
+        mov [rdi], ax
+        test eax, eax
+        jz .d
+        inc rsi
+        add rdi, 2
+        jmp .c
+    .d: lea rdx, [abuf]
+        jmp puts
+
+    draw_menu:
+        push rbx
+        push rsi
+        push rdi
+        push r12
+        sub rsp, 56
+        call clear_screen
+        lea rdx, [wmsg_title]
+        call puts
+        xor ebx, ebx
+    .e: movzx eax, word [menu_count]
+        cmp ebx, eax
+        jae .done
+        mov ecx, 32
+        cmp ebx, [sel]
+        jne .n
+        mov ecx, 62
+    .n: call putc16
+        mov ecx, 32
+        call putc16
+        lea ecx, [rbx + 49]
+        call putc16
+        mov ecx, 46
+        call putc16
+        mov ecx, 32
+        call putc16
+        lea rcx, [menu_tab]
+        mov edx, [rcx + rbx * 8]
+        add rdx, rcx
+        call puts
+        lea rdx, [wmsg_crlf]
+        call puts
+        inc ebx
+        jmp .e
+    .done:
+        lea rdx, [wmsg_help]
+        call puts
+        cmp byte [locked], 0
+        je .nolock
+        lea rdx, [wmsg_locked]
+        call puts
+    .nolock:
+        cmp byte [counting], 0
+        je .r
+        lea rdx, [wmsg_count1]
+        call puts
+        mov eax, [ticks]
+        add eax, 9
+        xor edx, edx
+        mov ecx, 10
+        div ecx
+        call putnum
+        lea rdx, [wmsg_count2]
+        call puts
+    .r: add rsp, 56
+        pop r12
+        pop rdi
+        pop rsi
+        pop rbx
+        ret
+
+    run_menu:
+        push rbx
+        push rsi
+        push rdi
+        push r12
+        sub rsp, 56
+        movzx eax, word [menu_default]
+        mov [sel], eax
+        mov byte [counting], 0
+        movzx eax, word [menu_timeout]
+        test eax, eax
+        jz .redraw
+        imul eax, eax, 10
+        mov [ticks], eax
+        mov byte [counting], 1
+    .redraw:
+        call draw_menu
+    .poll:
+        call getkey
+        test eax, eax
+        jnz .key
+        call sleep100
+        cmp byte [counting], 0
+        je .poll
+        dec dword [ticks]
+        jz .boot
+        mov eax, [ticks]
+        xor edx, edx
+        mov ecx, 10
+        div ecx
+        test edx, edx
+        jnz .poll
+        jmp .redraw
+    .key:
+        mov byte [counting], 0
+        mov edx, eax
+        shr edx, 16
+        movzx eax, ax
+        cmp edx, 1                      ; up
+        je .up
+        cmp edx, 2                      ; down
+        je .down
+        cmp eax, 107                    ; 'k' / 'j'
+        je .up
+        cmp eax, 106
+        je .down
+        cmp eax, 13
+        je .boot
+        cmp eax, 10
+        je .boot
+        cmp eax, 101                    ; 'e'
+        je .edit
+        cmp eax, 69
+        je .edit
+        cmp eax, 49
+        jb .redraw
+        cmp eax, 57
+        ja .redraw
+        sub eax, 49
+        movzx ecx, word [menu_count]
+        cmp eax, ecx
+        jae .redraw
+        mov [sel], eax
+        jmp .boot
+    .up:
+        mov eax, [sel]
+        test eax, eax
+        jz .redraw
+        dec eax
+        mov [sel], eax
+        jmp .redraw
+    .down:
+        mov eax, [sel]
+        inc eax
+        movzx ecx, word [menu_count]
+        cmp eax, ecx
+        jae .redraw
+        mov [sel], eax
+        jmp .redraw
+    .edit:
+        cmp byte [locked], 0
+        jne .redraw
+        call edit_cmdline
+        jc .redraw
+        jmp .out
+    .boot:
+        mov eax, [sel]
+        lea rcx, [menu_tab]
+        mov edx, [rcx + rax * 8 + 4]
+        add rcx, rdx
+        mov [cmdptr], rcx
+    .out:
+        add rsp, 56
+        pop r12
+        pop rdi
+        pop rsi
+        pop rbx
+        ret
+
+    edit_cmdline:                       ; CF set: cancelled; clear: cmdptr -> the edited text
+        push rbx
+        push rsi
+        push rdi
+        push r12
+        sub rsp, 56
+        mov eax, [sel]
+        lea rcx, [menu_tab]
+        mov edx, [rcx + rax * 8 + 4]
+        lea rsi, [rcx + rdx]
+        lea rdi, [editbuf]
+        xor ebx, ebx
+    .cp:
+        mov al, [rsi]
+        test al, al
+        jz .cpd
+        cmp ebx, 127
+        jae .cpd
+        mov [rdi + rbx], al
+        inc rsi
+        inc ebx
+        jmp .cp
+    .cpd:
+        mov byte [rdi + rbx], 0
+        mov [editlen], ebx
+        lea rdx, [wmsg_edit]
+        call puts
+        call print_edit
+    .k: call getkey
+        test eax, eax
+        jnz .got
+        call sleep100
+        jmp .k
+    .got:
+        mov edx, eax
+        shr edx, 16
+        movzx eax, ax
+        cmp edx, 0x17                   ; Escape
+        je .cancel
+        cmp eax, 27
+        je .cancel
+        cmp eax, 13
+        je .accept
+        cmp eax, 10
+        je .accept
+        cmp eax, 8
+        je .bs
+        cmp eax, 127
+        je .bs
+        cmp eax, 32
+        jb .k
+        cmp eax, 126
+        ja .k
+        mov ebx, [editlen]
+        cmp ebx, 127
+        jae .k
+        lea rdi, [editbuf]
+        mov [rdi + rbx], al
+        mov byte [rdi + rbx + 1], 0
+        inc dword [editlen]
+        mov ecx, eax
+        call putc16
+        jmp .k
+    .bs:
+        mov ebx, [editlen]
+        test ebx, ebx
+        jz .k
+        dec ebx
+        mov [editlen], ebx
+        lea rdi, [editbuf]
+        mov byte [rdi + rbx], 0
+        mov ecx, 8
+        call putc16
+        mov ecx, 32
+        call putc16
+        mov ecx, 8
+        call putc16
+        jmp .k
+    .accept:
+        lea rax, [editbuf]
+        mov [cmdptr], rax
+        add rsp, 56
+        pop r12
+        pop rdi
+        pop rsi
+        pop rbx
+        clc
+        ret
+    .cancel:
+        add rsp, 56
+        pop r12
+        pop rdi
+        pop rsi
+        pop rbx
+        stc
+        ret
+
     puts:                               ; rdx = UTF-16 string
         sub rsp, 56
         mov rax, [systab]
@@ -519,6 +912,10 @@ export func build(elf, info, cmdline, elf64):
         add rsp, 56
         ret
     
+    """ .. sha256_asm.text() .. """
+    align 8
+    shactx: times """ .. to_string(sha256_asm.CTX_SIZE) .. """ db 0
+    khash: """ .. dd_words(sha256_asm.words(hash.sha256(kbin))) .. """
     align 8
     image: dq 0
     systab: dq 0
@@ -567,8 +964,33 @@ export func build(elf, info, cmdline, elf64):
     msg_kbuf: """ .. u16s("Sprint loader: cannot allocate the file buffer\r\n") .. """
     msg_low: """ .. u16s("Sprint loader: cannot allocate low memory\r\n") .. """
     msg_file: """ .. u16s("Sprint loader: cannot read SPRINTOS.BIN\r\n") .. """
+    msg_hash: """ .. u16s("Sprint loader: SPRINTOS.BIN does not match the hash this loader was built with - refusing to boot\r\n") .. """
     msg_mm: """ .. u16s("Sprint loader: GetMemoryMap failed\r\n") .. """
-    cmdline: """ .. db_string(cmdline) .. """
+    wname_secureboot: """ .. u16s("SecureBoot") .. """
+    wmsg_title: """ .. u16s("Sprint OS boot menu\r\n\r\n") .. """
+    wmsg_help: """ .. u16s("\r\n  Up/Down or 1-9: select   Enter: boot   e: edit the command line\r\n") .. """
+    wmsg_locked: """ .. u16s("  (Secure Boot is on: the command line cannot be edited)\r\n") .. """
+    wmsg_count1: """ .. u16s("\r\n  Booting the selected entry in ") .. """
+    wmsg_count2: """ .. u16s(" s (any key stops the countdown)\r\n") .. """
+    wmsg_edit: """ .. u16s("\r\n  command line (Enter: boot, Esc: back): ") .. """
+    wmsg_crlf: """ .. u16s("\r\n") .. """
+    guid_global: db 0x61, 0xdf, 0xe4, 0x8b, 0xca, 0x93, 0xd2, 0x11, 0xaa, 0x0d, 0x00, 0xe0, 0x98, 0x03, 0x2b, 0x8c
+    cmdptr: dq 0
+    varsize: dq 0
+    vardata: dq 0
+    locked: db 0
+    counting: db 0
+    align 4
+    sel: dd 0
+    ticks: dd 0
+    editlen: dd 0
+    numtmp: dd 0
+    keybuf: dd 0
+    chbuf: dd 0
+    editbuf: times 132 db 0
+    abuf: times 270 db 0
+    """ .. boot_menu.data(menu, true) .. """
+    align 8
     align 8
     ktable:
     """ .. ktable .. """

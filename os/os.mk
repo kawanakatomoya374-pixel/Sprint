@@ -83,24 +83,27 @@ $(OSB)/sprintos-test.iso: $(OSB)/kernel.elf os/boot/grub-test.cfg
 	cp os/boot/grub-test.cfg $(OSB)/isot/boot/grub/grub.cfg
 	grub-mkrescue -o $@ $(OSB)/isot >/dev/null 2>&1
 
+# the boot menu of the user-facing images (see os/boot/boot_menu.sp): TIMEOUT;label|command line;...   Test images use one fixed command line.
+OS_MENU  := 3;Sprint OS desktop|init=boot;Sprint OS self-test (serial log)|init=init;Sprint OS desktop, quiet (no serial log)|init=boot quiet
+
 # ---- the same kernel booted by the bootloader written in Sprint (os/boot/sprintboot.sp): a raw disk image, no GRUB ----
-$(OSB)/sprintos.img: $(OSB)/kernel.elf os/boot/sprintboot.sp stdlib/asm.sp $(BUILD)/sprint
-	$(BUILD)/sprint run --allow-read=$(OSB) --allow-write=$(OSB) os/boot/sprintboot.sp $(OSB)/kernel32.elf $@ "init=boot"
-$(OSB)/sprintos-test.img: $(OSB)/kernel.elf os/boot/sprintboot.sp stdlib/asm.sp $(BUILD)/sprint
+$(OSB)/sprintos.img: $(OSB)/kernel.elf os/boot/sprintboot.sp os/boot/bios_loader.sp os/boot/elf32.sp os/boot/boot_menu.sp stdlib/asm.sp $(BUILD)/sprint
+	$(BUILD)/sprint run --allow-read=$(OSB) --allow-write=$(OSB) os/boot/sprintboot.sp $(OSB)/kernel32.elf $@ '$(OS_MENU)'
+$(OSB)/sprintos-test.img: $(OSB)/kernel.elf os/boot/sprintboot.sp os/boot/bios_loader.sp os/boot/elf32.sp os/boot/boot_menu.sp stdlib/asm.sp $(BUILD)/sprint
 	$(BUILD)/sprint run --allow-read=$(OSB) --allow-write=$(OSB) os/boot/sprintboot.sp $(OSB)/kernel32.elf $@ "init=init"
 
 # ---- UEFI: a GPT disk image with an EFI System Partition, loader and image generator written in Sprint (os/boot/uefiboot.sp) ----
 # the kernel is relocatable (kernel.elf keeps its relocations): the loader picks a free block, the table comes from the 64-bit kernel.elf
-UEFI_SP  := os/boot/uefiboot.sp os/boot/uefi_loader.sp os/boot/elf32.sp os/boot/uefi_pe.sp os/boot/diskimg.sp stdlib/asm.sp
+UEFI_SP  := os/boot/uefiboot.sp os/boot/uefi_loader.sp os/boot/elf32.sp os/boot/uefi_pe.sp os/boot/diskimg.sp os/boot/boot_menu.sp os/boot/sha256_asm.sp os/boot/authenticode.sp os/boot/bn.sp os/boot/der.sp stdlib/asm.sp
 $(OSB)/sprintos-uefi.img: $(OSB)/kernel.elf $(UEFI_SP) $(BUILD)/sprint
-	$(BUILD)/sprint run --allow-read=$(OSB) --allow-write=$(OSB) os/boot/uefiboot.sp $(OSB)/kernel32.elf $@ "init=boot" $(OSB)/kernel.elf
+	$(BUILD)/sprint run --allow-read=$(OSB) --allow-write=$(OSB) os/boot/uefiboot.sp $(OSB)/kernel32.elf $@ '$(OS_MENU)' $(OSB)/kernel.elf
 $(OSB)/sprintos-uefi-test.img: $(OSB)/kernel.elf $(UEFI_SP) $(BUILD)/sprint
 	$(BUILD)/sprint run --allow-read=$(OSB) --allow-write=$(OSB) os/boot/uefiboot.sp $(OSB)/kernel32.elf $@ "init=init" $(OSB)/kernel.elf
 
 # ---- hybrid: one disk image that boots under BIOS and under UEFI (os/boot/hybridboot.sp) ----
-HYBRID_SP := os/boot/hybridboot.sp os/boot/bios_loader.sp os/boot/uefi_loader.sp os/boot/elf32.sp os/boot/uefi_pe.sp os/boot/diskimg.sp stdlib/asm.sp
+HYBRID_SP := os/boot/hybridboot.sp os/boot/bios_loader.sp os/boot/uefi_loader.sp os/boot/elf32.sp os/boot/uefi_pe.sp os/boot/diskimg.sp os/boot/boot_menu.sp os/boot/sha256_asm.sp os/boot/authenticode.sp os/boot/bn.sp os/boot/der.sp stdlib/asm.sp
 $(OSB)/sprintos-hybrid.img: $(OSB)/kernel.elf $(HYBRID_SP) $(BUILD)/sprint
-	$(BUILD)/sprint run --allow-read=$(OSB) --allow-write=$(OSB) os/boot/hybridboot.sp $(OSB)/kernel32.elf $@ "init=boot" $(OSB)/kernel.elf
+	$(BUILD)/sprint run --allow-read=$(OSB) --allow-write=$(OSB) os/boot/hybridboot.sp $(OSB)/kernel32.elf $@ '$(OS_MENU)' $(OSB)/kernel.elf
 $(OSB)/sprintos-hybrid-test.img: $(OSB)/kernel.elf $(HYBRID_SP) $(BUILD)/sprint
 	$(BUILD)/sprint run --allow-read=$(OSB) --allow-write=$(OSB) os/boot/hybridboot.sp $(OSB)/kernel32.elf $@ "init=init" $(OSB)/kernel.elf
 
@@ -143,3 +146,19 @@ os-uefi-run: $(OSB)/sprintos-uefi.img
 	qemu-system-x86_64 -m 256 -bios $(OVMF) -drive format=raw,file=$< -serial stdio
 os-uefi-test: $(OSB)/sprintos-uefi-test.img $(OSB)/sprintos-uefi.img
 	SPRINT_OVMF=$(OVMF) python3 os/tests/qemu_test.py $(OSB)/sprintos-uefi-test.img $(OSB)/sprintos-uefi.img
+
+# Secure Boot (needs qemu, the OVMF firmware with Secure Boot, openssl, virt-fw-vars (pip install virt-firmware) and sbverify (sbsigntool)):
+# the loader is signed by the Sprint signer, enforced by the firmware; see os/tests/secureboot_test.py
+os-secureboot-test: $(OSB)/kernel.elf $(UEFI_SP) $(BUILD)/sprint
+	python3 os/tests/secureboot_test.py
+# a signed hybrid image with throw-away keys (TEST KEYS ONLY: generate your own for real use):  make os-secureboot-image
+os-secureboot-image: $(OSB)/kernel.elf $(HYBRID_SP) $(BUILD)/sprint
+	@mkdir -p $(OSB)/keys
+	@[ -f $(OSB)/keys/sprintos.key ] || openssl req -new -x509 -newkey rsa:2048 -nodes -keyout $(OSB)/keys/sprintos.key -out $(OSB)/keys/sprintos.crt -days 3650 -subj "/CN=Sprint OS test signing key/" -sha256
+	$(BUILD)/sprint run --allow-read=$(OSB) --allow-write=$(OSB) os/boot/hybridboot.sp $(OSB)/kernel32.elf $(OSB)/sprintos-hybrid-signed.img '$(OS_MENU)' $(OSB)/kernel.elf $(OSB)/keys/sprintos.key $(OSB)/keys/sprintos.crt
+.PHONY: os-secureboot-test os-secureboot-image
+
+# the boot menu of the BIOS loader, the UEFI loader and the hybrid image (keys sent to the menu through the QEMU monitor)
+os-menu-test: $(OSB)/kernel.elf os/boot/sprintboot.sp os/boot/bios_loader.sp $(UEFI_SP) $(HYBRID_SP) $(BUILD)/sprint
+	python3 os/tests/menu_test.py
+.PHONY: os-menu-test

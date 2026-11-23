@@ -39,9 +39,12 @@ enum { LOG_SIZE = 64 * 1024 };
 static char g_log[LOG_SIZE];
 static uint64_t g_log_end;
 
+/* the boot menu's `quiet` option: no output on the serial port (the in-memory log is kept; panics and exceptions switch it back on) */
+static int g_quiet;
 void serial_write(const char *s, size_t n) {
     for (size_t i = 0; i < n; i++) {
         g_log[g_log_end++ % LOG_SIZE] = s[i];
+        if (g_quiet) continue;
         for (int spin = 0; spin < 100000 && !(inb(0x3FD) & 0x20); spin++) {}
         outb(0x3F8, (uint8_t)s[i]);
     }
@@ -66,6 +69,7 @@ static void put_hex(uint64_t v) {
 }
 
 void exception_report(uint64_t vec, uint64_t err, uint64_t rip, uint64_t cr2) {
+    g_quiet = 0;
     serial_puts("\n*** CPU exception ");
     put_hex(vec);
     serial_puts(" err=");
@@ -79,6 +83,7 @@ void exception_report(uint64_t vec, uint64_t err, uint64_t rip, uint64_t cr2) {
 }
 
 void kpanic(const char *msg) {
+    g_quiet = 0;
     serial_puts("\nkernel panic: ");
     serial_puts(msg);
     serial_puts("\n");
@@ -356,7 +361,16 @@ static void parse_boot_info(uint64_t mbi) {
     const MbTag *t = (const MbTag *)(uintptr_t)(mbi + 8);
     while (t->type != 0) {
         const uint8_t *p = (const uint8_t *)t;
-        if (t->type == 1) g_cmdline = (const char *)(p + 8);
+        if (t->type == 1) {
+            g_cmdline = (const char *)(p + 8);
+            for (const char *w = g_cmdline; *w;) {   /* the `quiet` word */
+                while (*w == ' ') w++;
+                const char *e = w;
+                while (*e && *e != ' ') e++;
+                if (e - w == 5 && memcmp(w, "quiet", 5) == 0) g_quiet = 1;
+                w = e;
+            }
+        }
         if (t->type == 14 || t->type == 15) g_rsdp = (uint64_t)(uintptr_t)(p + 8);
         if (t->type == 8) {
             g_fb.addr = *(const uint64_t *)(p + 8);
@@ -455,10 +469,10 @@ static int os_main(int argc, char **argv, char **envp) {
 void kmain(uint64_t mbi);
 void kmain(uint64_t mbi) {
     serial_init();
-    serial_puts("[kernel] Sprint OS booting\n");
     cpu_init(0);
     clock_init();
     parse_boot_info(mbi);
+    serial_puts("[kernel] Sprint OS booting\n");
     carve_user_memory();
     {
         char b[128];

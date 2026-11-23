@@ -750,3 +750,42 @@ void lib_ext_free(VM *vm) {
     vm->allow_read = vm->allow_write = NULL;
     vm->n_allow_read = vm->n_allow_write = 0;
 }
+
+/* ---- hash: digests of byte data (a string, an array of bytes 0..255 or a typed.u8); the result is a typed.u8 ---- */
+static int hash_bytes_of(VM *vm, SpValue v, unsigned char **buf, size_t *len) {
+    if (v.type == T_STRING) {
+        *len = AS_STR(v)->len;
+        *buf = malloc(*len ? *len : 1);
+        if (!*buf) return vm_set_error(vm, E_MEMORY, "out of memory");
+        if (*len) memcpy(*buf, AS_STR(v)->dp, *len);
+        return 0;
+    }
+    int64_t n = 0;
+    int is_arr = v.type == T_ARRAY;
+    if (is_arr) n = AS_ARRAY(v)->len;
+    else if (v.type == T_NATIVE && typed_kind(v) >= 0 && typed_kind(v) <= 8) n = typed_len(v);
+    else return vm_set_error(vm, E_TYPE, "hash needs a string, an array of bytes or a typed array, not %s", type_name(v));
+    *len = (size_t)n;
+    *buf = malloc(*len ? *len : 1);
+    if (!*buf) return vm_set_error(vm, E_MEMORY, "out of memory");
+    for (int64_t i = 0; i < n; i++) {
+        SpValue e;
+        if (is_arr) e = array_get(AS_ARRAY(v), i);
+        else if (!typed_peek(v, v_int(i), &e)) e = v_nil();
+        if (e.type != T_INT || e.as.i < 0 || e.as.i > 255) { free(*buf); return vm_set_error(vm, E_VALUE, "byte %lld is not an int in 0..255", (long long)i); }
+        (*buf)[i] = (unsigned char)e.as.i;
+    }
+    return 0;
+}
+static int hash_sha256(VM *vm, int argc, SpValue *argv, SpValue *ret) {
+    (void)argc;
+    unsigned char *b = NULL;
+    size_t n = 0;
+    if (hash_bytes_of(vm, argv[0], &b, &n)) return 1;
+    uint8_t d[32];
+    sp_sha256(b, n, d);
+    free(b);
+    *ret = typed_u8_from(vm, d, 32);
+    return 0;
+}
+const NativeDesc lib_hash_fns[] = {{"sha256", 1, 1, hash_sha256}, {NULL, 0, 0, NULL}};

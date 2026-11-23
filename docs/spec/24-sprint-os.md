@@ -24,6 +24,24 @@
 
 制約: 位置はファームウェア任せだが、4 GiB 未満の連続した空きブロック（約 24 MiB）が要る。Secure Boot 未対応。実機では未検証。
 
+## ブートメニュー（os/boot/boot_menu.sp）
+
+BIOS ローダーも UEFI ローダーも、カーネルを起動する前にメニューを出す（画面とシリアルポートの両方。画面は BIOS ではテキストモード、UEFI では ConOut）。メニューの内容はイメージ生成時の文字列で決める: `"TIMEOUT[/DEFAULT];ラベル|コマンドライン;..."`（`;` を含まない文字列は固定のコマンドラインで、メニューを出さずに起動する。テスト用イメージはこれ）。`make os-img` / `os-uefi` / `os-hybrid` のイメージは `OS_MENU`（既定: デスクトップ、セルフテスト、シリアルを止めたデスクトップの3項目、3秒）を使う。
+
+キー（キーボードとシリアルの両方）: ↑↓（または `k` `j`）で選択、`1`〜`9` で選んで即起動、Enter で起動、`e` でコマンドラインを編集（Enter で起動、Esc で戻る。BackSpace、印字可能文字、最大127文字）。カウントダウン中に何かキーを押すと止まる。時間切れで既定の項目が起動する。
+
+カーネルが解釈するコマンドライン: `init=NAME`（最初のユーザープログラム。既定 `boot`）と `quiet`（シリアルポートへの出力を止める。パニックと例外は出る）。シリアルコンソールの切り替えは、この `quiet` を含む項目と含まない項目をメニューに並べることで行う（メニュー自体は常に画面とシリアルの両方に出る）。`make os-menu-test` が、BIOS・UEFI・ハイブリッド（両方のファームウェア）で、数字キーによる選択、`quiet`、編集、カウントダウンを QEMU モニターのキー入力で確かめる。
+
+## Secure Boot（UEFI）
+
+UEFI ローダー（`BOOTX64.EFI`）は **Sprint 製の署名ツール**（`os/boot/authenticode.sp`、`os/boot/sbsign.sp`）で Authenticode 署名できる。鍵と証明書は外部で用意する（`openssl req -x509 -newkey rsa:2048 -nodes ...`）。署名は SHA-256 + RSA（PKCS#1 v1.5）の PKCS#7 SignedData で、イメージのハッシュ（チェックサム・証明書テーブルの項目・証明書データを除く）を `SpcIndirectDataContent` に入れ、`WIN_CERTIFICATE` として PE に付ける。RSA は `os/boot/bn.sp`（24 ビットの足、モンゴメリ乗算、中国人剰余定理）、ASN.1 / PEM は `os/boot/der.sp` で Sprint から実装し、署名の直後に公開指数で自己検証する。OpenSSL を使う `sbverify` が Sprint 製の署名を受け付けることを `make os-secureboot-test` が確かめる。
+
+信頼の連鎖: (1) ファームウェアが `db` の証明書でローダーの署名を検証する（未署名・別の鍵は `Access Denied`）。(2) ローダーはカーネルのファイル `SPRINTOS.BIN` の **SHA-256 を自分で計算**し（x86-64 アセンブリ、`os/boot/sha256_asm.sp`。ホストで `os/boot/test_sha256.sp` がネイティブの `hash.sha256` と突き合わせる）、**署名されたローダーイメージの中に埋め込んだハッシュ**と比べ、違えば起動を拒否する（署名されたローダーが、そのカーネルだけを起動する）。(3) `SecureBoot` 変数が 1 のとき、メニューはコマンドラインの編集を許さない（選べるのはイメージ生成時に署名の中へ入れた項目だけ）。
+
+`make os-secureboot-test`（要: OVMF の Secure Boot 版、`openssl`、`virt-fw-vars`（`pip install virt-firmware`）、`sbverify`（`sbsigntool`）、q35 + SMM の QEMU）は、鍵を作って OVMF の PK / KEK / db に登録し、次を確かめる: 署名したローダーが起動する、未署名と別の鍵はファームウェアが拒否する、カーネルを1バイト変えると署名済みローダーが拒否する、Secure Boot が有効ならメニューの編集ができず無効なら編集できる。`make os-secureboot-image` は、使い捨ての鍵で署名したハイブリッドイメージを作る（**テスト用の鍵**。実用には自分の鍵を使うこと。鍵の登録はファームウェアの設定か `virt-fw-vars` で行う）。
+
+制約: BIOS 経路には Secure Boot はない。鍵の生成と登録は外部ツール任せ（Sprint が行うのは署名と検証）。署名アルゴリズムは SHA-256 + RSA のみ。Microsoft の証明書による署名（shim 経由）や、カーネル自体の署名は扱わない（カーネルはローダーに埋め込んだハッシュで守る）。実機では未検証。
+
 ## ハイブリッドイメージ（os/boot/hybridboot.sp、`make os-hybrid`）
 
 `build/os/sprintos-hybrid.img` は **1本のディスクで BIOS と UEFI の両方から起動する**（イメージ生成・両方のローダーとも Sprint 製）。

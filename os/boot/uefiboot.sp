@@ -10,7 +10,8 @@
 # Multiboot2 entry (eax = 0x36d76289, ebx = the information structure) - the convention the GRUB and BIOS paths use, so the kernel
 # is unchanged. The code is in uefi_loader.sp (shared with the hybrid image, hybridboot.sp).
 #
-# usage: sprint run --allow-read=DIR --allow-write=DIR os/boot/uefiboot.sp KERNEL32.ELF OUT.IMG "kernel command line" KERNEL64.ELF
+# usage: sprint run --allow-read=DIR --allow-write=DIR os/boot/uefiboot.sp KERNEL32.ELF OUT.IMG "command line or menu spec" KERNEL64.ELF [KEY.pem CERT.pem]
+import authenticode
 import diskimg
 import elf32
 import fs
@@ -24,11 +25,14 @@ let elf = fs.read_bytes(kernel_path)
 let info = elf32.parse(elf, kernel_path)
 let elf64 = fs.read_bytes(sys.args[3])      # the 64-bit kernel.elf (relocations)
 let u = uefi_loader.build(elf, info, cmdline, elf64)
+let efi = u.efi
+if len(sys.args) > 5:       # KEY.pem CERT.pem: sign the loader for Secure Boot (authenticode.sp)
+    efi = authenticode.sign(u.efi, fs.read_file(sys.args[4]), fs.read_file(sys.args[5]))
 let d = diskimg.Disk(81920)
 let efi_dir = d.mkdir(d.root, "EFI")
 let boot_dir = d.mkdir(efi_dir, "BOOT")
-d.write_file(boot_dir, "BOOTX64.EFI", u.efi)
+d.write_file(boot_dir, "BOOTX64.EFI", efi)
 d.write_file(d.root, "SPRINTOS.BIN", u.kbin)
 let img = d.finish()
 fs.write_bytes(out_path, img)
-print("sprint uefi loader: BOOTX64.EFI " .. to_string(len(u.efi)) .. " bytes, " .. to_string(u.nsegs) .. " segments (" .. to_string(u.kbin_size) .. " bytes), disk " .. to_string(len(img)) .. " bytes")
+print("sprint uefi loader: BOOTX64.EFI " .. to_string(len(efi)) .. " bytes, " .. to_string(u.nsegs) .. " segments (" .. to_string(u.kbin_size) .. " bytes), disk " .. to_string(len(img)) .. " bytes")

@@ -1,0 +1,152 @@
+#!/usr/bin/env python3
+"""Secure Boot and boot-menu checks for the Sprint OS UEFI loader (needs qemu, OVMF with Secure Boot, openssl and virt-fw-vars).
+usage: python3 os/tests/secureboot_test.py   (run from the repository root, after `make build/os/kernel.elf`)
+
+What it proves, with the real firmware doing the enforcing (OVMF in user mode with our key enrolled as PK / KEK / db):
+  - a loader signed by the Sprint signer (os/boot/authenticode.sp) boots; sbverify (OpenSSL based) accepts the signature too
+  - the same loader unsigned, or signed with another key, is refused by the firmware (Access Denied)
+  - a signed loader refuses a kernel file that differs from the one it was built with (the hash lives inside the signed image)
+  - with Secure Boot on the boot menu does not allow editing the command line; with it off, it does
+"""
+import os, shutil, socket, subprocess, sys, tempfile, time
+
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+SPRINT = os.path.join(ROOT, "build/sprint")
+OSB = os.path.join(ROOT, "build/os")
+CODE = "/usr/share/OVMF/OVMF_CODE_4M.secboot.fd"
+VARS = "/usr/share/OVMF/OVMF_VARS_4M.fd"
+OVMF = "/usr/share/ovmf/OVMF.fd"
+fails = []
+
+def check(cond, what):
+    print(("ok   " if cond else "FAIL ") + what, flush=True)
+    if not cond:
+        fails.append(what)
+
+def need(tool):
+    if shutil.which(tool) is None:
+        print("secureboot-test: %s not found, skipped" % tool)
+        sys.exit(0)
+
+for t in ("qemu-system-x86_64", "openssl", "virt-fw-vars", "sbverify"):
+    need(t)
+for f in (CODE, VARS, OVMF, os.path.join(OSB, "kernel.elf"), os.path.join(OSB, "kernel32.elf")):
+    if not os.path.exists(f):
+        print("secureboot-test: %s missing, skipped" % f)
+        sys.exit(0)
+
+wd = tempfile.mkdtemp(prefix="sprint-sb-")
+def sh(*a, **k):
+    return subprocess.run(a, check=True, capture_output=True, text=True, **k)
+
+def genkey(name):
+    sh("openssl", "req", "-new", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", f"{wd}/{name}.key", "-out", f"{wd}/{name}.crt", "-days", "3650",
+       "-subj", f"/CN=Sprint OS test key {name} (not for production)/", "-sha256")
+genkey("good")
+genkey("other")
+GUID = "11111111-2222-3333-4444-555555555555"
+sh("virt-fw-vars", "--input", VARS, "--output", f"{wd}/vars.fd", "--set-pk", GUID, f"{wd}/good.crt", "--add-kek", GUID, f"{wd}/good.crt",
+   "--add-db", GUID, f"{wd}/good.crt", "--secure-boot")
+
+def build(out, spec, key=None):
+    args = [SPRINT, "run", f"--allow-read={OSB}", f"--allow-read={wd}", f"--allow-write={wd}", os.path.join(ROOT, "os/boot/uefiboot.sp"), os.path.join(OSB, "kernel32.elf"),
+            f"{wd}/{out}", spec, os.path.join(OSB, "kernel.elf")]
+    if key:
+        args += [f"{wd}/{key}.key", f"{wd}/{key}.crt"]
+    subprocess.run(args, check=True, capture_output=True)
+
+def tamper(img):
+    import struct
+    with open(f"{wd}/{img}", "r+b") as f:
+        base = 2048 * 512
+        f.seek(base); bpb = f.read(512)
+        res = struct.unpack("<H", bpb[14:16])[0]; fats = bpb[16]; fsz = struct.unpack("<I", bpb[36:40])[0]
+        data = base + (res + fats * fsz) * 512
+        f.seek(data); root = f.read(512)
+        for i in range(0, 512, 32):
+            if root[i:i + 11] == b"SPRINTOSBIN":
+                cl = struct.unpack("<H", root[i + 26:i + 28])[0]
+                off = data + (cl - 2) * 512 + 100000
+                f.seek(off); b = f.read(1); f.seek(off); f.write(bytes([b[0] ^ 0xff]))
+                return
+    raise SystemExit("SPRINTOS.BIN not found in the image")
+
+def run(img, secure, keys=(), until=None, timeout=90, quiet_after=2.0):
+    """Boots `img`; sends (delay, key) pairs through the monitor; stops when `until` appears in the serial log (or on timeout). Returns the log."""
+    ser = f"{wd}/serial.log"; mon = f"{wd}/mon.sock"
+    for f in (ser, mon):
+        if os.path.exists(f):
+            os.remove(f)
+    shutil.copy(f"{wd}/vars.fd", f"{wd}/vars-run.fd")
+    if secure:
+        fw = ["-machine", "q35,smm=on", "-global", "driver=cfi.pflash01,property=secure,value=on",
+              "-drive", f"if=pflash,format=raw,unit=0,file={CODE},readonly=on", "-drive", f"if=pflash,format=raw,unit=1,file={wd}/vars-run.fd"]
+    else:
+        fw = ["-bios", OVMF]
+    q = subprocess.Popen(["qemu-system-x86_64", "-m", "256", *fw, "-drive", f"format=raw,file={wd}/{img}", "-display", "none", "-no-reboot",
+                          "-serial", "file:" + ser, "-monitor", f"unix:{mon},server,nowait"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        for _ in range(200):
+            if os.path.exists(mon):
+                break
+            time.sleep(0.1)
+        time.sleep(0.5)
+        s = socket.socket(socket.AF_UNIX); s.connect(mon); s.settimeout(5); time.sleep(0.3); s.recv(4096)
+        t0 = time.time()
+        pending = sorted(keys)
+        def log():
+            return open(ser, errors="replace").read() if os.path.exists(ser) else ""
+        while time.time() - t0 < timeout:
+            while pending and time.time() - t0 >= pending[0][0]:
+                s.send(("sendkey " + pending.pop(0)[1] + "\n").encode()); time.sleep(0.3)
+            if until and until in log():
+                break
+            time.sleep(0.3)
+        time.sleep(quiet_after)
+        return log()
+    finally:
+        q.kill(); q.wait()
+
+# ---- images ----------------------------------------------------------------------------------------------------------
+build("signed.img", "init=init", "good")
+build("unsigned.img", "init=init")
+build("other.img", "init=init", "other")
+build("tampered.img", "init=init", "good"); tamper("tampered.img")
+MENU = "40;Sprint OS desktop|init=boot;Self-test|init=init;Quiet|init=boot quiet"
+build("menu-signed.img", MENU, "good")
+build("menu-plain.img", MENU)
+
+# the signature as an independent implementation (OpenSSL via sbverify) sees it
+efi = f"{wd}/BOOTX64.EFI"
+img = open(f"{wd}/signed.img", "rb").read()
+subprocess.run(["mcopy", "-n", "-i", f"{wd}/signed.img@@{2048 * 512}", "::/EFI/BOOT/BOOTX64.EFI", efi], check=True, capture_output=True)
+r = subprocess.run(["sbverify", "--cert", f"{wd}/good.crt", efi], capture_output=True, text=True)
+check(r.returncode == 0 and "OK" in r.stdout, "sbverify (OpenSSL) accepts the signature made by the Sprint signer")
+r = subprocess.run(["sbverify", "--cert", f"{wd}/other.crt", efi], capture_output=True, text=True)
+check(r.returncode != 0, "sbverify rejects it against another certificate")
+
+# ---- Secure Boot on -------------------------------------------------------------------------------------------------------
+log = run("signed.img", True, until="init: done", timeout=120)
+check("init: done" in log and "[kernel] Sprint OS booting" in log, "Secure Boot on: the loader signed by Sprint is accepted and the kernel boots")
+log = run("unsigned.img", True, until="Access Denied", timeout=60)
+check("Access Denied" in log and "[kernel]" not in log, "Secure Boot on: an unsigned loader is refused by the firmware")
+log = run("other.img", True, until="Access Denied", timeout=60)
+check("Access Denied" in log and "[kernel]" not in log, "Secure Boot on: a loader signed with another key is refused")
+log = run("tampered.img", True, until="refusing to boot", timeout=90)
+check("refusing to boot" in log and "[kernel]" not in log, "Secure Boot on: a signed loader refuses a modified kernel file")
+log = run("menu-signed.img", True, keys=[(14, "e")], until="Secure Boot is on", timeout=60, quiet_after=3)
+check("Secure Boot is on" in log and "command line (Enter: boot" not in log, "Secure Boot on: the menu does not allow editing the command line")
+log = run("menu-signed.img", True, keys=[(14, "e"), (16, "2")], until="init: done", timeout=120)
+check("first process: init" in log and "init: done" in log, "Secure Boot on: the menu still selects an entry (the self-test)")
+
+# ---- Secure Boot off ----------------------------------------------------------------------------------------------------------
+log = run("menu-plain.img", False, keys=[(10, "e")], until="command line (Enter: boot", timeout=60, quiet_after=3)
+check("command line (Enter: boot" in log and "Secure Boot is on" not in log, "Secure Boot off: the menu allows editing the command line")
+log = run("unsigned.img", False, until="init: done", timeout=120)
+check("init: done" in log, "Secure Boot off: the unsigned loader boots")
+
+shutil.rmtree(wd, ignore_errors=True)
+if fails:
+    print("FAILED:", fails)
+    sys.exit(1)
+print("all Secure Boot checks passed")

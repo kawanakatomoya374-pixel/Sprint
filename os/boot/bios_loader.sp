@@ -1,11 +1,12 @@
 # bios_loader: the Sprint OS BIOS bootloader (see sprintboot.sp for the description), as a module so that the plain BIOS image and
 # the hybrid BIOS + UEFI image share it.
 #
-#   let b = bios_loader.build(elf_bytes, info, "init=boot", lba0)
+#   let b = bios_loader.build(elf_bytes, info, "init=boot", lba0)     # a command line, or a menu spec (see boot_menu.sp)
 #   b.stage1      machine code for the MBR (<= 446 bytes, no partition table, no signature); reads stage 2 from LBA lba0
 #   b.blob        stage 2 padded to STAGE2_SECTORS sectors, then every kernel segment on a sector boundary (this goes to LBA lba0..)
 #   b.sectors     the size of the blob in sectors
 import asm
+import boot_menu
 import typed
 
 export const STAGE2_SECTORS = 8
@@ -17,6 +18,7 @@ func db_string(s):
     return "db " .. parts.join(", ") .. ", 0"
 
 export func build(elf, info, cmdline, lba0):
+    let menu = boot_menu.parse(cmdline)
     let entry = info.entry
     let segs = []
     for s in info.segs:
@@ -67,7 +69,6 @@ export func build(elf, info, cmdline, lba0):
     """
     
     # ---- stage 2 ----------------------------------------------------------------------------------------
-    let cmd_tag = 8 + len(cmdline) + 1
     let stage2 = """
     bits 16
     org 0x8000
@@ -86,6 +87,10 @@ export func build(elf, info, cmdline, lba0):
         or al, 2
         and al, 0xfe
         out 0x92, al
+        cmp byte [menu_on], 0
+        je .nomenu
+        call run_menu
+    .nomenu:
     
         ; ---- VBE: a 1024x768x32 linear framebuffer ----
         mov ax, 0x4000
@@ -205,10 +210,22 @@ export func build(elf, info, cmdline, lba0):
         mov dword [es:di], 0
         mov dword [es:di + 4], 0
         add di, 8
-        mov dword [es:di], 1            ; command line
-        mov dword [es:di + 4], """ .. to_string(cmd_tag) .. """
-        mov si, cmdline
-        mov cx, """ .. to_string(len(cmdline) + 1) .. """
+        mov dword [es:di], 1            ; command line (the chosen entry or the edited text)
+        mov si, [cmdptr]
+        mov bx, si
+    .cl:
+        cmp byte [bx], 0
+        je .cle
+        inc bx
+        jmp .cl
+    .cle:
+        sub bx, si                      ; length
+        lea ax, [bx + 9]
+        mov dx, ax                      ; tag size = 8 + length + 1
+        movzx eax, ax
+        mov [es:di + 4], eax
+        mov cx, bx
+        inc cx
         push di
         add di, 8
     .cpcmd:
@@ -218,7 +235,10 @@ export func build(elf, info, cmdline, lba0):
         inc di
         loop .cpcmd
         pop di
-        add di, """ .. to_string((cmd_tag + 7) // 8 * 8) .. """
+        mov ax, dx
+        add ax, 7
+        and ax, 0xfff8
+        add di, ax
         mov bp, di                      ; memory map: E820, 24-byte entries
         mov dword [es:di], 6
         mov dword [es:di + 8], 24
@@ -379,16 +399,284 @@ export func build(elf, info, cmdline, lba0):
         jmp dword 0x08:pm_entry
     
     ; ---- helpers (real mode) ----
-    puts:
-        lodsb
-        test al, al
-        jz .d
-        mov ah, 0x0e
-        xor bx, bx
-        int 0x10
-        jmp puts
-    .d: ret
-    
+        puts:                               ; si -> zero-terminated string, to the screen and COM1
+            lodsb
+            test al, al
+            jz .d
+            call putc
+            jmp puts
+        .d: ret
+
+        putc:                               ; al -> the screen (BIOS teletype) and COM1; every register is kept
+            pusha
+            mov ah, 0x0e
+            xor bx, bx
+            int 0x10
+            popa
+            pusha
+            mov bl, al
+            mov dx, 0x3fd
+            mov cx, 30000
+        .w: in al, dx
+            test al, 0x20
+            jnz .s
+            loop .w
+        .s: mov dx, 0x3f8
+            mov al, bl
+            out dx, al
+            popa
+            ret
+
+        getkey:                             ; ax = key (ah = scan code, al = ASCII) from the keyboard or COM1; 0 when there is none
+            mov ah, 1
+            int 0x16
+            jz .serial
+            xor ah, ah
+            int 0x16
+            ret
+        .serial:
+            mov dx, 0x3fd
+            in al, dx
+            test al, 1
+            jz .none
+            mov dx, 0x3f8
+            in al, dx
+            xor ah, ah
+            ret
+        .none:
+            xor ax, ax
+            ret
+
+        sleep100:                           ; 100 ms
+            pusha
+            mov ah, 0x86
+            mov cx, 1
+            mov dx, 0x86a0
+            int 0x15
+            popa
+            ret
+
+        putnum:                             ; ax (0..99) in decimal
+            pusha
+            xor dx, dx
+            mov bx, 10
+            div bx
+            test ax, ax
+            jz .u
+            add al, 48
+            call putc
+        .u: mov al, dl
+            add al, 48
+            call putc
+            popa
+            ret
+
+        draw_menu:
+            mov ax, 3                       ; 80x25 text mode (clears the screen)
+            int 0x10
+            mov si, msg_menu_title
+            call puts
+            xor cx, cx
+        .e: cmp cx, [menu_count]
+            jae .done
+            mov al, 32
+            cmp cx, [sel]
+            jne .n
+            mov al, 62
+        .n: call putc
+            mov al, 32
+            call putc
+            mov al, cl
+            add al, 49
+            call putc
+            mov al, 46
+            call putc
+            mov al, 32
+            call putc
+            mov bx, cx
+            shl bx, 2
+            mov si, [menu_tab + bx]
+            call puts
+            mov si, msg_crlf
+            call puts
+            inc cx
+            jmp .e
+        .done:
+            mov si, msg_menu_help
+            call puts
+            cmp byte [counting], 0
+            je .r
+            mov si, msg_countdown
+            call puts
+            mov ax, [ticks]
+            add ax, 9
+            xor dx, dx
+            mov bx, 10
+            div bx
+            call putnum
+            mov si, msg_countdown2
+            call puts
+        .r: ret
+
+        run_menu:
+            mov ax, [menu_default]
+            mov [sel], ax
+            mov byte [counting], 0
+            mov ax, [menu_timeout]
+            test ax, ax
+            jz .redraw
+            mov bx, 10
+            mul bx
+            mov [ticks], ax
+            mov byte [counting], 1
+        .redraw:
+            call draw_menu
+        .poll:
+            call getkey
+            test ax, ax
+            jnz .key
+            call sleep100
+            cmp byte [counting], 0
+            je .poll
+            dec word [ticks]
+            jz .boot
+            mov ax, [ticks]
+            xor dx, dx
+            mov bx, 10
+            div bx
+            test dx, dx
+            jnz .poll
+            jmp .redraw
+        .key:
+            mov byte [counting], 0
+            cmp ah, 0x48
+            je .up
+            cmp ah, 0x50
+            je .down
+            cmp al, 107                     ; 'k' / 'j' for terminals
+            je .up
+            cmp al, 106
+            je .down
+            cmp al, 13
+            je .boot
+            cmp al, 10
+            je .boot
+            cmp al, 101                     ; 'e'
+            je .edit
+            cmp al, 69
+            je .edit
+            cmp al, 49
+            jb .redraw
+            cmp al, 57
+            ja .redraw
+            sub al, 49
+            xor ah, ah
+            cmp ax, [menu_count]
+            jae .redraw
+            mov [sel], ax
+            jmp .boot
+        .up:
+            mov ax, [sel]
+            test ax, ax
+            jz .redraw
+            dec ax
+            mov [sel], ax
+            jmp .redraw
+        .down:
+            mov ax, [sel]
+            inc ax
+            cmp ax, [menu_count]
+            jae .redraw
+            mov [sel], ax
+            jmp .redraw
+        .edit:
+            call edit_cmdline
+            jc .redraw
+            ret
+        .boot:
+            mov bx, [sel]
+            shl bx, 2
+            mov ax, [menu_tab + bx + 2]
+            mov [cmdptr], ax
+            ret
+
+        edit_cmdline:                       ; CF set: cancelled; clear: cmdptr -> the edited text
+            mov bx, [sel]
+            shl bx, 2
+            mov si, [menu_tab + bx + 2]
+            mov di, editbuf
+            xor cx, cx
+        .cp:
+            lodsb
+            test al, al
+            jz .cpd
+            cmp cx, 127
+            jae .cpd
+            mov [di], al
+            inc di
+            inc cx
+            jmp .cp
+        .cpd:
+            mov byte [di], 0
+            mov [editlen], cx
+            mov si, msg_edit
+            call puts
+            mov si, editbuf
+            call puts
+        .k: call getkey
+            test ax, ax
+            jnz .got
+            call sleep100
+            jmp .k
+        .got:
+            cmp al, 27
+            je .cancel
+            cmp al, 13
+            je .accept
+            cmp al, 10
+            je .accept
+            cmp al, 8
+            je .bs
+            cmp al, 127
+            je .bs
+            cmp al, 32
+            jb .k
+            cmp al, 126
+            ja .k
+            mov cx, [editlen]
+            cmp cx, 127
+            jae .k
+            mov bx, editbuf
+            add bx, cx
+            mov [bx], al
+            mov byte [bx + 1], 0
+            inc word [editlen]
+            call putc
+            jmp .k
+        .bs:
+            mov cx, [editlen]
+            test cx, cx
+            jz .k
+            dec cx
+            mov [editlen], cx
+            mov bx, editbuf
+            add bx, cx
+            mov byte [bx], 0
+            mov al, 8
+            call putc
+            mov al, 32
+            call putc
+            mov al, 8
+            call putc
+            jmp .k
+        .accept:
+            mov word [cmdptr], editbuf
+            clc
+            ret
+        .cancel:
+            stc
+            ret
+
     disk_error:
         mov si, msg_err
         call puts
@@ -485,7 +773,18 @@ export func build(elf, info, cmdline, lba0):
     msg_boot: """ .. db_string("Sprint OS bootloader (Sprint)\r\n") .. """
     msg_load: """ .. db_string("loading kernel\r\n") .. """
     msg_err: """ .. db_string("disk read error\r\n") .. """
-    cmdline: """ .. db_string(cmdline) .. """
+    msg_menu_title: """ .. db_string("Sprint OS boot menu\r\n\r\n") .. """
+    msg_menu_help: """ .. db_string("\r\n  Up/Down or 1-9: select   Enter: boot   e: edit the command line\r\n") .. """
+    msg_countdown: """ .. db_string("\r\n  Booting the selected entry in ") .. """
+    msg_countdown2: """ .. db_string(" s (any key stops the countdown)\r\n") .. """
+    msg_edit: """ .. db_string("\r\n  command line (Enter: boot, Esc: back): ") .. """
+    msg_crlf: """ .. db_string("\r\n") .. """
+    sel: dw 0
+    ticks: dw 0
+    counting: db 0
+    editlen: dw 0
+    editbuf: times 132 db 0
+    """ .. boot_menu.data(menu, false) .. """
     align 4
     ktable:
     """ .. table .. """

@@ -1047,7 +1047,7 @@ int op_len(int op);
 /* ------------------------------------------------------------------ */
 /* stdlib                                                              */
 /* ------------------------------------------------------------------ */
-extern const NativeDesc lib_json_fns[], lib_random_fns[], lib_fs_fns[], lib_typed_fns[];
+extern const NativeDesc lib_json_fns[], lib_random_fns[], lib_fs_fns[], lib_typed_fns[], lib_hash_fns[];
 /* typed arrays (lib_typed.c): native objects holding unboxed numbers */
 /* element kinds of a typed array; the JIT reads the element straight from the payload (layout: TypedHdr, then the elements) */
 typedef enum TKind { TK_I8, TK_U8, TK_I16, TK_U16, TK_I32, TK_U32, TK_I64, TK_F32, TK_F64, TK_COUNT } TKind;

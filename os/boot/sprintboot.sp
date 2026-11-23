@@ -10,7 +10,7 @@
 # small load table (lba, destination, file size, memory size), so the 16-bit loader never has to understand ELF.
 # The code lives in bios_loader.sp (shared with the hybrid image, hybridboot.sp).
 #
-# usage: sprint run --allow-read=DIR --allow-write=DIR os/boot/sprintboot.sp KERNEL32.ELF OUT.IMG "kernel command line"
+# usage: sprint run --allow-read=DIR --allow-write=DIR os/boot/sprintboot.sp KERNEL32.ELF OUT.IMG "command line or menu spec (see boot_menu.sp)"
 import bios_loader
 import elf32
 import fs

@@ -75,7 +75,7 @@ def desktop():
             time.sleep(t)
         def log():
             return open(ser, errors="replace").read()
-        for _ in range(150):
+        for _ in range(400):
             if "[desktop] ready" in log():
                 break
             time.sleep(0.2)

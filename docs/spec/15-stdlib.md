@@ -24,3 +24,4 @@
 - [15.19 window / vfs / proc / wm（2.6、同梱module）](15-stdlib/19-os.md)
 - [15.20 typed（2.29、型付き配列）](15-stdlib/20-typed.md)
 - [15.21 asm（x86 / x86-64 アセンブラ、同梱module）](15-stdlib/21-asm.md)
+- [15.22 hash（SHA-256）](15-stdlib/22-hash.md)
