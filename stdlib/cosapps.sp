@@ -189,6 +189,48 @@ export class MemSink:
     func executable(self, path):
         self.exec[path] = true
 
+# writes the files straight to a file system (an explorer-style backend: exists, mkdir, write_bytes) below `root`, creating the folders; links and executable bits
+# are kept in the lists `links` and `exec` (the file system has neither symbolic links nor modes here)
+export class BackendSink:
+    let fs = nil
+    let root = ""
+    let links = nil
+    let exec = nil
+    let made = nil
+    let count = 0
+    let bytes = 0
+    func init(self, fs, root = ""):
+        self.fs = fs
+        self.root = root
+        self.links = {}
+        self.exec = {}
+        self.made = {}
+    func ensure_dir(self, path):
+        if path == "" or path == "/" or self.made[path]:
+            return nil
+        let i = len(path) - 1
+        while i > 0 and path[i] != 47:
+            i -= 1
+        if i > 0:
+            self.ensure_dir(path.slice(0, i))
+        if not self.fs.exists(path):
+            self.fs.mkdir(path)
+        self.made[path] = true
+    func file(self, path, size, offset, data):
+        let full = self.root .. "/" .. path
+        let i = len(full) - 1
+        while i > 0 and full[i] != 47:
+            i -= 1
+        self.ensure_dir(full.slice(0, i))
+        if offset == 0:
+            self.count += 1
+        self.fs.write_bytes(full, data, offset, offset == 0)
+        self.bytes += len(data)
+    func link(self, path, target):
+        self.links[path] = target
+    func executable(self, path):
+        self.exec[path] = true
+
 export func catalog(src):
     let m = src.get("apps/catalog.manifest")
     if m == nil:

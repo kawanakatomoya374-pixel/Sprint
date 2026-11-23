@@ -11,6 +11,7 @@ import io
 import ipc
 import psys
 import str
+import sslcore
 
 const BUF = 65536
 const CHUNK = 60000
@@ -77,6 +78,32 @@ export class Client:
             parts.append(ipc.shm_read(self.seg[1], 0, k))
             got += k
         return parts.join("")
+    # the same as read(), binary safe: a typed.u8
+    func read_bytes(self, path, off = 0, n = -1):
+        let want = n if n >= 0 else self.stat(path).size - off
+        let parts = []
+        let got = 0
+        while got < want:
+            let k = to_int(self.call("read\t" .. path .. "\t" .. to_string(off + got) .. "\t" .. to_string(min_int(CHUNK, want - got)))[0])
+            if k == 0:
+                break
+            parts.append(ipc.shm_bytes(self.seg[1], 0, k))
+            got += k
+        return sslcore.concat(parts)
+    # the same as write() for a typed.u8
+    func write_bytes(self, path, data, off = 0, truncate = false):
+        let done = 0
+        let first = truncate
+        if len(data) == 0:
+            self.call("write\t" .. path .. "\t" .. to_string(off) .. "\t0\t" .. ("t" if first else "-"))
+            return 0
+        while done < len(data):
+            let n = min_int(CHUNK, len(data) - done)
+            ipc.shm_put(self.seg[1], 0, data.slice(done, done + n))
+            self.call("write\t" .. path .. "\t" .. to_string(off + done) .. "\t" .. to_string(n) .. "\t" .. ("t" if first else "-"))
+            first = false
+            done += n
+        return done
     func read_file(self, path):
         return self.read(path, 0, -1)
     # writes data at offset off (creating the file); truncate = true first empties it

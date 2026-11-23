@@ -2,6 +2,8 @@
 import fs
 import sslcore
 import cosapps
+import sprintfs
+import explorer
 
 const DIR = "sprintssl/tests/data/cosapps/"
 let fails = 0
@@ -60,4 +62,14 @@ catch e:
     r3 = to_string(e)
 check(r3.find("signature", 0) >= 0, "a changed pack manifest is refused: " .. r3)
 check(cosapps.verify(fs.read_bytes(DIR .. "apps/catalog.manifest"), [sslcore.unhex("04" .. "00".repeat(64))]) == nil, "another key does not verify the signature")
+src.tamper = nil
+# straight onto a SprintFS volume
+let dev = sprintfs.MemDevice(4096, 4096)
+sprintfs.mkfs(dev, {label: "apps"})
+let vol = sprintfs.mount(dev)
+let bsink = cosapps.BackendSink(explorer.VolumeBackend(vol), "/apps/sprint")
+cosapps.install(src, "apps/sprint", bsink)
+check(bsink.count == 3 and bsink.bytes == 9719, "BackendSink: 3 files, 9719 bytes written to the volume")
+let any = vol.listdir("/apps/sprint")
+check(len(any) > 0 and sprintfs.fsck(dev).ok, "the volume has the files and is clean")
 print(fails == 0)

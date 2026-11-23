@@ -371,6 +371,11 @@ func open_demo(ic = nil):
     log("open Demo")
     psys.spawn("gdemo")
 desk.add_icon("Demo", 20, 422, open_demo)
+
+func open_explorer(ic = nil):
+    log("open Explorer")
+    psys.spawn("filemgr")
+desk.add_icon("Explorer", 20, 480, open_explorer)
 ipc.register("gui")
 desk.set_clock(rtc.clock_text())
 func update_clock(a):

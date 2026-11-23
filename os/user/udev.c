@@ -291,6 +291,27 @@ static SpStatus i_shm_read(SpVM *vm, int argc, const SpValue *argv, SpValue *ret
     if (!p) return SP_E_RUNTIME;
     return sp_new_string(vm, (const char *)p, (size_t)n, ret);
 }
+/* shm_bytes(va, off, n): n bytes of a segment as a typed.u8 (binary safe); shm_put(va, off, bytes): store a typed.u8 or an array of bytes */
+static SpStatus i_shm_bytes(SpVM *vm, int argc, const SpValue *argv, SpValue *ret) {
+    (void)argc;
+    int64_t n;
+    if (need_i(vm, argv[2], &n) != SP_OK) return SP_E_RUNTIME;
+    const uint8_t *p = shm_span(vm, argv[0], argv[1], n, "shm_bytes");
+    if (!p) return SP_E_RUNTIME;
+    *ret = typed_u8_from(vm, p, (size_t)n);
+    return SP_OK;
+}
+static SpStatus i_shm_put(SpVM *vm, int argc, const SpValue *argv, SpValue *ret) {
+    (void)argc;
+    unsigned char *d = typed_u8_data(argv[2]);
+    if (!d) return sp_throw(vm, "TypeError", "ipc.shm_put: expected a typed.u8");
+    size_t n = (size_t)typed_len(argv[2]);
+    uint8_t *p = shm_span(vm, argv[0], argv[1], (int64_t)n, "shm_put");
+    if (!p) return SP_E_RUNTIME;
+    memcpy(p, d, n);
+    *ret = sp_nil();
+    return SP_OK;
+}
 static SpStatus i_shm_write(SpVM *vm, int argc, const SpValue *argv, SpValue *ret) {
     (void)argc;
     if (argv[2].type != SP_T_STRING) return sp_throw(vm, "TypeError", "ipc.shm_write: expected a string");
@@ -430,7 +451,7 @@ static const SpNativeDesc ipc_fns[] = {
     {"recv_from", 0, 2, 0, SP_NATIVE_ALLOCATES, i_recv_from}, {"irq_register", 2, 2, 0, 0, i_irq_register}, {"irq_ack", 1, 1, 0, 0, i_irq_ack}, {"register", 1, 1, 0, 0, i_register}, {"lookup", 1, 1, 0, 0, i_lookup},
     {"shm_create", 1, 1, 0, SP_NATIVE_ALLOCATES, i_shm_create}, {"shm_open", 1, 1, 0, SP_NATIVE_ALLOCATES, i_shm_open},
     {"shm_close", 1, 1, 0, 0, i_shm_close}, {"shm_read", 3, 3, 0, SP_NATIVE_ALLOCATES, i_shm_read},
-    {"shm_write", 3, 3, 0, 0, i_shm_write}, {"shm_get", 2, 2, 0, 0, i_shm_get}, {"shm_set", 3, 3, 0, 0, i_shm_set},
+    {"shm_write", 3, 3, 0, 0, i_shm_write}, {"shm_bytes", 3, 3, 0, SP_NATIVE_ALLOCATES, i_shm_bytes}, {"shm_put", 3, 3, 0, 0, i_shm_put}, {"shm_get", 2, 2, 0, 0, i_shm_get}, {"shm_set", 3, 3, 0, 0, i_shm_set},
     {"send", 2, 2, 0, 0, i_send}, {"recv", 0, 1, 0, SP_NATIVE_ALLOCATES, i_recv},
 };
 

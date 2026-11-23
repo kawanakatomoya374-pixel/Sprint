@@ -72,7 +72,7 @@ func handle(src, q):
         let data = f.read(want)
         f.close()
         if len(data) > 0:
-            ipc.shm_write(b[0], 0, str.from_bytes(data))
+            ipc.shm_put(b[0], 0, data)
         return ok(to_string(len(data)))
     if op == "write":
         let b = buf_of(src)
@@ -85,7 +85,7 @@ func handle(src, q):
         if q[4] == "t":
             f.truncate(0)
         f.seek(to_int(q[2]))
-        f.write(ipc.shm_read(b[0], 0, n))
+        f.write(ipc.shm_bytes(b[0], 0, n))
         f.close()
         return ok(to_string(n))
     if op == "truncate":

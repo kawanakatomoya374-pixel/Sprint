@@ -1,0 +1,35 @@
+start / docs,music,readme.txt
+dir,dir,file
+selected docs
+entered /docs sub,a.txt,b.sp,blob.dat
+back /
+forward /docs
+up /
+down down music
+shift down music,readme.txt
+select all 3
+renaming rename New folder
+after new folder docs,music,Projects,readme.txt
+exists true
+renamed true false
+duplicate: modal message
+pasted docs true
+copy equal 5000 true
+pasted twice docs,docs - Copy
+moved docs - Copy false
+confirm confirm
+still there true
+deleted false 
+by name sub,a.txt,b.sp,blob.dat
+by size size sub,a.txt,b.sp,blob.dat
+by size desc sub,blob.dat,b.sp,a.txt
+address edit addr
+address goto /Work/docs
+bad address /Work/docs true
+jump blob.dat
+menu 5
+menu empty Refresh
+dragged true false
+tree toggle false
+canvas drawn true
+done 3

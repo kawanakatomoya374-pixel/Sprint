@@ -107,7 +107,8 @@ $(OSB)/sprintos-hybrid.img: $(OSB)/kernel.elf $(HYBRID_SP) $(BUILD)/sprint
 $(OSB)/sprintos-hybrid-test.img: $(OSB)/kernel.elf $(HYBRID_SP) $(BUILD)/sprint
 	$(BUILD)/sprint run --allow-read=$(OSB) --allow-write=$(OSB) os/boot/hybridboot.sp $(OSB)/kernel32.elf $@ "init=init" $(OSB)/kernel.elf
 
-.PHONY: os os-check os-kernel os-user os-iso os-run os-test os-img os-img-run os-img-test os-uefi os-uefi-run os-uefi-test os-hybrid os-hybrid-run os-hybrid-uefi-run os-hybrid-test
+# (os-explorer-test is at the end)
+.PHONY: os-explorer-test os os-check os-kernel os-user os-iso os-run os-test os-img os-img-run os-img-test os-uefi os-uefi-run os-uefi-test os-hybrid os-hybrid-run os-hybrid-uefi-run os-hybrid-test
 # `make os`: check the tools, then build the bootable ISO
 os: os-check os-iso
 	@echo "ISO ready: $(OSB)/sprintos.iso   (try: make os-run)"
@@ -191,3 +192,11 @@ os-secureboot-image: $(OSB)/kernel.elf $(HYBRID_SP) $(BUILD)/sprint
 os-menu-test: $(OSB)/kernel.elf os/boot/sprintboot.sp os/boot/bios_loader.sp $(UEFI_SP) $(HYBRID_SP) $(BUILD)/sprint
 	python3 os/tests/menu_test.py
 .PHONY: os-menu-test
+
+$(OSB)/sprintos-exptest.img: $(OSB)/kernel.elf os/boot/sprintboot.sp os/boot/bios_loader.sp os/boot/elf32.sp os/boot/boot_menu.sp stdlib/asm.sp $(BUILD)/sprint
+	$(BUILD)/sprint run --allow-read=$(OSB) --allow-write=$(OSB) os/boot/sprintboot.sp $(OSB)/kernel32.elf $@ "init=exptest"
+
+# the file manager: its logic on the real file system server (copy, cut, paste, rename, delete, a binary file), the host checks the disk afterwards; and the desktop's
+# Explorer icon opens its window through guid
+os-explorer-test: $(OSB)/sprintos-exptest.img $(OSB)/sprintos.img $(BUILD)/sprint
+	python3 os/tests/explorer_test.py $(OSB)/sprintos-exptest.img $(OSB)/sprintos.img

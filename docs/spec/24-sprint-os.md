@@ -159,3 +159,14 @@ x86-64 の JIT（領域 JIT・TraceJIT・純関数 JIT）は、カーネル自�
 `catalog(src)` は署名を確かめてアプリ一覧を返し、`install(src, "apps/lua", sink)` はマニフェストの署名、チャンクのサイズと SHA-256、zlib（C の `sslcore.inflate`、Adler-32 つき）、レコードの範囲を確かめて `sink`（`MemSink`: メモリ上にファイルを組み立てる）へ渡す。パスに `..` や先頭の `/` があれば拒否する。`HttpsSource` は `sprintssl` で HTTPS 取得する。試験: `sprintssl/tests/cosapps_test.sp`（実データのコピー。1 バイト変えたカタログ・チャンク・マニフェストを拒否）、`os-net-test`（ゲストが GitHub Pages から実カタログ 14 件と Lua パック 2.4 MB を取得し、31 ファイル 5048159 バイトを展開）。
 
 未実装: SprintFS へ書く sink と、インストール先（`root=`）の扱い、ファイルマネージャー（Windows 風 GUI）。
+
+## ファイルマネージャー（Explorer）
+
+Windows のエクスプローラーに似た GUI。ロジックと描画は `stdlib/explorer.sp`（`Explorer` クラス: OS に依存せず、gfx のキャンバスとバックエンド（ファイルシステム）を受け取り、guid のイベントを `event()` で受ける）、GUI クライアントは `os/user/filemgr.sp`（guiclient の窓 + fsclient）で、デスクトップの「Explorer」アイコンから起動する。
+
+- **画面**: ツールバー（戻る・進む・上へ・新しいフォルダー・切り取り・コピー・貼り付け・削除・名前の変更・更新）、編集できるアドレスバー（クリックか Ctrl+L）、左のフォルダーツリー（展開・折りたたみ）、詳細リスト（名前・更新日時・種類・サイズ。見出しのクリックで並べ替え）、ステータスバー（項目数、選択数とサイズ、空き容量）。
+- **操作**: クリック・ラバーバンド選択、矢印・Shift+矢印・Home/End・PageUp/Down・Ctrl+A、文字を打つと頭文字へジャンプ、Enter・ダブルクリックで開く、F2 でその場で名前の変更、Ctrl+Shift+N で新しいフォルダー、Delete は確認の窓、Ctrl+C/X/V（フォルダーは再帰。同名は「- Copy」「(2)」を付ける）、フォルダーへのドラッグ＆ドロップ（移動）、右クリックのメニュー、Backspace / Alt+←→↑。
+- **バイナリ**: `ipc.shm_bytes` / `ipc.shm_put`（typed.u8）と `fsclient.read_bytes` / `write_bytes` を追加し、`fsd` の read / write をバイナリ安全にした（以前は UTF-8 の文字列だった）。
+- **試験**: `tests/cases/stdlib/explorer.sp`（メモリ上の SprintFS に合成イベントを送る。移動・コピー・削除・並べ替え・アドレスバー・メニュー・ドラッグ）、`make os-explorer-test`（実際の `fsd` と SprintFS のディスクの上で 70000 バイトのバイナリのコピー・移動・名前の変更・削除をし、ホストがディスクを fsck して読み戻す。デスクトップのアイコンのダブルクリックで窓が開き、ディスクの内容が見える）。
+- **アプリのインストール先**: `cosapps.BackendSink(fs, root)` がパックをファイルシステム（`explorer.VolumeBackend` や `fsclient`）へ直接書く。
+- **未実装**: 日付（`fsd` が返す mtime をそのまま出すが、ホストで作ったファイルは空）、ファイルを開くアプリ（今はログに出すだけ）、ストア画面、Ctrl/Shift 付きのクリック（`guid` がポインタイベントに修飾キーを載せない）。
