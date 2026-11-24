@@ -1196,11 +1196,13 @@ func sys_mmap(g, a):
         # a big file (the JVM's 130 MB class library): pages are read when the program touches them
         if lx.map(g.pid, addr, n, (3 if (prot & 2) != 0 else 1) | 4) != 0:
             return -ENOMEM
+        lazy_remove(g, addr, addr + n)          # (what this mapping replaces is no longer filled from an older one)
         vm_add(g, addr, addr + n, prot & 7, f.path)
         g.lazy.append([addr, addr + n, f.path, off, {}, {kind: "file", path: f.path, readable: true, pos: 0}])
         return addr
     if lx.map(g.pid, addr, n, 3 if f != nil else (3 if (prot & 2) != 0 else 1)) != 0:
         return -ENOMEM
+    lazy_remove(g, addr, addr + n)              # a MAP_FIXED over part of a lazy file mapping (a library's data segment): those pages are not lazy any more
     vm_add(g, addr, addr + n, prot & 7, f.path if f != nil and f.kind == "file" else "")
     if f != nil:
         let data = do_read(g, f, length, off)
@@ -1228,8 +1230,9 @@ func lazy_remove(g, a, b):
         elif e[1] <= b:
             e[1] = a
             out.append(e)
-        else:
-            out.append(e)
+        else:                                       # a hole in the middle: two pieces of the same mapping
+            out.append([e[0], a, e[2], e[3], e[4], e[5]])
+            out.append([b, e[1], e[2], e[3] + (b - e[0]), e[4], e[5]])
     g.lazy = out
     return 0
 

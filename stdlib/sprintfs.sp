@@ -760,6 +760,7 @@ export class Fs:
         self.free_blocks += len_
         self.sb_dirty = true
     func alloc_inode(self):
+        # (a number that is handed out again must not keep the lookup cache of the directory that had it)
         let bits = self.bs * 8
         for k in range(self.imap_n):
             let b = self.rblock(self.imap + k)
@@ -774,9 +775,11 @@ export class Fs:
                             w[byte] = w[byte] | (1 << bit)
                             self.free_inodes -= 1
                             self.sb_dirty = true
+                            self.dcache[ino] = nil
                             return ino
         err("ENOSPC", "no free inodes")
     func free_inode(self, ino):
+        self.dcache[ino] = nil
         let bits = self.bs * 8
         let w = self.upd(self.imap + ino // bits)
         let bit = ino % bits
@@ -1146,6 +1149,7 @@ export class Fs:
         err("ENOENT", name)
     func dir_set_ino(self, dino, name, ino, ftype):
         let e = self.dir_lookup(dino, name)
+        self.dcache[dino] = nil
         let w = self.upd(e.blk)
         put32(w, e.off, ino)
         w[e.off + 7] = ftype
