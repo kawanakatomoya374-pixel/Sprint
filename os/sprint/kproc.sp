@@ -66,6 +66,7 @@ export class Process:
     let rcap = 0
     let mm = nil         # a thread of a Linux program: the process whose memory (space, regions) it shares
     let live = 1         # (the owner of the memory) threads that still use it
+    let sigpend = false  # a Linux program with a signal waiting: its next timer tick is reported to the server
     let lx = false       # may run Linux programs (the personality server linuxd)
     let handler = 0      # a Linux program: the pid of the server that answers its system calls (0 = an ordinary process)
     let mwake = 0        # when a blocked msg_recv with a timeout gives up (microseconds; 0 = never)

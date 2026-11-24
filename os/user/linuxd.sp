@@ -47,6 +47,14 @@ let cur_tid = 0           # the thread whose system call is being served
 let futex_q = {}          # "pid:address" -> [[tid, bitset], ...]
 let table = {}            # system call number -> function(g, a)
 let verbose = false
+let waiters = []     # [thread, check function, deadline (0 = none), result on timeout]
+let tmask = {}          # tid -> blocked signals (bit sig-1)
+let tpend = {}          # tid -> signals sent to that thread
+let altstk = {}         # tid -> [sp, size]
+let savedmask = {}      # tid -> the mask to restore when a sigsuspend handler returns
+let blocked = {}        # tid -> function that takes the thread out of the wait it is in (so a signal can interrupt it)
+let last_nr = {}        # tid -> the system call being served (to restart it)
+let alarms = {}         # pid -> [deadline ms, interval ms]
 
 func log(s):
     print("[linuxd] " .. s)
@@ -55,6 +63,13 @@ func log(s):
 # a C int argument arrives zero-extended in its 64-bit register: make it signed again
 func i32(v):
     return v - 4294967296 if v >= 2147483648 and v < 4294967296 else v
+
+# the keys of a table as an array (so the table may be changed while they are walked)
+func keys(t):
+    let out = []
+    for k in t:
+        out.append(k)
+    return out
 
 func align_up(v):
     return (v + 4095) & ~4095
@@ -130,7 +145,8 @@ class Guest:
     let waiting = nil         # a blocked wait4: [pid filter, status address, options, thread]
     let tids = nil            # thread id -> true
     let nthreads = 1
-    let sigs = nil            # signal -> handler address (1 = ignore)
+    let sigs = nil            # signal -> [handler, flags, restorer, mask]
+    let pend = 0              # signals sent to the process (bit sig-1)
     func init(self, pid, client):
         self.pid = pid
         self.client = client
@@ -169,7 +185,7 @@ func fclose(f):
             pipe_wake(p)
 
 func release_fds(g):
-    for fd in g.fds:
+    for fd in keys(g.fds):
         let f = g.fds[fd]
         if f != nil:
             fclose(f)
@@ -541,6 +557,8 @@ func sys_read(g, a):
             if p.writers == 0:
                 return 0
             p.rwait.append([g, a[1], a[2], cur_tid])
+            let tid = cur_tid
+            blocked[tid] = () => cancel_pipe_wait(p, tid)
             return nil
         let chunk = pipe_take(p, imin(a[2], p.size))
         let e0 = wr(g, a[1], chunk)
@@ -1001,7 +1019,7 @@ func ended(g, status):
     if verbose:
         log("pid " .. to_string(g.pid) .. " ended at " .. to_string(psys.ms()) .. " after " .. to_string(g.calls) .. " calls")
     guests[g.pid] = nil
-    for t in g.tids:
+    for t in keys(g.tids):
         if t != g.pid:
             lx.kill(t, 0)
         tmap[t] = nil
@@ -1013,8 +1031,16 @@ func ended(g, status):
         let ch = guests[c]
         if ch != nil:
             ch.parent = 0
+    alarms[g.pid] = nil
     let par = guests[g.parent] if g.parent != 0 else nil
     if par != nil:
+        if par.waiting != nil and (par.waiting[0] == -1 or par.waiting[0] == g.pid):
+            # (a parent blocked in wait4 gets the child, and a SIGCHLD handler runs when that call returns)
+            let h17 = par.sigs[17]
+            if h17 != nil and h17[0] > 1:
+                par.pend = par.pend | sigbit(17)
+        else:
+            post_signal(par, 0, 17, nil)
         if par.waiting != nil and (par.waiting[0] == -1 or par.waiting[0] == g.pid):
             let w = par.waiting
             par.waiting = nil
@@ -1024,7 +1050,7 @@ func ended(g, status):
                 for i in range(4):
                     sb.append((status >> (8 * i)) & 255)
                 wr(par, w[1], sslcore.concat([sb]))
-            lx.reply(w[3], g.pid)
+            reply(w[3], g.pid)
         else:
             par.zombies[g.pid] = status
     if g.client != 0:
@@ -1046,7 +1072,14 @@ func pipe_wake(p):
         if n > 0:
             chunk = pipe_take(p, n)
         let r = wr(w[0], w[1], chunk) if n > 0 else 0
-        lx.reply(w[3], r if r < 0 else n)
+        reply(w[3], r if r < 0 else n)
+
+func cancel_pipe_wait(p, tid):
+    let keep = []
+    for w in p.rwait:
+        if w[3] != tid:
+            keep.append(w)
+    p.rwait = keep
 
 func pipe_take(p, n):
     let all = sslcore.concat(p.data)
@@ -1092,6 +1125,9 @@ func do_fork(g, sp, tls):
     guests[pid] = c
     tmap[pid] = c
     g.children[pid] = true
+    for sg in g.sigs:
+        c.sigs[sg] = g.sigs[sg]
+    tmask[pid] = tmask[cur_tid] ?? 0
     if sp != 0:
         lx.setsp(pid, sp)
     if tls != 0:
@@ -1112,6 +1148,7 @@ func sys_clone(g, a):
     tmap[tid] = g
     g.tids[tid] = true
     g.nthreads += 1
+    tmask[tid] = tmask[cur_tid] ?? 0
     if (flags & 0x80000) != 0:         # CLONE_SETTLS
         lx.setfs(tid, a[4])
     let idb = []
@@ -1149,25 +1186,17 @@ func sys_exit_thread(g, a):
     finish(g, a[0] & 255, (a[0] & 255) << 8)
     return nil
 
-# rt_sigaction(sig, act, oldact, size): the handler is remembered (it cannot be delivered yet); SIG_IGN is honoured by kill()
-func sys_sigaction(g, a):
-    if a[2] != 0:
-        wr(g, a[2], sslcore.concat([[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]]))
-    if a[1] != 0:
-        let act = rd(g, a[1], 8)
-        if act == nil:
-            return -EFAULT
-        g.sigs[a[0]] = u64(act, 0)
-    return 0
-
 func sys_sched_getaffinity(g, a):
     wr(g, a[2], sslcore.concat([[1, 0, 0, 0, 0, 0, 0, 0]]))
     return 8
 
+func cancel_wait4(g):
+    g.waiting = nil
+
 func sys_wait4(g, a):
     let want = i32(a[0])
     let sp = a[1]
-    for z in g.zombies:
+    for z in keys(g.zombies):
         if want == -1 or want == z:
             let st = g.zombies[z]
             g.zombies[z] = nil
@@ -1183,38 +1212,9 @@ func sys_wait4(g, a):
     if (a[2] & 1) != 0:       # WNOHANG
         return 0
     g.waiting = [want, sp, a[2], cur_tid]
+    let tid = cur_tid
+    blocked[tid] = () => cancel_wait4(g)
     return nil
-
-func deliver_signal(t, sig):
-    if sig == 0 or sig == 17 or sig == 28 or sig == 23 or sig == 18 or sig == 20:
-        return 0
-    let h = t.sigs[sig]
-    if h == 1:
-        return 0
-    if h != nil and h > 1:
-        log("signal " .. to_string(sig) .. " for pid " .. to_string(t.pid) .. " has a handler; handlers are not delivered yet")
-        return 0
-    lx.kill(t.pid, 128 + sig)
-    ended(t, sig)
-    return 0
-
-func sys_kill(g, a):
-    let t = guests[i32(a[0])]
-    if t == nil:
-        return -3
-    return deliver_signal(t, a[1])
-
-func sys_tgkill(g, a):          # tgkill(tgid, tid, sig)
-    let t = guests[a[0]]
-    if t == nil:
-        return -3
-    return deliver_signal(t, a[2])
-
-func sys_tkill(g, a):
-    let t = tmap[a[0]]
-    if t == nil:
-        return -3
-    return deliver_signal(t, a[1])
 
 # the strings of a NULL-terminated array of C string pointers
 func string_vec(g, addr):
@@ -1267,6 +1267,9 @@ func sys_execve(g, a):
             return -errno_of(e.kind)
         p = line[0]
     let t0 = psys.ms()
+    for sg in keys(g.sigs):
+        if g.sigs[sg][0] > 1:
+            g.sigs[sg] = nil                  # handlers do not survive execve (ignored signals stay ignored)
     lx.reset(g.pid)
     let r = setup_image(g.pid, img, p, argv, envp, g)
     if verbose:
@@ -1282,9 +1285,31 @@ func sys_execve(g, a):
 # a program that is told to sleep: it stays blocked until its time has come
 # timers: [deadline ms, thread, result, futex key (or nil)]; when one fires the thread's blocked system call returns `result`
 let sleepers = []
-func sleep_for(g, ms):
-    sleepers.append([psys.ms() + ms, cur_tid, 0, nil])
+func sleep_for(g, ms, rem = 0):
+    let until = psys.ms() + ms
+    sleepers.append([until, cur_tid, 0, nil])
+    let tid = cur_tid
+    blocked[tid] = () => cancel_sleep_rem(g, tid, until, rem)
     return nil
+
+# a sleep that a signal cut short: the time left goes to the program's rem pointer
+func cancel_sleep_rem(g, tid, until, rem):
+    cancel_sleeper(tid)
+    if rem != 0:
+        let left = imax(0, until - psys.ms())
+        let b = []
+        for i in range(16):
+            b.append(0)
+        put64(b, 0, left // 1000)
+        put64(b, 8, (left % 1000) * 1000000)
+        wr(g, rem, sslcore.concat([b]))
+
+func cancel_sleeper(tid):
+    let keep = []
+    for s in sleepers:
+        if s[1] != tid:
+            keep.append(s)
+    sleepers = keep
 
 func wake_sleepers():
     let now = psys.ms()
@@ -1294,7 +1319,7 @@ func wake_sleepers():
             if tmap[s[1]] != nil:
                 if s[3] != nil:
                     futex_drop(s[3], s[1])
-                lx.reply(s[1], s[2])
+                reply(s[1], s[2])
         else:
             keep.append(s)
     sleepers = keep
@@ -1325,7 +1350,7 @@ func futex_wake(key, n):
         return 0
     while len(l) > 0 and woken < n:
         let w = l.remove_at(0)
-        lx.reply(w[0], 0)
+        reply(w[0], 0)
         woken += 1
         # its timeout (if any) is cancelled
         let keep = []
@@ -1334,6 +1359,10 @@ func futex_wake(key, n):
                 keep.append(s)
         sleepers = keep
     return woken
+
+func cancel_futex(key, tid):
+    futex_drop(key, tid)
+    cancel_sleeper(tid)
 
 func read_i32(g, addr):
     let b = rd(g, addr, 4)
@@ -1357,6 +1386,8 @@ func sys_futex(g, a):
         if futex_q[key] == nil:
             futex_q[key] = []
         futex_q[key].append([cur_tid, 0xffffffff])
+        let tid = cur_tid
+        blocked[tid] = () => cancel_futex(key, tid)
         if a[3] != 0:
             let ts = rd(g, a[3], 16)
             if ts == nil:
@@ -1494,7 +1525,7 @@ func sys_nanosleep(g, a):
     let ts = rd(g, a[0], 16)
     if ts == nil:
         return -EFAULT
-    return sleep_for(g, u64(ts, 0) * 1000 + u64(ts, 8) // 1000000)
+    return sleep_for(g, u64(ts, 0) * 1000 + u64(ts, 8) // 1000000, a[1])
 
 func sys_clock_nanosleep(g, a):
     let ts = rd(g, a[2], 16)
@@ -1503,7 +1534,7 @@ func sys_clock_nanosleep(g, a):
     let ms = u64(ts, 0) * 1000 + u64(ts, 8) // 1000000
     if (a[1] & 1) != 0:           # TIMER_ABSTIME
         ms = imax(0, ms - psys.ms())
-    return sleep_for(g, ms)
+    return sleep_for(g, ms, a[3] if (a[1] & 1) == 0 else 0)
 
 func sys_getrandom(g, a):
     let n = imin(a[1], 1 << 20)
@@ -1543,6 +1574,459 @@ func sys_sysinfo(g, a):
     put32(b, 104, 1)
     return wr(g, a[0], sslcore.concat([b]))
 
+
+# ================= signals =================
+const SA_ONSTACK = 0x08000000
+const SA_RESTART = 0x10000000
+const SA_NODEFER = 0x40000000
+const SA_RESETHAND = 0x80000000
+const SA_RESTORER = 0x04000000
+const EINTR = 4
+
+func sigbit(sig):
+    return 1 << (sig - 1)
+
+func sig_ignored_by_default(sig):
+    return sig == 17 or sig == 18 or sig == 23 or sig == 28 or sig == 19 or sig == 20 or sig == 21 or sig == 22
+
+func reply(tid, r):
+    blocked[tid] = nil
+    let g = tmap[tid]
+    if g == nil:
+        return nil
+    let sig = next_deliverable(g, tid)
+    if verbose == "trace":
+        log("reply " .. to_string(tid) .. " " .. to_string(r) .. " sig " .. to_string(sig))
+    if sig == nil:
+        let rr = lx.reply(tid, r)
+        if rr != 0:
+            log("lx.reply to " .. to_string(tid) .. " failed: " .. to_string(rr))
+        return nil
+    deliver(g, tid, sig, r, r == -EINTR, nil)
+
+func next_deliverable(g, tid):
+    let avail = (tpend[tid] ?? 0) | g.pend
+    if avail == 0:
+        return nil
+    let mask = (tmask[tid] ?? 0) & ~(sigbit(9) | sigbit(19))
+    avail = avail & ~mask
+    if avail == 0:
+        return nil
+    for sig in range(1, 65):
+        if (avail & sigbit(sig)) != 0:
+            return sig
+    return nil
+
+func kill_process(g, sig):
+    lx.kill(g.pid, 128 + sig)
+    ended(g, sig)
+
+# ucontext / siginfo / FXSAVE frame on the program's stack, then run the handler; info = {code, addr, trapno, err}
+func deliver(g, tid, sig, r, interrupted, info):
+    if (tpend[tid] ?? 0) & sigbit(sig) != 0:
+        tpend[tid] = tpend[tid] & ~sigbit(sig)
+    else:
+        g.pend = g.pend & ~sigbit(sig)
+    let act = g.sigs[sig]
+    let h = act[0] if act != nil else 0
+    if h == 0 or h == 1:
+        if h == 1 or sig_ignored_by_default(sig):
+            reply(tid, r)                       # nothing to do
+            return nil
+        kill_process(g, sig)
+        return nil
+    let c = lx.getctx(tid)
+    if c == nil:
+        kill_process(g, 11)
+        return nil
+    func w(i):
+        return u64(c, 8 * i)
+    let rax = r
+    let rip = w(15)
+    if interrupted and (act[1] & SA_RESTART) != 0 and last_nr[tid] != nil:
+        rax = last_nr[tid]                      # run the interrupted system call again after the handler
+        rip -= 2
+    let rsp = w(16)
+    let top = rsp - 128
+    let alt = altstk[tid]
+    if (act[1] & SA_ONSTACK) != 0 and alt != nil and alt[1] > 0 and not (rsp >= alt[0] and rsp < alt[0] + alt[1]):
+        top = alt[0] + alt[1]
+    let F = (((top - 1104) & ~15) - 8)
+    if (act[1] & SA_RESTORER) == 0:
+        kill_process(g, 11)
+        return nil
+    let fr = []
+    for i in range(1104):
+        fr.append(0)
+    put64(fr, 0, act[2])                       # the return address: the restorer (rt_sigreturn)
+    # siginfo at 8
+    put32(fr, 8, sig)
+    put32(fr, 16, info.code if info != nil else 0)
+    if info != nil:
+        put64(fr, 24, info.addr)
+    # ucontext at 136
+    let uc = 136
+    let sm = savedmask[tid] if savedmask[tid] != nil else (tmask[tid] ?? 0)
+    # uc_stack
+    if alt != nil:
+        put64(fr, uc + 16, alt[0])
+        put64(fr, uc + 32, alt[1])
+    let g0 = uc + 40
+    # gregs: r8 r9 r10 r11 r12 r13 r14 r15 rdi rsi rbp rbx rdx rax rcx rsp rip efl cs err trapno oldmask cr2
+    let order = [7, 8, 9, 10, 11, 12, 13, 14, 5, 4, 6, 1, 3, 0, 2]
+    for i in range(15):
+        put64(fr, g0 + 8 * i, rax if order[i] == 0 else w(order[i]))
+    put64(fr, g0 + 8 * 15, rsp)
+    put64(fr, g0 + 8 * 16, rip)
+    put64(fr, g0 + 8 * 17, w(17))
+    put64(fr, g0 + 8 * 18, 0x33)
+    put64(fr, g0 + 8 * 19, info.err if info != nil else 0)
+    put64(fr, g0 + 8 * 20, info.trapno if info != nil else 0)
+    put64(fr, g0 + 8 * 21, 0)
+    put64(fr, g0 + 8 * 22, info.addr if info != nil else 0)
+    put64(fr, g0 + 8 * 23, F + uc + 424)       # fpregs: points at the saved FXSAVE image
+    put64(fr, uc + 296, sm)                    # uc_sigmask
+    for i in range(512):
+        fr[uc + 424 + i] = c[8 * 19 + i]
+    if lx.write(g.pid, F, sslcore.concat([fr])) != 0:
+        kill_process(g, 11)
+        return nil
+    savedmask[tid] = nil
+    tmask[tid] = (tmask[tid] ?? 0) | act[3] | (0 if (act[1] & SA_NODEFER) != 0 else sigbit(sig))
+    if (act[1] & SA_RESETHAND) != 0:
+        g.sigs[sig] = nil
+    put64(c, 8 * 15, h)
+    put64(c, 8 * 16, F)
+    put64(c, 8 * 5, sig)
+    put64(c, 8 * 4, F + 8)
+    put64(c, 8 * 3, F + uc)
+    put64(c, 8 * 0, 0)
+    put64(c, 8 * 17, w(17) & ~0x400)
+    lx.setctx(tid, c)
+    lx.reply(tid, 0)
+
+# rt_sigreturn: the handler is done; take the registers back from the frame (the handler may have changed them)
+func sys_rt_sigreturn(g, a):
+    let c = lx.getctx(cur_tid)
+    if c == nil:
+        return -EFAULT
+    let rsp = u64(c, 8 * 16)
+    let uc = rsp + 128 - 8 + 8              # (the restorer's return popped the return-address slot: rsp = F + 8; ucontext = F + 136)
+    let fr = rd(g, uc, 424 + 512)
+    if fr == nil:
+        kill_process(g, 11)
+        return nil
+    let g0 = 40
+    let order = [7, 8, 9, 10, 11, 12, 13, 14, 5, 4, 6, 1, 3, 0, 2]
+    for i in range(15):
+        put64(c, 8 * order[i], u64(fr, g0 + 8 * i))
+    put64(c, 8 * 16, u64(fr, g0 + 8 * 15))
+    put64(c, 8 * 15, u64(fr, g0 + 8 * 16))
+    put64(c, 8 * 17, u64(fr, g0 + 8 * 17))
+    for i in range(512):
+        c[8 * 19 + i] = fr[424 + i]
+    tmask[cur_tid] = u64(fr, 296) & ~(sigbit(9) | sigbit(19))
+    lx.setctx(cur_tid, c)
+    reply(cur_tid, u64(c, 0))
+    return nil
+
+# ---- sending signals ----
+func interrupt(tid):
+    let f = blocked[tid]
+    if f != nil:
+        blocked[tid] = nil
+        f()
+        reply(tid, -EINTR)
+        return true
+    return false
+
+func post_signal(g, tid, sig, info):
+    if sig < 1 or sig > 64:
+        return -EINVAL
+    let act = g.sigs[sig]
+    let h = act[0] if act != nil else 0
+    if h == 1 or (h == 0 and sig_ignored_by_default(sig)):
+        return 0                                 # ignored: discarded at once
+    let target = tid
+    if target == 0:
+        target = g.pid
+    let masked = ((tmask[target] ?? 0) & sigbit(sig)) != 0 and sig != 9 and sig != 19
+    if h == 0 and not masked:
+        kill_process(g, sig)                     # default action: terminate
+        return 0
+    if tid != 0:
+        tpend[tid] = (tpend[tid] ?? 0) | sigbit(sig)
+    else:
+        g.pend = g.pend | sigbit(sig)
+    # wake a thread that can take it: a blocked one gets EINTR, a running one is asked to report at its next timer tick
+    let cand = [tid] if tid != 0 else []
+    if tid == 0:
+        for t in keys(g.tids):
+            cand.append(t)
+    for t in cand:
+        if ((tmask[t] ?? 0) & sigbit(sig)) == 0 or sig == 9:
+            if not interrupt(t):
+                lx.sigpend(t, 1)
+            return 0
+    return 0
+
+func sys_kill(g, a):
+    let pid = i32(a[0])
+    let sig = a[1]
+    let t = guests[pid if pid > 0 else g.pid]
+    if t == nil:
+        return -3
+    if sig == 0:
+        return 0
+    return post_signal(t, 0, sig, nil)
+
+func sys_tgkill(g, a):
+    let t = tmap[a[1]]
+    if t == nil or t.pid != a[0]:
+        return -3
+    if a[2] == 0:
+        return 0
+    return post_signal(t, a[1], a[2], nil)
+
+func sys_tkill(g, a):
+    let t = tmap[a[0]]
+    if t == nil:
+        return -3
+    if a[1] == 0:
+        return 0
+    return post_signal(t, a[0], a[1], nil)
+
+func sys_sigaction(g, a):
+    let sig = a[0]
+    if sig < 1 or sig > 64 or sig == 9 or sig == 19:
+        return -EINVAL
+    if a[2] != 0:
+        let old = g.sigs[sig]
+        let b = []
+        for i in range(32):
+            b.append(0)
+        if old != nil:
+            put64(b, 0, old[0])
+            put64(b, 8, old[1])
+            put64(b, 16, old[2])
+            put64(b, 24, old[3])
+        wr(g, a[2], sslcore.concat([b]))
+    if a[1] != 0:
+        let act = rd(g, a[1], 32)
+        if act == nil:
+            return -EFAULT
+        g.sigs[sig] = [u64(act, 0), u64(act, 8), u64(act, 16), u64(act, 24)]
+        if u64(act, 0) == 1 or (u64(act, 0) == 0 and sig_ignored_by_default(sig)):
+            g.pend = g.pend & ~sigbit(sig)
+    return 0
+
+func sys_sigprocmask(g, a):
+    let old = tmask[cur_tid] ?? 0
+    if a[2] != 0:
+        wr(g, a[2], sslcore.concat([[(old >> 0) & 255, (old >> 8) & 255, (old >> 16) & 255, (old >> 24) & 255, (old >> 32) & 255, (old >> 40) & 255, (old >> 48) & 255, (old >> 56) & 255]]))
+    if a[1] != 0:
+        let sb = rd(g, a[1], 8)
+        if sb == nil:
+            return -EFAULT
+        let set = u64(sb, 0)
+        let nm = old
+        if a[0] == 0:
+            nm = old | set
+        elif a[0] == 1:
+            nm = old & ~set
+        elif a[0] == 2:
+            nm = set
+        else:
+            return -EINVAL
+        tmask[cur_tid] = nm & ~(sigbit(9) | sigbit(19))
+    return 0
+
+func sys_sigaltstack(g, a):
+    if a[1] != 0:
+        let alt = altstk[cur_tid]
+        let b = []
+        for i in range(24):
+            b.append(0)
+        if alt != nil:
+            put64(b, 0, alt[0])
+            put64(b, 16, alt[1])
+        else:
+            put32(b, 8, 2)                       # SS_DISABLE
+        wr(g, a[1], sslcore.concat([b]))
+    if a[0] != 0:
+        let ss = rd(g, a[0], 24)
+        if ss == nil:
+            return -EFAULT
+        if (u32(ss, 8) & 2) != 0:
+            altstk[cur_tid] = nil
+        else:
+            altstk[cur_tid] = [u64(ss, 0), u64(ss, 16)]
+    return 0
+
+func sys_pause(g, a):
+    let tid = cur_tid
+    waiters.append([tid, () => nil, 0, 0])
+    blocked[tid] = () => cancel_waiter(tid)
+    return nil
+
+func cancel_waiter(tid):
+    let keep = []
+    for w in waiters:
+        if w[0] != tid:
+            keep.append(w)
+    waiters = keep
+
+func sys_sigsuspend(g, a):
+    let sb = rd(g, a[0], 8)
+    if sb == nil:
+        return -EFAULT
+    savedmask[cur_tid] = tmask[cur_tid] ?? 0
+    tmask[cur_tid] = u64(sb, 0) & ~(sigbit(9) | sigbit(19))
+    # a signal that was waiting for the new mask is delivered by reply(); otherwise wait
+    if next_deliverable(g, cur_tid) != nil:
+        return -EINTR
+    return sys_pause(g, a)
+
+func sys_sigpending(g, a):
+    let p = ((tpend[cur_tid] ?? 0) | g.pend) & (tmask[cur_tid] ?? 0)
+    return wr(g, a[0], sslcore.concat([[p & 255, (p >> 8) & 255, (p >> 16) & 255, (p >> 24) & 255, (p >> 32) & 255, (p >> 40) & 255, (p >> 48) & 255, (p >> 56) & 255]]))
+
+func sys_sigtimedwait(g, a):
+    let sb = rd(g, a[0], 8)
+    if sb == nil:
+        return -EFAULT
+    let set = u64(sb, 0)
+    let t = ts_ms(g, a[2])
+    if t == nil:
+        return -EFAULT
+    let tid = cur_tid
+    func check():
+        let avail = ((tpend[tid] ?? 0) | g.pend) & set
+        if avail == 0:
+            return nil
+        for sig in range(1, 65):
+            if (avail & sigbit(sig)) != 0:
+                if (tpend[tid] ?? 0) & sigbit(sig) != 0:
+                    tpend[tid] = tpend[tid] & ~sigbit(sig)
+                else:
+                    g.pend = g.pend & ~sigbit(sig)
+                if a[1] != 0:
+                    let si = []
+                    for i in range(128):
+                        si.append(0)
+                    put32(si, 0, sig)
+                    wr(g, a[1], sslcore.concat([si]))
+                return sig
+        return nil
+    let r = check()
+    if r != nil:
+        return r
+    if t == 0:
+        return -EAGAIN
+    waiters.append([tid, check, 0 if t < 0 else psys.ms() + t, -EAGAIN])
+    blocked[tid] = () => cancel_waiter(tid)
+    return nil
+
+# alarm / setitimer (ITIMER_REAL): SIGALRM
+func set_alarm(g, first_ms, interval_ms):
+    if first_ms <= 0:
+        alarms[g.pid] = nil
+    else:
+        alarms[g.pid] = [psys.ms() + first_ms, interval_ms]
+
+func sys_alarm(g, a):
+    let old = alarms[g.pid]
+    let left = 0
+    if old != nil:
+        left = imax(1, (old[0] - psys.ms() + 999) // 1000)
+    set_alarm(g, a[0] * 1000, 0)
+    return left
+
+func sys_setitimer(g, a):
+    if a[0] != 0:
+        return -EINVAL
+    if a[2] != 0:
+        let old = alarms[g.pid]
+        let b = []
+        for i in range(32):
+            b.append(0)
+        if old != nil:
+            let left = imax(0, old[0] - psys.ms())
+            put64(b, 0, old[1] // 1000)
+            put64(b, 8, (old[1] % 1000) * 1000)
+            put64(b, 16, left // 1000)
+            put64(b, 24, (left % 1000) * 1000)
+        wr(g, a[2], sslcore.concat([b]))
+    let nv = rd(g, a[1], 32)
+    if nv == nil:
+        return -EFAULT
+    set_alarm(g, u64(nv, 16) * 1000 + u64(nv, 24) // 1000, u64(nv, 0) * 1000 + u64(nv, 8) // 1000)
+    return 0
+
+func sys_getitimer(g, a):
+    let old = alarms[g.pid]
+    let b = []
+    for i in range(32):
+        b.append(0)
+    if old != nil:
+        let left = imax(0, old[0] - psys.ms())
+        put64(b, 0, old[1] // 1000)
+        put64(b, 8, (old[1] % 1000) * 1000)
+        put64(b, 16, left // 1000)
+        put64(b, 24, (left % 1000) * 1000)
+    return wr(g, a[1], sslcore.concat([b]))
+
+func fire_alarms():
+    if len(alarms) == 0:
+        return nil
+    let now = psys.ms()
+    for pid in keys(alarms):
+        let al = alarms[pid]
+        if al != nil and al[0] <= now:
+            let g = guests[pid]
+            if al[1] > 0:
+                alarms[pid] = [now + al[1], al[1]]
+            else:
+                alarms[pid] = nil
+            if g != nil:
+                post_signal(g, 0, 14, nil)
+
+func alarm_deadline():
+    let best = 0
+    for pid in alarms:
+        let al = alarms[pid]
+        if al != nil:
+            let d = imax(1, al[0] - psys.ms())
+            if best == 0 or d < best:
+                best = d
+    return best
+
+# the kernel reports an exception of a program: a handler for the matching signal runs, otherwise the program ends
+func serve_fault(g, tid, q):
+    let vec = to_int(q[1])
+    let addr = to_int(q[2])
+    let err = to_int(q[3])
+    let sig = 11
+    if vec == 0 or vec == 16 or vec == 19:
+        sig = 8
+    elif vec == 6:
+        sig = 4
+    elif vec == 17:
+        sig = 7
+    let act = g.sigs[sig]
+    let c = lx.getctx(tid)
+    let masked = ((tmask[tid] ?? 0) & sigbit(sig)) != 0
+    if act == nil or act[0] <= 1 or c == nil or masked:
+        kill_process(g, sig)
+        return nil
+    deliver(g, tid, sig, u64(c, 0), false, {code: 1 if (err & 1) == 0 else 2, addr: addr, trapno: vec, err: err})
+
+# the kernel asks us to look at a program that was running when a signal arrived
+func serve_signal_check(g, tid):
+    let c = lx.getctx(tid)
+    if c == nil:
+        return nil
+    reply(tid, u64(c, 0))
 
 # ================= more of the system call table (after C-OS's cos_linux.c) =================
 
@@ -1886,7 +2370,6 @@ const POLLOUT = 4
 const POLLERR = 8
 const POLLHUP = 16
 
-let waiters = []     # [thread, check function, deadline (0 = none), result on timeout]
 
 # block the calling thread until check() gives a result (not nil), or the timeout; timeout_ms < 0: for ever, 0: do not wait
 func block(check, timeout_ms, tres):
@@ -1896,6 +2379,8 @@ func block(check, timeout_ms, tres):
     if timeout_ms == 0:
         return tres
     waiters.append([cur_tid, check, 0 if timeout_ms < 0 else psys.ms() + timeout_ms, tres])
+    let tid = cur_tid
+    blocked[tid] = () => cancel_waiter(tid)
     return nil
 
 func recheck():
@@ -1912,7 +2397,7 @@ func recheck():
         if r == nil and w[2] != 0 and now >= w[2]:
             r = w[3]
         if r != nil:
-            lx.reply(w[0], r)
+            reply(w[0], r)
         else:
             keep.append(w)
     for w in waiters:
@@ -2623,13 +3108,21 @@ func setup():
     table[11] = sys_munmap
     table[12] = sys_brk
     table[13] = sys_sigaction
+    table[15] = sys_rt_sigreturn
+    table[34] = sys_pause
+    table[36] = sys_getitimer
+    table[37] = sys_alarm
+    table[38] = sys_setitimer
+    table[127] = sys_sigpending
+    table[128] = sys_sigtimedwait
+    table[130] = sys_sigsuspend
     table[24] = sys_zero
     table[56] = sys_clone
     table[200] = sys_tkill
     table[204] = sys_sched_getaffinity
     table[234] = sys_tgkill
     table[273] = sys_zero
-    table[14] = sys_zero
+    table[14] = sys_sigprocmask
     table[16] = sys_ioctl
     table[17] = sys_pread
     table[18] = sys_pwrite
@@ -2667,7 +3160,7 @@ func setup():
     table[107] = sys_getuid
     table[108] = sys_getuid
     table[111] = sys_getpid
-    table[131] = sys_zero
+    table[131] = sys_sigaltstack
     table[158] = sys_arch_prctl
     table[186] = sys_gettid
     table[202] = sys_futex
@@ -2777,6 +3270,7 @@ func serve_call(g, q):
     g.calls += 1
     let f = table[nr]
     let t_start = psys.ms()
+    last_nr[cur_tid] = nr
     let r = nil
     if f == nil:
         if verbose:
@@ -2793,7 +3287,7 @@ func serve_call(g, q):
     if verbose == "trace" and cur_tid >= 8:
         log("tid " .. to_string(cur_tid) .. " syscall " .. to_string(nr) .. " (" .. to_string(a[0]) .. "," .. to_string(a[1]) .. "," .. to_string(a[2]) .. ") = " .. to_string(r))
     if r != nil:
-        lx.reply(cur_tid, r)
+        reply(cur_tid, r)
 
 func serve_request(src, text):
     let q = text.split("\t")
@@ -2822,36 +3316,49 @@ ipc.register("linux")
 log("serving as \"linux\", pid " .. to_string(psys.pid()))
 let running = true
 while running:
-    io.flush()
-    let tmo = next_wake()
-    let wd = waiter_deadline()
-    if wd != 0 and (tmo == 0 or wd < tmo):
-        tmo = wd
-    let m = nil
-    if fs != nil and len(fs.backlog) > 0:
-        m = fs.backlog.remove_at(0)           # a message that came in while we waited for fsd
-    else:
-        m = ipc.recv_from(true, tmo)
-    wake_sleepers()
-    if m == nil:
-        recheck()
-        continue
-    let src = m[0]
-    let text = m[1]
-    if verbose == "trace" and src >= 8:
-        log("recv from " .. to_string(src) .. ": " .. text.slice(0, 30))
-    let g = tmap[src]
-    if g != nil:
-        if text.starts_with("X\t"):
-            # the kernel ended it (a fault): the whole process goes
-            let code = to_int(text.slice(2))
-            ended(g, 11 if code == 139 else code)
+    try:
+        io.flush()
+        let tmo = next_wake()
+        let wd = waiter_deadline()
+        let ad = alarm_deadline()
+        if ad != 0 and (wd == 0 or ad < wd):
+            wd = ad
+        if wd != 0 and (tmo == 0 or wd < tmo):
+            tmo = wd
+        let m = nil
+        if fs != nil and len(fs.backlog) > 0:
+            m = fs.backlog.remove_at(0)           # a message that came in while we waited for fsd
         else:
-            cur_tid = src
-            serve_call(g, text.split("\t"))
-    elif text.starts_with("X\t"):
-        pass          # a program we already finished
-    else:
-        running = serve_request(src, text)
-    recheck()
+            m = ipc.recv_from(true, tmo)
+        wake_sleepers()
+        fire_alarms()
+        if m == nil:
+            recheck()
+            continue
+        let src = m[0]
+        let text = m[1]
+        if verbose == "trace" and src >= 8:
+            log("recv from " .. to_string(src) .. ": " .. text.slice(0, imin(30, len(text))))
+        let g = tmap[src]
+        if g != nil:
+            if text == "S":
+                cur_tid = src
+                serve_signal_check(g, src)
+            elif text.starts_with("F\t"):
+                cur_tid = src
+                serve_fault(g, src, text.split("\t"))
+            elif text.starts_with("X\t"):
+                # the kernel ended it: the whole process goes
+                let code = to_int(text.slice(2))
+                ended(g, 11 if code == 139 else code)
+            else:
+                cur_tid = src
+                serve_call(g, text.split("\t"))
+        elif text.starts_with("X\t"):
+            pass          # a program we already finished
+        else:
+            running = serve_request(src, text)
+        recheck()
+    catch e:
+        log("main loop error: " .. to_string(e))
 log("bye")

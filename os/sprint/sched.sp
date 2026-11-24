@@ -340,6 +340,41 @@ func lx_syscall(p, nr):
             order.append(q.pid)
         set_ret(p, 0)
         return true
+    if nr == 1055:   # lx_getctx(pid, buf): 83 words: rax rbx rcx rdx rsi rdi rbp r8..r15 rip rsp rflags fsbase, then the 512-byte FXSAVE image
+        let regs = [0, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128, 136, 184]
+        for i in range(19):
+            if not p.space.write64(a1 + 8 * i, hw.peek64(q.ctx + regs[i])):
+                set_ret(p, -14)
+                return true
+        for i in range(64):
+            if not p.space.write64(a1 + 8 * (19 + i), hw.peek64(q.ctx + kproc.CTX_FX + 8 * i)):
+                set_ret(p, -14)
+                return true
+        set_ret(p, 0)
+        return true
+    if nr == 1056:   # lx_setctx(pid, buf): the same layout back (flags are sanitised; segments and the page table stay)
+        let regs = [0, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128, 136, 184]
+        for i in range(19):
+            let v = p.space.read64(a1 + 8 * i)
+            if v == nil:
+                set_ret(p, -14)
+                return true
+            if regs[i] == 136:
+                v = (v & 0xDD5) | 0x202
+            hw.poke64(q.ctx + regs[i], v)
+        for i in range(64):
+            let v = p.space.read64(a1 + 8 * (19 + i))
+            if v == nil:
+                set_ret(p, -14)
+                return true
+            hw.poke64(q.ctx + kproc.CTX_FX + 8 * i, v)
+        hw.poke32(q.ctx + kproc.CTX_FX + 24, hw.peek32(q.ctx + kproc.CTX_FX + 24) & 0xFFBF)    # MXCSR: reserved bits off
+        set_ret(p, 0)
+        return true
+    if nr == 1057:   # lx_sigpend(pid, on): report the program at its next timer tick (so a signal can be delivered to code that makes no system calls)
+        q.sigpend = a1 != 0
+        set_ret(p, 0)
+        return true
     if nr == 1054:   # lx_setsp(pid, sp)
         hw.poke64(q.ctx + kproc.CTX_RSP, a1)
         set_ret(p, 0)
@@ -559,6 +594,10 @@ export func trap(cpu, v):
             finish(p)
     elif v == lapic.TIMER_VECTOR:
         lapic.eoi()
+        if p.handler != 0 and p.sigpend:
+            p.sigpend = false
+            if send_to(p.handler, p.pid, "S"):
+                p.state = "lxwait"
         p.slices += 1
         preemptions += 1
         k.stat_set(cpu, 1, preemptions)
@@ -571,7 +610,14 @@ export func trap(cpu, v):
     elif v >= 32 and v < 256:
         if v != 255:
             lapic.eoi()
+    elif p.handler != 0 and (v == 0 or v == 6 or v == 13 or v == PF or v == 16 or v == 17 or v == 19):
+        # an exception in a Linux program: the server turns it into a signal (a handler may run, or the program ends)
+        if send_to(p.handler, p.pid, "F\t" .. to_string(v) .. "\t" .. to_string(hw.peek64(p.ctx + kproc.CTX_CR2)) .. "\t" .. to_string(hw.peek64(p.ctx + kproc.CTX_ERR))):
+            p.state = "lxwait"
+        else:
+            p.exit_code = 139
+            finish(p)
     else:
-        log("pid " .. to_string(p.pid) .. " (" .. p.name .. "): trap " .. to_string(v) .. " err=" .. to_string(hw.peek64(p.ctx + kproc.CTX_ERR)) .. " rip=" .. to_string(hw.peek64(p.ctx + kproc.CTX_RIP)) .. " cr2=" .. to_string(hw.peek64(p.ctx + kproc.CTX_CR2)))
+        log("pid " .. to_string(p.pid) .. " (" .. p.name .. "): trap ".. to_string(v) .. " err=" .. to_string(hw.peek64(p.ctx + kproc.CTX_ERR)) .. " rip=" .. to_string(hw.peek64(p.ctx + kproc.CTX_RIP)) .. " cr2=" .. to_string(hw.peek64(p.ctx + kproc.CTX_CR2)))
         p.exit_code = 139
         finish(p)

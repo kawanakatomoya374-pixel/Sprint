@@ -15,9 +15,10 @@ tmp = tempfile.mkdtemp()
 src = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "tests", "linux")
 glibc_ok = subprocess.run(["gcc", "-O2", "-pie", "-fPIE", "-o", os.path.join(tmp, "glibc"), os.path.join(src, "glibc.c"), "-lm"], capture_output=True).returncode == 0
 glibc_ok = glibc_ok and subprocess.run(["gcc", "-O2", "-pie", "-fPIE", "-o", os.path.join(tmp, "dl"), os.path.join(src, "dl.c"), "-ldl"], capture_output=True).returncode == 0
+glibc_ok = glibc_ok and subprocess.run(["gcc", "-O2", "-pie", "-fPIE", "-o", os.path.join(tmp, "signals_glibc"), os.path.join(src, "signals.c")], capture_output=True).returncode == 0
 glibc_ok = glibc_ok and subprocess.run(["gcc", "-O2", "-pie", "-fPIE", "-pthread", "-o", os.path.join(tmp, "threads_glibc"), os.path.join(src, "threads.c")], capture_output=True).returncode == 0
 check(glibc_ok, "gcc builds glibc dynamic PIE programs")
-for name, flags in (("hello", ["-static-pie"]), ("files", ["-static-pie"]), ("proc", ["-static-pie"]), ("threads", ["-static-pie", "-pthread"]), ("socks", ["-static-pie"]), ("hello_dyn", ["-pie", "-fPIE"])):
+for name, flags in (("hello", ["-static-pie"]), ("files", ["-static-pie"]), ("proc", ["-static-pie"]), ("threads", ["-static-pie", "-pthread"]), ("socks", ["-static-pie"]), ("signals", ["-static-pie"]), ("hello_dyn", ["-pie", "-fPIE"])):
     r = subprocess.run(["musl-gcc"] + flags + ["-O2", "-o", os.path.join(tmp, name), os.path.join(src, name.replace("_dyn", "") + ".c")], capture_output=True, text=True)
     check(r.returncode == 0, "musl-gcc builds %s (%s)" % (name, " ".join(flags)))
 fsimg = os.path.join(tmp, "fs.img")
@@ -30,7 +31,7 @@ if glibc_ok:
     tool("mkdir", "/lib64"); tool("mkdir", "/lib/x86_64-linux-gnu")
     for host, guest in (("/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2", "/lib64/ld-linux-x86-64.so.2"), ("/lib/x86_64-linux-gnu/libc.so.6", "/lib/x86_64-linux-gnu/libc.so.6")):
         shutil.copy(os.path.realpath(host), os.path.join(tmp, "glibc_lib")); tool("put", os.path.join(tmp, "glibc_lib"), guest)
-    tool("put", os.path.join(tmp, "glibc"), "/bin/glibc"); tool("put", os.path.join(tmp, "dl"), "/bin/dl"); tool("put", os.path.join(tmp, "threads_glibc"), "/bin/threads_glibc")
+    tool("put", os.path.join(tmp, "glibc"), "/bin/glibc"); tool("put", os.path.join(tmp, "signals_glibc"), "/bin/signals_glibc"); tool("put", os.path.join(tmp, "dl"), "/bin/dl"); tool("put", os.path.join(tmp, "threads_glibc"), "/bin/threads_glibc")
 REAL = ["dash", "cat", "sort", "sed", "ls", "echo", "wc", "tr", "head"]
 made = set()
 def put_real(binpath):
@@ -63,7 +64,7 @@ echo "done" | tr a-z A-Z
 exit 5
 """)
 tool("put", os.path.join(tmp, "script.sh"), "/lx/script.sh")
-tool("put", os.path.join(tmp, "socks"), "/bin/socks"); tool("mkdir", "/tmp"); tool("put", os.path.join(tmp, "threads"), "/bin/threads"); tool("put", os.path.join(tmp, "proc"), "/bin/proc"); tool("put", os.path.join(tmp, "hello_dyn"), "/bin/hello_dyn")
+tool("put", os.path.join(tmp, "signals"), "/bin/signals"); tool("put", os.path.join(tmp, "socks"), "/bin/socks"); tool("mkdir", "/tmp"); tool("put", os.path.join(tmp, "threads"), "/bin/threads"); tool("put", os.path.join(tmp, "proc"), "/bin/proc"); tool("put", os.path.join(tmp, "hello_dyn"), "/bin/hello_dyn")
 tool("put", os.path.join(tmp, "hello"), "/bin/hello"); tool("put", os.path.join(tmp, "files"), "/bin/files"); tool("put", os.path.join(tmp, "input.txt"), "/lx/input.txt")
 ser = os.path.join(OUT, "linux.log")
 if os.path.exists(ser): os.remove(ser)
@@ -112,6 +113,14 @@ check("bind tcp: 0" in L and "listening on port 8080" in L and "epoll: 1 ready, 
 check("tcp loopback: 3 bytes then EOF after 1 wakeups" in L, "loopback TCP: nonblocking accept4, epoll, data and EOF")
 check("poll after close: 1 hup=1" in L and "connect refused: yes" in L, "poll reports hang-up; connecting to nothing gives ECONNREFUSED")
 check("udp loopback: datagram" in L, "UDP datagrams on the loopback")
+for tag, n in (("musl", 1), ("glibc", 2)):
+    check(L.count("raise: usr1=1") >= n and L.count("kill + siginfo: usr2=1 signo=12 pid_ok=1") >= n, "signals (%s): sigaction handlers run on raise / kill, SA_SIGINFO gives siginfo" % tag)
+    check(L.count("blocked: usr1=1 pending=1") >= n and L.count("unblocked: usr1=2") >= n, "signals (%s): a blocked signal waits and is delivered when unblocked" % tag)
+    check(L.count("pause: r=-1 errno=EINTR alrm=1") >= n and L.count("busy loop interrupted by the timer: ticks>=3 is 1") >= n, "signals (%s): alarm interrupts pause(); a periodic timer interrupts a loop with no system calls" % tag)
+    check(L.count("nanosleep: r=-1 errno=EINTR remaining>0=1") >= n and L.count("restart: read=1 c=z handler ran=1") >= n, "signals (%s): nanosleep gives EINTR; SA_RESTART restarts a blocked read" % tag)
+    check(L.count("child killed: signaled=1 sig=15 chld=1") >= n, "signals (%s): SIGTERM ends a child by default, SIGCHLD handler runs" % tag)
+    check(L.count("SIGSEGV handler: addr=") >= n and L.count("recovered from SIGSEGV") >= n and L.count("recovered from SIGFPE") >= n, "signals (%s): a page fault and a division by zero reach their handlers (siglongjmp out)" % tag)
+    check(L.count("unhandled fault: signaled=1 sig=11") >= n and L.count("abort: sig=6") >= n, "signals (%s): an unhandled fault ends with SIGSEGV; abort() gives SIGABRT" % tag)
 check("lxtest: /bin/nothere: cannot read" in L, "a missing program is reported")
 check("lxtest: done" in L, "the test finished")
 # the host looks at the disk

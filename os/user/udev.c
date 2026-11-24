@@ -530,6 +530,34 @@ static SpStatus l_resume(SpVM *vm, int argc, const SpValue *argv, SpValue *ret) 
     return SP_OK;
 }
 static SpStatus l_setsp(SpVM *vm, int argc, const SpValue *argv, SpValue *ret) { (void)argc; return l_call3(vm, argv, 1054, ret); }
+/* getctx(pid) -> typed.u8 of 83 words (see sched.sp, lx_getctx); setctx(pid, bytes); sigpend(pid, on) */
+static SpStatus l_getctx(SpVM *vm, int argc, const SpValue *argv, SpValue *ret) {
+    (void)argc;
+    int64_t pid;
+    if (lx_int(vm, argv, 0, &pid) != SP_OK) return SP_E_RUNTIME;
+    uint64_t tmp[83];
+    long r = sc3(1055, (long)pid, (long)(uintptr_t)tmp, 0);
+    *ret = r == 0 ? typed_u8_from(vm, (const unsigned char *)tmp, sizeof tmp) : sp_nil();
+    return SP_OK;
+}
+static SpStatus l_setctx(SpVM *vm, int argc, const SpValue *argv, SpValue *ret) {
+    (void)argc;
+    int64_t pid;
+    if (lx_int(vm, argv, 0, &pid) != SP_OK) return SP_E_RUNTIME;
+    unsigned char *d = typed_u8_data(argv[1]);
+    if (!d || typed_len(argv[1]) != 83 * 8) return sp_throw(vm, "ValueError", "lx.setctx: expected 664 bytes");
+    uint64_t tmp[83];
+    memcpy(tmp, d, sizeof tmp);
+    *ret = sp_int(sc3(1056, (long)pid, (long)(uintptr_t)tmp, 0));
+    return SP_OK;
+}
+static SpStatus l_sigpend(SpVM *vm, int argc, const SpValue *argv, SpValue *ret) {
+    (void)argc;
+    int64_t pid, on;
+    if (lx_int(vm, argv, 0, &pid) != SP_OK || lx_int(vm, argv, 1, &on) != SP_OK) return SP_E_RUNTIME;
+    *ret = sp_int(sc3(1057, (long)pid, (long)on, 0));
+    return SP_OK;
+}
 static SpStatus l_start(SpVM *vm, int argc, const SpValue *argv, SpValue *ret) { (void)argc; return l_call3(vm, argv, 1046, ret); }
 static SpStatus l_reply(SpVM *vm, int argc, const SpValue *argv, SpValue *ret) { (void)argc; return l_call3(vm, argv, 1047, ret); }
 static SpStatus l_kill(SpVM *vm, int argc, const SpValue *argv, SpValue *ret) { (void)argc; return l_call3(vm, argv, 1048, ret); }
@@ -537,7 +565,7 @@ static SpStatus l_setfs(SpVM *vm, int argc, const SpValue *argv, SpValue *ret) {
 static const SpNativeDesc lx_fns[] = {
     {"create", 0, 0, 0, 0, l_create}, {"map", 4, 4, 0, 0, l_map}, {"unmap", 3, 3, 0, 0, l_unmap}, {"protect", 4, 4, 0, 0, l_protect},
     {"write", 3, 5, 0, 0, l_write}, {"read", 3, 3, 0, SP_NATIVE_ALLOCATES, l_read}, {"start", 3, 3, 0, 0, l_start},
-    {"reply", 2, 2, 0, 0, l_reply}, {"fork", 1, 1, 0, 0, l_fork}, {"clone", 2, 2, 0, 0, l_clone}, {"resume", 1, 1, 0, 0, l_resume}, {"setsp", 2, 2, 0, 0, l_setsp}, {"reset", 1, 1, 0, 0, l_reset}, {"kill", 2, 2, 0, 0, l_kill}, {"setfs", 2, 2, 0, 0, l_setfs},
+    {"reply", 2, 2, 0, 0, l_reply}, {"fork", 1, 1, 0, 0, l_fork}, {"getctx", 1, 1, 0, SP_NATIVE_ALLOCATES, l_getctx}, {"setctx", 2, 2, 0, 0, l_setctx}, {"sigpend", 2, 2, 0, 0, l_sigpend}, {"clone", 2, 2, 0, 0, l_clone}, {"resume", 1, 1, 0, 0, l_resume}, {"setsp", 2, 2, 0, 0, l_setsp}, {"reset", 1, 1, 0, 0, l_reset}, {"kill", 2, 2, 0, 0, l_kill}, {"setfs", 2, 2, 0, 0, l_setfs},
 };
 
 /* ---- module `uio`: port I/O for a driver process (the kernel opens the ports in its I/O permission bitmap; anything else faults) ---- */
