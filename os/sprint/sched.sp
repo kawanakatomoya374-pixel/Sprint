@@ -424,6 +424,40 @@ func lx_syscall(p, nr):
     set_ret(p, -38)
     return true
 
+func hex64(x):
+    let d = "0123456789abcdef"
+    let out = ""
+    for i in range(16):
+        out = out .. d.slice(((x >> (60 - 4 * i)) & 15), ((x >> (60 - 4 * i)) & 15) + 1)
+    return out
+
+# words from `va`, equal neighbours folded ("0000000000000000 x100000"); unmapped memory shows as "--"
+func dump_words(proc, va, n):
+    let out = ""
+    let prev = nil
+    let run = 0
+    for i in range(n):
+        let w = proc.space.read64(va + 8 * i)
+        let t = "--" if w == nil else hex64(w)
+        if t == prev:
+            run += 1
+            continue
+        if prev != nil:
+            out = out .. " " .. prev .. (" x" .. to_string(run) if run > 1 else "")
+        prev = t
+        run = 1
+    if prev != nil:
+        out = out .. " " .. prev .. (" x" .. to_string(run) if run > 1 else "")
+    return out
+
+# what a fault looks like: registers, the code bytes at rip, the top of the stack
+func trap_dump(p):
+    let rip = hw.peek64(p.ctx + kproc.CTX_RIP)
+    let rsp = hw.peek64(p.ctx + kproc.CTX_RSP)
+    log("  code at rip " .. hex64(rip) .. ":" .. dump_words(p, rip & ~7, 6))
+    log("  stack at rsp " .. hex64(rsp) .. ":" .. dump_words(p, rsp & ~7, 24))
+    log("  regs rbx=" .. hex64(hw.peek64(p.ctx + 8)) .. " rbp=" .. hex64(hw.peek64(p.ctx + 48)) .. " rdi=" .. hex64(hw.peek64(p.ctx + 40)) .. " rsi=" .. hex64(hw.peek64(p.ctx + 32)))
+
 func syscall(p):
     let nr = hw.peek64(p.ctx + kproc.CTX_RAX)
     if p.handler != 0:
@@ -644,6 +678,7 @@ export func trap(cpu, v):
             p.exit_code = 139
             finish(p)
     else:
-        log("pid " .. to_string(p.pid) .. " (" .. p.name .. "): trap ".. to_string(v) .. " err=" .. to_string(hw.peek64(p.ctx + kproc.CTX_ERR)) .. " rip=" .. to_string(hw.peek64(p.ctx + kproc.CTX_RIP)) .. " cr2=" .. to_string(hw.peek64(p.ctx + kproc.CTX_CR2)))
+        log("pid " .. to_string(p.pid) .. " (" .. p.name .. "): trap ".. to_string(v) .. " err=" .. to_string(hw.peek64(p.ctx + kproc.CTX_ERR)) .. " rip=" .. to_string(hw.peek64(p.ctx + kproc.CTX_RIP)) .. " rsp=" .. to_string(hw.peek64(p.ctx + kproc.CTX_RSP)) .. " rax=" .. to_string(hw.peek64(p.ctx + kproc.CTX_RAX)) .. " cs=" .. to_string(hw.peek64(p.ctx + 144)) .. " cr2=" .. to_string(hw.peek64(p.ctx + kproc.CTX_CR2)))
+        trap_dump(p)
         p.exit_code = 139
         finish(p)

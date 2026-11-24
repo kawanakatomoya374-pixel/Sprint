@@ -56,6 +56,7 @@ export class Process:
     let gui = false      # may map the framebuffer and read input
     let syscalls = 0
     let shm = []         # [segment id, address] of every shared segment mapped
+    let shm_free = []    # address ranges [va, bytes] of segments that were detached (reused, so the mmap area never creeps up to the stack)
     let inbox = []       # messages waiting (strings)
     let inbox_from = []  # the sender's pid of each
     let rfrom = 0        # where a blocked msg_recv wants the sender's pid (0 = nowhere)
@@ -123,9 +124,29 @@ export class Process:
     func mmap(self, len, flags):
         let n = (len + 4095) & ~4095
         let a = self.mmap_next
-        self.mmap_next += n + 4096   # a guard page after every mapping
+        if a + n + 4096 >= STACK_TOP - STACK_MAX - (1 << 20):
+            a = self.find_gap(n + 4096)      # the bump pointer reached the stack: first fit among the holes
+            if a == 0:
+                return 0
+        else:
+            self.mmap_next += n + 4096   # a guard page after every mapping
         self.add_region(a, a + n, flags)
         return a
+    # the lowest address >= MMAP_BASE where `need` bytes are free (0: none)
+    func find_gap(self, need):
+        let rs = self.owner().regions.slice(0, len(self.owner().regions))
+        rs.sort((x, y) => x.start < y.start)
+        let at = MMAP_BASE
+        let top = STACK_TOP - STACK_MAX - (1 << 20)
+        for r in rs:
+            if r.end <= at:
+                continue
+            if r.start >= top:
+                break
+            if r.start - at >= need:
+                return at
+            at = r.end + 4096
+        return at if top - at >= need else 0
     func munmap(self, a, len):
         let end = a + ((len + 4095) & ~4095)
         let keep = []
@@ -151,6 +172,8 @@ export class Process:
             keep.append(r)
         self.regions = keep
         self.space.unmap_free(a, end - a)
+        if end + 4096 == self.mmap_next and a >= MMAP_BASE:
+            self.mmap_next = a
     # execve: a fresh, empty address space and registers (the old frames are freed)
     func reset_space(self):
         self.space.destroy()

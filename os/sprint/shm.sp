@@ -30,8 +30,9 @@ export func attach(p, id):
     let n = k.shm_n(id)
     if n == 0:
         return -22
-    let va = p.mmap_next
-    p.mmap_next += n * 4096 + 4096
+    let va = p.mmap(n * 4096, vmm.W | vmm.U)      # the same address allocator (and region list) as every other mapping
+    if va == 0:
+        return -12
     for i in range(n):
         p.space.map(va + i * 4096, k.shm_page(id, i), vmm.W | vmm.U | vmm.DEVICE)
     k.shm_ref(id, 1)
@@ -59,6 +60,7 @@ export func detach(p, va):
         if e[1] == va:
             p.shm.remove_at(i)
             p.space.unmap_free(va, k.shm_n(e[0]) * 4096)
+            p.munmap(va, k.shm_n(e[0]) * 4096)
             k.shm_ref(e[0], -1)
             return 0
         i += 1
