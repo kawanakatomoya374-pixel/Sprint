@@ -45,6 +45,11 @@ void ssl_sha256_update(ssl_sha256_ctx *c, const uint8_t *p, size_t n) {
         if (fill + k < 64) return;
         sha256_block(c->h, c->buf);
     }
+    if (n >= 64 && ssl_accel_sha256()) {
+        size_t blocks = n / 64;
+        ssl_accel_sha256_blocks(c->h, p, blocks);
+        p += blocks * 64; n -= blocks * 64;
+    }
     for (; n >= 64; p += 64, n -= 64) sha256_block(c->h, p);
     if (n) memcpy(c->buf, p, n);
 }

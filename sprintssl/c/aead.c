@@ -135,6 +135,9 @@ static void gcm_tag(const aes_key *k, const uint8_t j0[16], u128 h, const uint8_
 }
 
 int ssl_aes_gcm_seal(const uint8_t *key, size_t kl, const uint8_t *nonce, const uint8_t *aad, size_t al, const uint8_t *pt, size_t n, uint8_t *out) {
+#ifndef SSL_NO_ACCEL
+    if (ssl_accel_aesgcm()) return ssl_accel_gcm(1, key, kl, nonce, aad, al, pt, n, out);
+#endif
     aes_key k;
     if (aes_setup(&k, key, kl)) return -1;
     uint8_t zero[16] = {0}, hb[16], j0[16];
@@ -147,6 +150,9 @@ int ssl_aes_gcm_seal(const uint8_t *key, size_t kl, const uint8_t *nonce, const 
 }
 
 int ssl_aes_gcm_open(const uint8_t *key, size_t kl, const uint8_t *nonce, const uint8_t *aad, size_t al, const uint8_t *ct, size_t n, uint8_t *out) {
+#ifndef SSL_NO_ACCEL
+    if (ssl_accel_aesgcm()) return ssl_accel_gcm(0, key, kl, nonce, aad, al, ct, n, out);
+#endif
     aes_key k;
     if (n < 16 || aes_setup(&k, key, kl)) return -1;
     n -= 16;
@@ -182,7 +188,12 @@ static void chacha_block(const uint8_t key[32], uint32_t ctr, const uint8_t nonc
 }
 static void chacha_xor(const uint8_t key[32], uint32_t ctr, const uint8_t nonce[12], const uint8_t *in, size_t n, uint8_t *out) {
     uint8_t b[64];
-    for (size_t off = 0; off < n; off += 64, ctr++) {
+    size_t off = 0;
+#ifndef SSL_NO_ACCEL
+    off = ssl_chacha_xor4(key, ctr, nonce, in, n, out);
+    ctr += (uint32_t)(off / 64);
+#endif
+    for (; off < n; off += 64, ctr++) {
         chacha_block(key, ctr, nonce, b);
         size_t m = n - off < 64 ? n - off : 64;
         for (size_t i = 0; i < m; i++) out[off + i] = (uint8_t)(in[off + i] ^ b[i]);

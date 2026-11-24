@@ -31,6 +31,11 @@ int ssl_hkdf_expand(int alg, const uint8_t *prk, size_t pl, const uint8_t *info,
 /* ---- AEAD: AES-GCM (key 16 or 32 bytes, nonce 12) and ChaCha20-Poly1305. seal writes n + 16 bytes; open returns 0 when the tag is right ---- */
 int ssl_aes_gcm_seal(const uint8_t *key, size_t kl, const uint8_t *nonce, const uint8_t *aad, size_t al, const uint8_t *pt, size_t n, uint8_t *out);
 int ssl_aes_gcm_open(const uint8_t *key, size_t kl, const uint8_t *nonce, const uint8_t *aad, size_t al, const uint8_t *ct, size_t n, uint8_t *out); /* n includes the tag */
+int ssl_accel_aesgcm(void);   /* 1 when this CPU has AES-NI and PCLMULQDQ */
+int ssl_accel_gcm(int seal, const uint8_t *key, size_t kl, const uint8_t *nonce, const uint8_t *aad, size_t al, const uint8_t *in, size_t n, uint8_t *out);
+size_t ssl_chacha_xor4(const uint8_t key[32], uint32_t ctr, const uint8_t nonce[12], const uint8_t *in, size_t n, uint8_t *out); /* whole 256-byte groups; returns the bytes done */
+int ssl_accel_sha256(void);   /* 1 when this CPU has the SHA extensions */
+void ssl_accel_sha256_blocks(uint32_t st[8], const uint8_t *data, size_t blocks);
 void ssl_chacha_seal(const uint8_t key[32], const uint8_t nonce[12], const uint8_t *aad, size_t al, const uint8_t *pt, size_t n, uint8_t *out);
 int ssl_chacha_open(const uint8_t key[32], const uint8_t nonce[12], const uint8_t *aad, size_t al, const uint8_t *ct, size_t n, uint8_t *out);
 

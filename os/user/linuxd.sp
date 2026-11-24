@@ -62,6 +62,7 @@ let table = {}            # system call number -> function(g, a)
 let verbose = false
 let prof = {}             # system call number -> [calls, ms] (verbose "prof")
 let prof_busy = 0
+let next_beat = 0
 let prof_wr = 0
 let prof_wrn = 0
 let prof_rd = 0
@@ -4395,6 +4396,13 @@ while running:
             m = ipc.recv_from(true, tmo)
         wake_sleepers()
         fire_alarms()
+        if verbose == "beat" and psys.ms() >= next_beat:
+            next_beat = psys.ms() + 20000
+            let line = ""
+            for t in keys(tmap):
+                let gg = tmap[t]
+                line = line .. " " .. to_string(t) .. ":" .. to_string(last_nr[t]) .. "/" .. to_string(gg.calls if gg != nil else 0) .. ("*" if blocked[t] != nil else "")
+            log("beat at " .. to_string(psys.ms()) .. " ms (tid:last syscall/calls, * blocked):" .. line)
         if m == nil:
             net_pump()
             recheck()
