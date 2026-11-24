@@ -4389,6 +4389,11 @@ while running:
             wd = ad
         if wd != 0 and (tmo == 0 or wd < tmo):
             tmo = wd
+        if verbose == "beat":
+            if next_beat == 0:
+                next_beat = psys.ms() + 20000
+            if tmo == 0 or next_beat < tmo:
+                tmo = next_beat               # wake up for the heartbeat even when nothing happens
         let m = nil
         if fs != nil and len(fs.backlog) > 0:
             m = fs.backlog.remove_at(0)           # a message that came in while we waited for fsd
