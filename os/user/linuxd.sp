@@ -60,6 +60,9 @@ let cur_tid = 0           # the thread whose system call is being served
 let futex_q = {}          # "pid:address" -> [[tid, bitset], ...]
 let table = {}            # system call number -> function(g, a)
 let verbose = false
+let shm_segs = {}         # System V segments, see sys_shmget
+let shm_next = 1
+let shm_attached = {}     # pid -> {address -> [shmid, pages]}
 let waiters = []     # [thread, check function, deadline (0 = none), result on timeout]
 let tmask = {}          # tid -> blocked signals (bit sig-1)
 let tpend = {}          # tid -> signals sent to that thread
@@ -1237,6 +1240,7 @@ func ended(g, status):
     if verbose:
         log("pid " .. to_string(g.pid) .. " ended at " .. to_string(psys.ms()) .. " after " .. to_string(g.calls) .. " calls")
     guests[g.pid] = nil
+    shm_exit(g.pid)
     for t in keys(g.tids):
         if t != g.pid:
             lx.kill(t, 0)
@@ -1340,6 +1344,7 @@ func do_fork(g, sp, tls):
     c.envp = g.envp
     for r in g.vm:
         c.vm.append(r)
+    shm_fork(g.pid, pid)
     for fd in g.fds:
         let f = g.fds[fd]
         if f != nil:
@@ -3823,6 +3828,121 @@ func sys_getsockopt(g, a):
     return 0
 
 
+# ================= System V shared memory (the X server and its clients share their framebuffers this way) =================
+# segment: [kernel segment id, size, key, removed]; linuxd holds one kernel reference until IPC_RMID, every attachment holds another, so a removed segment lives on until the last detach
+func sys_shmget(g, a):
+    let key = i32(a[0])
+    let size = a[1]
+    let flag = a[2]
+    if key != 0:
+        for id in keys(shm_segs):
+            let e = shm_segs[id]
+            if e[2] == key and not e[3]:
+                if (flag & 0x400) != 0 and (flag & 0x200) != 0:
+                    return -17
+                if size > e[1]:
+                    return -EINVAL
+                return id
+        if (flag & 0x200) == 0:
+            return -2
+    if size <= 0:
+        return -EINVAL
+    let kid = lx.shm_new(align_up(size) // 4096)
+    if kid < 0:
+        return -ENOMEM
+    let id = shm_next
+    shm_next += 1
+    shm_segs[id] = [kid, size, key, false, 0]
+    return id
+
+func sys_shmat(g, a):
+    let e = shm_segs[a[0]]
+    if e == nil:
+        return -EINVAL
+    let n = align_up(e[1])
+    let addr = a[1]
+    if addr == 0:
+        addr = g.mmap_next
+        g.mmap_next += n + 4096
+    elif (addr & 4095) != 0:
+        return -EINVAL
+    let r = lx.shm_attach(g.pid, addr, e[0])
+    if r < 0:
+        return -ENOMEM
+    vm_add(g, addr, addr + n, 7 if (a[2] & 0x1000) == 0 else 5, "SYSV" .. to_string(a[0]))
+    if shm_attached[g.pid] == nil:
+        shm_attached[g.pid] = {}
+    shm_attached[g.pid][addr] = [a[0], n]
+    e[4] += 1
+    return addr
+
+func sys_shmdt(g, a):
+    let t = shm_attached[g.pid]
+    if t == nil or t[a[0]] == nil:
+        return -EINVAL
+    let at = t[a[0]]
+    lx.shm_detach(g.pid, a[0])
+    vm_remove(g, a[0], a[0] + at[1])
+    t[a[0]] = nil
+    let e = shm_segs[at[0]]
+    if e != nil:
+        e[4] -= 1
+        if e[3] and e[4] <= 0:
+            shm_segs[at[0]] = nil
+    return 0
+
+func sys_shmctl(g, a):
+    let e = shm_segs[a[0]]
+    if e == nil:
+        return -EINVAL
+    let cmd = a[1] & 0xFF
+    if cmd == 0:                      # IPC_RMID
+        if not e[3]:
+            e[3] = true
+            lx.shm_drop(e[0])
+        if e[4] <= 0:
+            shm_segs[a[0]] = nil
+        return 0
+    if cmd == 2 or cmd == 13:         # IPC_STAT, SHM_STAT
+        let b = []
+        for i in range(112):
+            b.append(0)
+        put32(b, 4, 0)
+        put32(b, 0, e[2])
+        put32(b, 20, 0o666)
+        put64(b, 48, e[1])
+        put32(b, 80, g.pid)
+        put64(b, 88, e[4])
+        return wr(g, a[2], sslcore.concat([b])) if a[2] != 0 else -EFAULT
+    return 0                          # IPC_SET, SHM_LOCK ... : accepted
+
+func shm_fork(parent, child):
+    let t = shm_attached[parent]
+    if t == nil:
+        return 0
+    let c = {}
+    for addr in keys(t):
+        c[addr] = t[addr]
+        let e = shm_segs[t[addr][0]]
+        if e != nil:
+            e[4] += 1
+    shm_attached[child] = c
+    return 0
+
+func shm_exit(pid):
+    let t = shm_attached[pid]
+    if t == nil:
+        return 0
+    for addr in keys(t):
+        let e = shm_segs[t[addr][0]]
+        if e != nil:
+            e[4] -= 1
+            if e[3] and e[4] <= 0:
+                shm_segs[t[addr][0]] = nil
+    shm_attached[pid] = nil
+    return 0
+
+
 func setup():
     table[0] = sys_read
     table[1] = sys_write
@@ -3833,6 +3953,10 @@ func setup():
     table[6] = sys_lstat
     table[8] = sys_lseek
     table[9] = sys_mmap
+    table[29] = sys_shmget
+    table[30] = sys_shmat
+    table[31] = sys_shmctl
+    table[67] = sys_shmdt
     table[10] = sys_mprotect
     table[11] = sys_munmap
     table[12] = sys_brk

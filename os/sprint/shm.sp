@@ -38,6 +38,17 @@ export func attach(p, id):
     p.shm.append([id, va])
     return va
 
+# map segment `id` into p at the given address (a Linux program's shmat); returns va, or a negative errno
+export func attach_at(p, va, id):
+    let n = k.shm_n(id)
+    if n == 0:
+        return -22
+    for i in range(n):
+        p.space.map(va + i * 4096, k.shm_page(id, i), vmm.W | vmm.U | vmm.DEVICE)
+    k.shm_ref(id, 1)
+    p.shm.append([id, va])
+    return va
+
 export func size_of(id):
     return k.shm_n(id) * 4096
 

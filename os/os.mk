@@ -207,3 +207,6 @@ $(OSB)/sprintos-lxtest.img: $(OSB)/kernel.elf os/boot/sprintboot.sp os/boot/bios
 # Linux programs (static-pie, built here with musl-gcc) run on SprintOS: the kernel forwards their system calls to linuxd, which answers them in Sprint
 os-linux-test: $(OSB)/sprintos-lxtest.img $(BUILD)/sprint
 	python3 os/tests/linux_test.py $(OSB)/sprintos-lxtest.img
+
+$(OSB)/sprintos-lxrun.img: $(OSB)/kernel.elf os/boot/sprintboot.sp os/boot/bios_loader.sp os/boot/elf32.sp os/boot/boot_menu.sp stdlib/asm.sp $(BUILD)/sprint
+	$(BUILD)/sprint run --allow-read=$(OSB) --allow-write=$(OSB) os/boot/sprintboot.sp $(OSB)/kernel32.elf $@ "init=lxrun"

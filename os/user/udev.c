@@ -558,6 +558,34 @@ static SpStatus l_sigpend(SpVM *vm, int argc, const SpValue *argv, SpValue *ret)
     *ret = sp_int(sc3(1057, (long)pid, (long)on, 0));
     return SP_OK;
 }
+static SpStatus l_shm_attach(SpVM *vm, int argc, const SpValue *argv, SpValue *ret) {
+    (void)argc;
+    int64_t pid, addr, id;
+    if (lx_int(vm, argv, 0, &pid) != SP_OK || lx_int(vm, argv, 1, &addr) != SP_OK || lx_int(vm, argv, 2, &id) != SP_OK) return SP_E_RUNTIME;
+    *ret = sp_int(sc3(1058, (long)pid, (long)addr, (long)id));
+    return SP_OK;
+}
+static SpStatus l_shm_detach(SpVM *vm, int argc, const SpValue *argv, SpValue *ret) {
+    (void)argc;
+    int64_t pid, addr;
+    if (lx_int(vm, argv, 0, &pid) != SP_OK || lx_int(vm, argv, 1, &addr) != SP_OK) return SP_E_RUNTIME;
+    *ret = sp_int(sc3(1059, (long)pid, (long)addr, 0));
+    return SP_OK;
+}
+static SpStatus l_shm_new(SpVM *vm, int argc, const SpValue *argv, SpValue *ret) {
+    (void)argc;
+    int64_t n;
+    if (lx_int(vm, argv, 0, &n) != SP_OK) return SP_E_RUNTIME;
+    *ret = sp_int(sc3(1060, (long)n, 0, 0));
+    return SP_OK;
+}
+static SpStatus l_shm_drop(SpVM *vm, int argc, const SpValue *argv, SpValue *ret) {
+    (void)argc;
+    int64_t id;
+    if (lx_int(vm, argv, 0, &id) != SP_OK) return SP_E_RUNTIME;
+    *ret = sp_int(sc3(1061, (long)id, 0, 0));
+    return SP_OK;
+}
 static SpStatus l_start(SpVM *vm, int argc, const SpValue *argv, SpValue *ret) { (void)argc; return l_call3(vm, argv, 1046, ret); }
 static SpStatus l_reply(SpVM *vm, int argc, const SpValue *argv, SpValue *ret) { (void)argc; return l_call3(vm, argv, 1047, ret); }
 static SpStatus l_kill(SpVM *vm, int argc, const SpValue *argv, SpValue *ret) { (void)argc; return l_call3(vm, argv, 1048, ret); }
@@ -565,7 +593,7 @@ static SpStatus l_setfs(SpVM *vm, int argc, const SpValue *argv, SpValue *ret) {
 static const SpNativeDesc lx_fns[] = {
     {"create", 0, 0, 0, 0, l_create}, {"map", 4, 4, 0, 0, l_map}, {"unmap", 3, 3, 0, 0, l_unmap}, {"protect", 4, 4, 0, 0, l_protect},
     {"write", 3, 5, 0, 0, l_write}, {"read", 3, 3, 0, SP_NATIVE_ALLOCATES, l_read}, {"start", 3, 3, 0, 0, l_start},
-    {"reply", 2, 2, 0, 0, l_reply}, {"fork", 1, 1, 0, 0, l_fork}, {"getctx", 1, 1, 0, SP_NATIVE_ALLOCATES, l_getctx}, {"setctx", 2, 2, 0, 0, l_setctx}, {"sigpend", 2, 2, 0, 0, l_sigpend}, {"clone", 2, 2, 0, 0, l_clone}, {"resume", 1, 1, 0, 0, l_resume}, {"setsp", 2, 2, 0, 0, l_setsp}, {"reset", 1, 1, 0, 0, l_reset}, {"kill", 2, 2, 0, 0, l_kill}, {"setfs", 2, 2, 0, 0, l_setfs},
+    {"reply", 2, 2, 0, 0, l_reply}, {"fork", 1, 1, 0, 0, l_fork}, {"shm_attach", 3, 3, 0, 0, l_shm_attach}, {"shm_new", 1, 1, 0, 0, l_shm_new}, {"shm_drop", 1, 1, 0, 0, l_shm_drop}, {"shm_detach", 2, 2, 0, 0, l_shm_detach}, {"getctx", 1, 1, 0, SP_NATIVE_ALLOCATES, l_getctx}, {"setctx", 2, 2, 0, 0, l_setctx}, {"sigpend", 2, 2, 0, 0, l_sigpend}, {"clone", 2, 2, 0, 0, l_clone}, {"resume", 1, 1, 0, 0, l_resume}, {"setsp", 2, 2, 0, 0, l_setsp}, {"reset", 1, 1, 0, 0, l_reset}, {"kill", 2, 2, 0, 0, l_kill}, {"setfs", 2, 2, 0, 0, l_setfs},
 };
 
 

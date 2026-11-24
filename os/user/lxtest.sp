@@ -39,7 +39,7 @@ func run(path, args, env):
 
 ipc.send(srv, "verbose")
 ipc.recv_from()
-let progs = ["/bin/hello", "/bin/files", "/bin/proc", "/bin/hello_dyn", "/bin/glibc", "/bin/dl", "/bin/threads", "/bin/threads_glibc", "/bin/socks", "/bin/signals", "/bin/signals_glibc", "/bin/procfs", "/bin/nettest"]
+let progs = ["/bin/hello", "/bin/files", "/bin/proc", "/bin/hello_dyn", "/bin/glibc", "/bin/dl", "/bin/threads", "/bin/threads_glibc", "/bin/socks", "/bin/signals", "/bin/signals_glibc", "/bin/procfs", "/bin/shm", "/bin/nettest"]
 
 for p in progs:
     run(p, [p, "one", "two words"], ["HOME=/root", "LANG=C"])

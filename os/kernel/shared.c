@@ -297,7 +297,7 @@ static SpStatus k_name_get(SpVM *vm, int argc, const SpValue *argv, SpValue *ret
 static SpStatus k_shm_create(SpVM *vm, int argc, const SpValue *argv, SpValue *ret) {
     (void)argc;
     ARG(0, npages);
-    if (npages <= 0 || npages > 4096) { *ret = sp_int(-22); return SP_OK; }
+    if (npages <= 0 || npages > 16384) { *ret = sp_int(-22); return SP_OK; }
     uint64_t *pages = (uint64_t *)malloc((size_t)npages * 8);
     if (!pages) { *ret = sp_int(-12); return SP_OK; }
     for (int64_t i = 0; i < npages; i++) {

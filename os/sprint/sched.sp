@@ -7,6 +7,7 @@ import vmm
 import ksys
 import lapic
 import ioapic
+import shm
 
 const PF = 14
 const SLICE_MS = 10
@@ -278,6 +279,16 @@ func lx_syscall(p, nr):
         p.children[pid] = true
         set_ret(p, pid)
         return true
+    if nr == 1060:   # lx_shm_new(pages): a segment the caller (linuxd) holds one reference to
+        let id = k.shm_create(a0)
+        if id > 0:
+            k.shm_ref(id, 1)
+        set_ret(p, id)
+        return true
+    if nr == 1061:   # lx_shm_drop(id): give that reference back (the segment goes when the last attachment does)
+        k.shm_ref(a0, -1)
+        set_ret(p, 0)
+        return true
     let q = lx_target(p, a0)
     if q == nil:
         set_ret(p, -3)
@@ -375,6 +386,12 @@ func lx_syscall(p, nr):
         q.sigpend = a1 != 0
         set_ret(p, 0)
         return true
+    if nr == 1058:   # lx_shm_attach(pid, addr, id): map shared segment `id` into the program at addr (System V shmat, shared mappings)
+        set_ret(p, shm.attach_at(m, a1, a2))
+        return true
+    if nr == 1059:   # lx_shm_detach(pid, addr)
+        set_ret(p, shm.detach(m, a1))
+        return true
     if nr == 1054:   # lx_setsp(pid, sp)
         hw.poke64(q.ctx + kproc.CTX_RSP, a1)
         set_ret(p, 0)
@@ -417,7 +434,7 @@ func syscall(p):
             return false
         p.exit_code = 137
         return false
-    if nr >= 1040 and nr < 1060:
+    if nr >= 1040 and nr < 1070:
         return lx_syscall(p, nr)
     if nr == 35:   # nanosleep(&ts, nil)
         let ts = p.space.read64(hw.peek64(p.ctx + kproc.CTX_RDI))

@@ -1,6 +1,7 @@
 # kproc: a user process = one address space + one saved CPU context + a table of memory regions.
 # Pages are filled in on first touch (#PF), so stacks and mmap areas cost nothing until used.
 import hw
+import k
 import kmem
 import vmm
 import kelf
@@ -281,12 +282,16 @@ export func fork(src, pid):
         let a = r.start
         while a < r.end:
             let p = o.space.translate(a)
-            if p != nil:
+            if p != nil and o.space.flags_of(a) & vmm.DEVICE != 0:
+                c.space.map(a, p & ~4095, o.space.flags_of(a) & 0xFFF & ~vmm.P)   # a shared segment stays shared
+            elif p != nil:
                 let q = kmem.alloc()
                 c.space.pages.append(q)
                 hw.memcpy(q, p & ~4095, 4096)
                 c.space.map(a, q, o.space.flags_of(a) & 0xFFF & ~vmm.P)
             a += 4096
+    for e in o.shm:                       # attached shared segments are inherited
+        shm.attach_at(c, e[1], e[0])
     hw.memcpy(c.ctx, src.ctx, 768)
     hw.poke64(c.ctx + CTX_CR3, c.space.pml4)
     return c
