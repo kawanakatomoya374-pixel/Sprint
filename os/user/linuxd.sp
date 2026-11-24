@@ -4286,7 +4286,7 @@ func serve_call(g, q):
         prof_busy += t_end - t_start
     if verbose and psys.ms() - t_start > 150:
         log("slow: tid " .. to_string(cur_tid) .. " syscall " .. to_string(nr) .. " (" .. to_string(a[0]) .. "," .. to_string(a[1]) .. "," .. to_string(a[2]) .. ") took " .. to_string(psys.ms() - t_start) .. " ms")
-    if verbose == "trace" and cur_tid >= 8:
+    if verbose == "trace" and cur_tid >= 7:
         log("tid " .. to_string(cur_tid) .. " syscall " .. to_string(nr) .. " (" .. to_string(a[0]) .. "," .. to_string(a[1]) .. "," .. to_string(a[2]) .. ") = " .. to_string(r))
     if r != nil:
         reply(cur_tid, r)
@@ -4348,7 +4348,7 @@ while running:
             continue
         let src = m[0]
         let text = m[1]
-        if verbose == "trace" and src >= 8:
+        if verbose == "trace" and src >= 7:
             log("recv from " .. to_string(src) .. ": " .. text.slice(0, imin(30, len(text))))
         if net != nil and src == net.link.pid:
             net_message(text)
