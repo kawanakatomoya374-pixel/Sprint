@@ -17,7 +17,7 @@ glibc_ok = subprocess.run(["gcc", "-O2", "-pie", "-fPIE", "-o", os.path.join(tmp
 glibc_ok = glibc_ok and subprocess.run(["gcc", "-O2", "-pie", "-fPIE", "-o", os.path.join(tmp, "dl"), os.path.join(src, "dl.c"), "-ldl"], capture_output=True).returncode == 0
 glibc_ok = glibc_ok and subprocess.run(["gcc", "-O2", "-pie", "-fPIE", "-pthread", "-o", os.path.join(tmp, "threads_glibc"), os.path.join(src, "threads.c")], capture_output=True).returncode == 0
 check(glibc_ok, "gcc builds glibc dynamic PIE programs")
-for name, flags in (("hello", ["-static-pie"]), ("files", ["-static-pie"]), ("proc", ["-static-pie"]), ("threads", ["-static-pie", "-pthread"]), ("hello_dyn", ["-pie", "-fPIE"])):
+for name, flags in (("hello", ["-static-pie"]), ("files", ["-static-pie"]), ("proc", ["-static-pie"]), ("threads", ["-static-pie", "-pthread"]), ("socks", ["-static-pie"]), ("hello_dyn", ["-pie", "-fPIE"])):
     r = subprocess.run(["musl-gcc"] + flags + ["-O2", "-o", os.path.join(tmp, name), os.path.join(src, name.replace("_dyn", "") + ".c")], capture_output=True, text=True)
     check(r.returncode == 0, "musl-gcc builds %s (%s)" % (name, " ".join(flags)))
 fsimg = os.path.join(tmp, "fs.img")
@@ -63,7 +63,7 @@ echo "done" | tr a-z A-Z
 exit 5
 """)
 tool("put", os.path.join(tmp, "script.sh"), "/lx/script.sh")
-tool("put", os.path.join(tmp, "threads"), "/bin/threads"); tool("put", os.path.join(tmp, "proc"), "/bin/proc"); tool("put", os.path.join(tmp, "hello_dyn"), "/bin/hello_dyn")
+tool("put", os.path.join(tmp, "socks"), "/bin/socks"); tool("mkdir", "/tmp"); tool("put", os.path.join(tmp, "threads"), "/bin/threads"); tool("put", os.path.join(tmp, "proc"), "/bin/proc"); tool("put", os.path.join(tmp, "hello_dyn"), "/bin/hello_dyn")
 tool("put", os.path.join(tmp, "hello"), "/bin/hello"); tool("put", os.path.join(tmp, "files"), "/bin/files"); tool("put", os.path.join(tmp, "input.txt"), "/lx/input.txt")
 ser = os.path.join(OUT, "linux.log")
 if os.path.exists(ser): os.remove(ser)
@@ -106,6 +106,12 @@ check("shell works" in L and "a\nb\nc" in L.replace("\r", "") and "HELLO from th
 check("1 2 3" in L and "got subshell" in L and "DONE" in L, "dash: loops, command substitution (fork + pipe), tr")
 check("lxtest: /usr/bin/dash exited with 5" in L, "the script's exit status")
 check("dlopen: ok" in L and "dlsym: serialize=found compile=found" in L, "dlopen / dlsym of a real shared library (libpcre2) finds its symbols")
+check("socketpair: ping" in L and "after shutdown: read=0" in L, "socketpair and shutdown(SHUT_WR) give EOF")
+check("bind unix: 0" in L and "unix server got: hello unix" in L and "unix echo: reply!" in L, "AF_UNIX stream sockets: bind, listen, accept, connect between processes")
+check("bind tcp: 0" in L and "listening on port 8080" in L and "epoll: 1 ready, listener=1" in L, "loopback TCP: bind/listen, getsockname, epoll on the listening socket")
+check("tcp loopback: 3 bytes then EOF after 1 wakeups" in L, "loopback TCP: nonblocking accept4, epoll, data and EOF")
+check("poll after close: 1 hup=1" in L and "connect refused: yes" in L, "poll reports hang-up; connecting to nothing gives ECONNREFUSED")
+check("udp loopback: datagram" in L, "UDP datagrams on the loopback")
 check("lxtest: /bin/nothere: cannot read" in L, "a missing program is reported")
 check("lxtest: done" in L, "the test finished")
 # the host looks at the disk

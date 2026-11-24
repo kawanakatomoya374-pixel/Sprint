@@ -157,6 +157,9 @@ func fclose(f):
     f.refs -= 1
     if f.refs > 0:
         return nil
+    if f.kind == "sock":
+        sock_close(f)
+        return nil
     if f.kind == "pipe":
         let p = f.pipe
         if f.end == "r":
@@ -456,6 +459,8 @@ func do_write(g, f, b):
         return len(b)
     if f.kind == "null":
         return len(b)
+    if f.kind == "sock":
+        return sock_send(g, f, b, 0, nil)
     if f.kind == "eventfd":
         return eventfd_write(g, f, b)
     if f.kind == "pipe" and f.end == "w":
@@ -524,6 +529,8 @@ func sys_read(g, a):
         return -EBADF
     if f.kind == "dir":
         return -EISDIR
+    if f.kind == "sock":
+        return sys_recvfrom(g, [a[0], a[1], a[2], 0, 0, 0])
     if f.kind == "eventfd":
         return eventfd_read(g, f, a[1])
     if f.kind == "pipe":
@@ -1945,7 +1952,7 @@ func fd_ready(f):
     if k == "epoll":
         return POLLIN if len(epoll_ready(f, 1)) > 0 else 0
     if k == "sock":
-        return POLLIN | POLLOUT
+        return sock_ready(f)
     return POLLIN | POLLOUT
 
 func sys_poll_core(g, fds_addr, nfds, timeout_ms):
@@ -2155,6 +2162,453 @@ func eventfd_write(g, f, b):
     return 8
 
 
+
+# ================= sockets: AF_UNIX and loopback (in this process; the network ones come later) =================
+const AF_UNIX = 1
+const AF_INET = 2
+const AF_INET6 = 10
+const ECONNREFUSED = 111
+const EADDRINUSE = 98
+const EISCONN = 106
+const ENOTCONN = 107
+const EAFNOSUPPORT = 97
+const EPIPE = 32
+const ENETUNREACH = 101
+
+let unix_names = {}      # path -> listening / bound socket
+let inet_ports = {}      # port -> listening / bound socket (loopback)
+let next_port = 40000
+
+func new_sock(domain, type, flags):
+    return {kind: "sock", domain: domain, type: type & 15, nonblock: (type & 0x800) != 0, state: "new", name: nil, port: 0, backlog: [], peer: nil,
+            data: [], size: 0, msgs: [], eof: false, shut_wr: false, shut_rd: false, opts: {}}
+
+func sock_of(g, fd):
+    let f = g.fds[i32(fd)]
+    if f == nil or f.kind != "sock":
+        return nil
+    return f
+
+func sock_ready(f):
+    if f.state == "listening":
+        return POLLIN if len(f.backlog) > 0 else 0
+    if f.type == 2:
+        return (POLLIN if len(f.msgs) > 0 else 0) | POLLOUT
+    let r = 0
+    if f.size > 0 or f.eof or f.shut_rd:
+        r = POLLIN
+    if f.eof:
+        r = r | POLLHUP | POLLIN
+    if f.state == "connected":
+        r = r | POLLOUT
+    if f.state == "new":
+        r = r | POLLOUT | POLLHUP
+    return r
+
+func sock_close(f):
+    if f.name != nil:
+        if f.domain == AF_UNIX and unix_names[f.name] == f:
+            unix_names[f.name] = nil
+        if f.domain != AF_UNIX and inet_ports[f.port] == f:
+            inet_ports[f.port] = nil
+    let p = f.peer
+    if p != nil:
+        p.eof = true
+        p.peer = nil
+    for c in f.backlog:           # connections that were never accepted
+        if c.peer != nil:
+            c.peer.eof = true
+            c.peer.peer = nil
+    f.state = "closed"
+
+# a sockaddr from the program's memory: ["unix", path] or ["inet", ip (int), port]
+func read_sockaddr(g, addr, alen):
+    if alen < 2:
+        return nil
+    let b = rd(g, addr, imin(alen, 128))
+    if b == nil:
+        return nil
+    let fam = u16(b, 0)
+    if fam == AF_UNIX:
+        let stop = 2
+        if len(b) > 2 and b[2] == 0:                  # abstract
+            return ["unix", "@" .. sslcore.to_text(b.slice(3))]
+        while stop < len(b) and b[stop] != 0:
+            stop += 1
+        return ["unix", sslcore.to_text(b.slice(2, stop))]
+    if fam == AF_INET and len(b) >= 8:
+        return ["inet", (b[4] << 24) | (b[5] << 16) | (b[6] << 8) | b[7], (b[2] << 8) | b[3]]
+    if fam == AF_INET6 and len(b) >= 24:
+        let port = (b[2] << 8) | b[3]
+        let loop = true
+        for i in range(8, 23):
+            if b[i] != 0:
+                loop = false
+        if loop and b[23] == 1:
+            return ["inet", 0x7f000001, port]
+        let mapped = true
+        for i in range(8, 18):
+            if b[i] != 0:
+                mapped = false
+        if mapped and b[18] == 255 and b[19] == 255:
+            return ["inet", (b[20] << 24) | (b[21] << 16) | (b[22] << 8) | b[23], port]
+        return ["inet6", 0, port]
+    return nil
+
+func u16le(v):
+    return [v & 255, (v >> 8) & 255]
+
+func sockaddr_bytes(f, local):
+    let other = f if local else f.peer
+    if other == nil:
+        return sslcore.concat([u16le(f.domain)])
+    if f.domain == AF_UNIX:
+        if other.name == nil:
+            return sslcore.concat([u16le(AF_UNIX)])
+        return sslcore.concat([u16le(AF_UNIX), sslcore.from_str(other.name), [0]])
+    let port = other.port
+    if f.domain == AF_INET6:
+        let b = []
+        for i in range(28):
+            b.append(0)
+        put16(b, 0, AF_INET6)
+        b[2] = (port >> 8) & 255
+        b[3] = port & 255
+        b[23] = 1
+        return sslcore.concat([b])
+    return sslcore.concat([u16le(AF_INET), [(port >> 8) & 255, port & 255, 127, 0, 0, 1], [0, 0, 0, 0, 0, 0, 0, 0]])
+
+func put_sockaddr(g, f, local, addr, lenptr):
+    if addr == 0 or lenptr == 0:
+        return 0
+    let sa = sockaddr_bytes(f, local)
+    let lb = rd(g, lenptr, 4)
+    if lb == nil:
+        return -EFAULT
+    let n = imin(u32(lb, 0), len(sa))
+    if n > 0:
+        wr(g, addr, sa.slice(0, n))
+    let ob = []
+    for i in range(4):
+        ob.append((len(sa) >> (8 * i)) & 255)
+    wr(g, lenptr, sslcore.concat([ob]))
+    return 0
+
+func sys_socket(g, a):
+    if a[0] != AF_UNIX and a[0] != AF_INET and a[0] != AF_INET6:
+        return -EAFNOSUPPORT
+    let t = a[1] & 15
+    if t != 1 and t != 2:
+        return -93
+    return g.alloc_fd(new_sock(a[0], a[1], 0))
+
+func sys_socketpair(g, a):
+    if a[0] != AF_UNIX:
+        return -EAFNOSUPPORT
+    let x = new_sock(AF_UNIX, a[1], 0)
+    let y = new_sock(AF_UNIX, a[1], 0)
+    x.peer = y
+    y.peer = x
+    x.state = "connected"
+    y.state = "connected"
+    let fa = g.alloc_fd(x)
+    let fb = g.alloc_fd(y)
+    let b = []
+    for i in range(8):
+        b.append(0)
+    put32(b, 0, fa)
+    put32(b, 4, fb)
+    return wr(g, a[3], sslcore.concat([b]))
+
+func sys_bind(g, a):
+    let f = sock_of(g, a[0])
+    if f == nil:
+        return -EBADF
+    let sa = read_sockaddr(g, a[1], a[2])
+    if sa == nil:
+        return -EINVAL
+    if sa[0] == "unix":
+        if unix_names[sa[1]] != nil:
+            return -EADDRINUSE
+        unix_names[sa[1]] = f
+        f.name = sa[1]
+    else:
+        let port = sa[2]
+        if port == 0:
+            port = next_port
+            next_port += 1
+        if inet_ports[port] != nil:
+            return -EADDRINUSE
+        inet_ports[port] = f
+        f.port = port
+        f.name = "inet"
+    f.state = "bound"
+    return 0
+
+func sys_listen(g, a):
+    let f = sock_of(g, a[0])
+    if f == nil:
+        return -EBADF
+    if f.type != 1:
+        return -95
+    if f.name == nil:                # listen without bind: an ephemeral port
+        f.port = next_port
+        next_port += 1
+        inet_ports[f.port] = f
+        f.name = "inet"
+    f.state = "listening"
+    f.opts.backlog = imax(1, a[1])
+    return 0
+
+func connect_loopback(g, f, target):
+    if target == nil or target.state != "listening":
+        return -ECONNREFUSED
+    if len(target.backlog) >= target.opts.backlog + 1:
+        return -ECONNREFUSED
+    let srv = new_sock(target.domain, 1, 0)
+    srv.state = "connected"
+    srv.name = target.name
+    srv.port = target.port
+    srv.peer = f
+    f.peer = srv
+    f.state = "connected"
+    if f.name == nil and f.domain != AF_UNIX:
+        f.port = next_port
+        next_port += 1
+        f.name = "inet"
+    target.backlog.append(srv)
+    return 0
+
+func net_connect(g, f, sa):
+    return -ENETUNREACH
+
+func sys_connect(g, a):
+    let f = sock_of(g, a[0])
+    if f == nil:
+        return -EBADF
+    let sa = read_sockaddr(g, a[1], a[2])
+    if sa == nil:
+        return -EINVAL
+    if f.state == "connected":
+        return -EISCONN
+    if f.type == 2:
+        f.opts.dest = sa          # a datagram socket just remembers where to send
+        f.state = "connected"
+        return 0
+    if sa[0] == "unix":
+        return connect_loopback(g, f, unix_names[sa[1]])
+    if sa[0] == "inet" and (sa[1] >> 24) == 127:
+        return connect_loopback(g, f, inet_ports[sa[2]])
+    return net_connect(g, f, sa)
+
+func sys_accept(g, a):
+    let f = sock_of(g, a[0])
+    if f == nil:
+        return -EBADF
+    if f.state != "listening":
+        return -EINVAL
+    let nb = f.nonblock or (a[3] & 0x800) != 0
+    func check():
+        if len(f.backlog) == 0:
+            return nil
+        let c = f.backlog.remove_at(0)
+        c.nonblock = (a[3] & 0x800) != 0
+        let fd = g.alloc_fd(c)
+        if a[1] != 0:
+            put_sockaddr(g, c, false, a[1], a[2])
+        return fd
+    return block(check, 0 if nb else -1, -EAGAIN)
+
+func sys_accept3(g, a):
+    return sys_accept(g, [a[0], a[1], a[2], 0])
+
+func sock_send(g, f, data, flags, dest):
+    if f.type == 2:
+        let d = dest if dest != nil else f.opts.dest
+        if d == nil:
+            return -89
+        let target = nil
+        if d[0] == "unix":
+            target = unix_names[d[1]]
+        elif d[0] == "inet":
+            target = inet_ports[d[2]]
+        if target == nil or target.type != 2:
+            return -ECONNREFUSED
+        target.msgs.append([data, f.name])
+        return len(data)
+    if f.state != "connected":
+        return -ENOTCONN
+    if f.shut_wr or f.peer == nil:
+        return -EPIPE
+    f.peer.data.append(data)
+    f.peer.size += len(data)
+    return len(data)
+
+func sock_take(f, n):
+    let all = sslcore.concat(f.data)
+    let out = all.slice(0, n)
+    let rest = all.slice(n)
+    f.data = [rest] if len(rest) > 0 else []
+    f.size = len(rest)
+    return out
+
+# bytes, an errno, or nil when the caller has to wait
+func sock_recv_check(f, n, peek):
+    if f.type == 2:
+        if len(f.msgs) == 0:
+            return nil
+        let m = f.msgs[0]
+        if not peek:
+            f.msgs.remove_at(0)
+        return m[0].slice(0, imin(n, len(m[0])))
+    if f.size > 0:
+        if peek:
+            return sslcore.concat(f.data).slice(0, imin(n, f.size))
+        return sock_take(f, imin(n, f.size))
+    if f.eof or f.shut_rd or f.state == "closed":
+        return sslcore.concat([[]])
+    if f.state != "connected":
+        return -ENOTCONN
+    return nil
+
+func sys_sendto(g, a):
+    let f = sock_of(g, a[0])
+    if f == nil:
+        return -EBADF
+    let data = rd(g, a[1], a[2])
+    if data == nil:
+        return -EFAULT
+    let dest = read_sockaddr(g, a[4], a[5]) if a[4] != 0 else nil
+    return sock_send(g, f, data, a[3], dest)
+
+func sys_recvfrom(g, a):
+    let f = sock_of(g, a[0])
+    if f == nil:
+        return -EBADF
+    let nb = f.nonblock or (a[3] & 0x40) != 0
+    let peek = (a[3] & 2) != 0
+    func check():
+        let r = sock_recv_check(f, a[2], peek)
+        if r == nil:
+            return nil
+        if type(r) == "int":
+            return r
+        if len(r) > 0:
+            let e = wr(g, a[1], r)
+            if e < 0:
+                return e
+        if a[4] != 0 and a[5] != 0:
+            put_sockaddr(g, f, false, a[4], a[5])
+        return len(r)
+    return block(check, 0 if nb else -1, -EAGAIN)
+
+# msghdr: name(8) namelen(4)+pad iov(8) iovlen(8) control(8) controllen(8) flags(4)
+func sys_sendmsg(g, a):
+    let f = sock_of(g, a[0])
+    if f == nil:
+        return -EBADF
+    let mh = rd(g, a[1], 56)
+    if mh == nil:
+        return -EFAULT
+    let iov = u64(mh, 16)
+    let parts = []
+    for i in range(u64(mh, 24)):
+        let e = rd(g, iov + i * 16, 16)
+        if e == nil:
+            return -EFAULT
+        if u64(e, 8) > 0:
+            let d = rd(g, u64(e, 0), u64(e, 8))
+            if d == nil:
+                return -EFAULT
+            parts.append(d)
+    let dest = read_sockaddr(g, u64(mh, 0), u32(mh, 8)) if u64(mh, 0) != 0 else nil
+    return sock_send(g, f, sslcore.concat(parts), a[2], dest)
+
+func sys_recvmsg(g, a):
+    let f = sock_of(g, a[0])
+    if f == nil:
+        return -EBADF
+    let mh = rd(g, a[1], 56)
+    if mh == nil:
+        return -EFAULT
+    let iov = u64(mh, 16)
+    let nb = f.nonblock or (a[2] & 0x40) != 0
+    let total = 0
+    let sizes = []
+    for i in range(u64(mh, 24)):
+        let e = rd(g, iov + i * 16, 16)
+        if e == nil:
+            return -EFAULT
+        sizes.append([u64(e, 0), u64(e, 8)])
+        total += u64(e, 8)
+    func check():
+        let r = sock_recv_check(f, total, (a[2] & 2) != 0)
+        if r == nil:
+            return nil
+        if type(r) == "int":
+            return r
+        let off = 0
+        for s in sizes:
+            if off >= len(r):
+                break
+            let k = imin(s[1], len(r) - off)
+            wr(g, s[0], r.slice(off, off + k))
+            off += k
+        wr(g, a[1] + 40, sslcore.concat([[0, 0, 0, 0, 0, 0, 0, 0]]))     # controllen = 0
+        wr(g, a[1] + 48, sslcore.concat([[0, 0, 0, 0]]))                  # flags
+        return len(r)
+    return block(check, 0 if nb else -1, -EAGAIN)
+
+func sys_shutdown(g, a):
+    let f = sock_of(g, a[0])
+    if f == nil:
+        return -EBADF
+    if f.state != "connected":
+        return -ENOTCONN
+    if a[1] == 1 or a[1] == 2:
+        f.shut_wr = true
+        if f.peer != nil:
+            f.peer.eof = true
+    if a[1] == 0 or a[1] == 2:
+        f.shut_rd = true
+    return 0
+
+func sys_getsockname(g, a):
+    let f = sock_of(g, a[0])
+    if f == nil:
+        return -EBADF
+    return put_sockaddr(g, f, true, a[1], a[2])
+
+func sys_getpeername(g, a):
+    let f = sock_of(g, a[0])
+    if f == nil:
+        return -EBADF
+    if f.peer == nil:
+        return -ENOTCONN
+    return put_sockaddr(g, f, false, a[1], a[2])
+
+func sys_setsockopt(g, a):
+    return 0 if sock_of(g, a[0]) != nil else -EBADF
+
+func sys_getsockopt(g, a):
+    let f = sock_of(g, a[0])
+    if f == nil:
+        return -EBADF
+    let v = 0
+    if a[1] == 1 and a[2] == 3:           # SO_TYPE
+        v = f.type
+    elif a[1] == 1 and (a[2] == 7 or a[2] == 8):     # SO_SNDBUF, SO_RCVBUF
+        v = 212992
+    if a[3] != 0:
+        let b = []
+        for i in range(4):
+            b.append((v >> (8 * i)) & 255)
+        wr(g, a[3], sslcore.concat([b]))
+        if a[4] != 0:
+            wr(g, a[4], sslcore.concat([[4, 0, 0, 0]]))
+    return 0
+
+
 func setup():
     table[0] = sys_read
     table[1] = sys_write
@@ -2228,6 +2682,22 @@ func setup():
     table[273] = sys_zero
     table[302] = sys_prlimit64
     table[318] = sys_getrandom
+    table[41] = sys_socket
+    table[42] = sys_connect
+    table[43] = sys_accept3
+    table[44] = sys_sendto
+    table[45] = sys_recvfrom
+    table[46] = sys_sendmsg
+    table[47] = sys_recvmsg
+    table[48] = sys_shutdown
+    table[49] = sys_bind
+    table[50] = sys_listen
+    table[51] = sys_getsockname
+    table[52] = sys_getpeername
+    table[53] = sys_socketpair
+    table[54] = sys_setsockopt
+    table[55] = sys_getsockopt
+    table[288] = sys_accept
     table[7] = sys_poll
     table[19] = sys_readv
     table[23] = sys_select

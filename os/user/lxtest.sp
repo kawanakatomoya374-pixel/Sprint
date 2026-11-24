@@ -34,7 +34,7 @@ func run(path, args, env):
 
 ipc.send(srv, "verbose")
 ipc.recv_from()
-let progs = ["/bin/hello", "/bin/files", "/bin/proc", "/bin/hello_dyn", "/bin/glibc", "/bin/dl", "/bin/threads", "/bin/threads_glibc"]
+let progs = ["/bin/hello", "/bin/files", "/bin/proc", "/bin/hello_dyn", "/bin/glibc", "/bin/dl", "/bin/threads", "/bin/threads_glibc", "/bin/socks"]
 
 for p in progs:
     run(p, [p, "one", "two words"], ["HOME=/root", "LANG=C"])
