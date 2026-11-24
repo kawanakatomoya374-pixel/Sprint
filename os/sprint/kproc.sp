@@ -34,6 +34,7 @@ export class Region:
     let start = 0
     let end = 0
     let flags = 0
+    let lazy = false          # file-backed: a first touch asks the server (linuxd) to fill the page
 
 export class Process:
     let pid = 0
@@ -108,6 +109,10 @@ export class Process:
         self.faults += 1
         self.space.map_range(addr & ~4095, 4096, r.flags)
         return true
+    # a not yet touched page of a lazy region: the server must fill it
+    func lazy_miss(self, addr):
+        let r = self.find_region(addr)
+        return r != nil and r.lazy and not self.space.is_mapped(addr & ~4095)
     # make sure [addr, addr + n) is backed (a kernel write into a not yet touched page of a region)
     func ensure(self, addr, n):
         let a = addr & ~4095
@@ -133,6 +138,7 @@ export class Process:
                 tail.start = end
                 tail.end = r.end
                 tail.flags = r.flags
+                tail.lazy = r.lazy
                 r.end = a
                 keep.append(r)
                 keep.append(tail)
@@ -168,17 +174,20 @@ export class Process:
                 left.start = r.start
                 left.end = a
                 left.flags = r.flags
+                left.lazy = r.lazy
                 out.append(left)
             if r.end > end:
                 let right = Region()
                 right.start = end
                 right.end = r.end
                 right.flags = r.flags
+                right.lazy = r.lazy
                 out.append(right)
             let mid = Region()
             mid.start = imax(r.start, a)
             mid.end = imin(r.end, end)
             mid.flags = flags
+            mid.lazy = r.lazy
             out.append(mid)
         self.regions = out
         let v = a & ~4095
@@ -279,6 +288,7 @@ export func fork(src, pid):
     c.mmap_next = o.mmap_next
     for r in o.regions:
         c.add_region(r.start, r.end, r.flags)
+        c.regions[len(c.regions) - 1].lazy = r.lazy
         let a = r.start
         while a < r.end:
             let p = o.space.translate(a)

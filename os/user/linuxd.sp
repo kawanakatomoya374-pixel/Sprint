@@ -16,7 +16,7 @@ import netstack
 import typed
 
 const USER_BASE = 0x8000000000
-const STACK_TOP = USER_BASE + 0x40000000
+const STACK_TOP = USER_BASE + 0x7000000000     # far above the mmap area (the JVM reserves gigabytes)
 const STACK_SIZE = 8 << 20
 const PIE_BASE = USER_BASE + 0x400000
 const INTERP_BASE = USER_BASE + 0x200000000
@@ -167,6 +167,7 @@ class Guest:
     let argv = nil
     let envp = nil
     let heap_start = 0
+    let lazy = nil            # file mappings filled on first touch: [start, end, path, file offset, {page -> true}]
     func init(self, pid, client):
         self.pid = pid
         self.client = client
@@ -175,6 +176,7 @@ class Guest:
         self.tids = {}
         self.tids[pid] = true
         self.vm = []
+        self.lazy = []
         self.argv = []
         self.envp = []
         self.sigs = {}
@@ -547,6 +549,7 @@ func setup_image(pid, img, path, argv, envp, g):
     g.heap_start = g.brk
     g.mmap_next = MMAP_BASE
     g.vm = []
+    g.lazy = []
     g.argv = argv
     g.envp = envp
     for sg in info.segs:
@@ -1154,6 +1157,13 @@ func sys_mmap(g, a):
         f = g.fds[i32(fd)]
         if f == nil or f.kind != "file":
             return -EBADF
+    if f != nil and f.kind == "file" and n >= (1 << 20) and (flags & 0x03) != 0:
+        # a big file (the JVM's 130 MB class library): pages are read when the program touches them
+        if lx.map(g.pid, addr, n, (3 if (prot & 2) != 0 else 1) | 4) != 0:
+            return -ENOMEM
+        vm_add(g, addr, addr + n, prot & 7, f.path)
+        g.lazy.append([addr, addr + n, f.path, off, {}])
+        return addr
     if lx.map(g.pid, addr, n, 3 if f != nil else (3 if (prot & 2) != 0 else 1)) != 0:
         return -ENOMEM
     vm_add(g, addr, addr + n, prot & 7, f.path if f != nil and f.kind == "file" else "")
@@ -1167,11 +1177,63 @@ func sys_mmap(g, a):
             lx.protect(g.pid, addr, n, 1)
     return addr
 
+func lazy_remove(g, a, b):
+    if len(g.lazy) == 0:
+        return 0
+    let out = []
+    for e in g.lazy:
+        if e[1] <= a or e[0] >= b:
+            out.append(e)
+        elif e[0] >= a and e[1] <= b:
+            pass
+        elif e[0] >= a:
+            e[3] += b - e[0]
+            e[0] = b
+            out.append(e)
+        elif e[1] <= b:
+            e[1] = a
+            out.append(e)
+        else:
+            out.append(e)
+    g.lazy = out
+    return 0
+
+# a first touch of a page of a big file mapping: read the next 64 KB window (pages not filled before) from the file, then let the instruction run again
+func serve_lazy(g, tid, q):
+    let addr = to_int(q[1])
+    let pg = addr & ~4095
+    for e in g.lazy:
+        if pg >= e[0] and pg < e[1]:
+            let hi = imin(e[1], (pg & ~65535) + 65536)
+            let lo = imax(pg & ~65535, e[0])
+            while lo < hi and e[4][lo >> 12] != nil and lo != pg:
+                lo += 4096
+            let fobj = {kind: "file", path: e[2], readable: true, pos: 0}
+            let data = do_read(g, fobj, hi - lo, e[3] + (lo - e[0]))
+            if type(data) == "int":
+                data = sslcore.concat([[]])
+            let b = data
+            if len(b) < hi - lo:
+                let z = []
+                for i in range(hi - lo - len(b)):
+                    z.append(0)
+                b = sslcore.concat([data, sslcore.concat([z])])
+            let a2 = lo
+            while a2 < hi:
+                if e[4][a2 >> 12] == nil:
+                    lx.write(g.pid, a2, b.slice(a2 - lo, a2 - lo + 4096))
+                    e[4][a2 >> 12] = true
+                a2 += 4096
+            lx.resume(tid)
+            return nil
+    serve_fault(g, tid, ["F", "14", to_string(addr), "4"])
+
 func sys_munmap(g, a):
     if (a[0] & 4095) != 0:
         return -EINVAL
     lx.unmap(g.pid, a[0], a[1])
     vm_remove(g, a[0], a[0] + align_up(a[1]))
+    lazy_remove(g, a[0], a[0] + align_up(a[1]))
     return 0
 
 func sys_mprotect(g, a):
@@ -1344,6 +1406,11 @@ func do_fork(g, sp, tls):
     c.envp = g.envp
     for r in g.vm:
         c.vm.append(r)
+    for e in g.lazy:
+        let d = {}
+        for kx in keys(e[4]):
+            d[kx] = true
+        c.lazy.append([e[0], e[1], e[2], e[3], d])
     shm_fork(g.pid, pid)
     for fd in g.fds:
         let f = g.fds[fd]
@@ -4206,6 +4273,9 @@ while running:
             if text == "S":
                 cur_tid = src
                 serve_signal_check(g, src)
+            elif text.starts_with("P\t"):
+                cur_tid = src
+                serve_lazy(g, src, text.split("\t"))
             elif text.starts_with("F\t"):
                 cur_tid = src
                 serve_fault(g, src, text.split("\t"))

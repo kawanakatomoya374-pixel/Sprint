@@ -301,6 +301,8 @@ func lx_syscall(p, nr):
             return true
         m.munmap(a1, a2)
         m.add_region(a1, a1 + ((a2 + 4095) & ~4095), flags)
+        if (a3 & 4) != 0:
+            m.regions[len(m.regions) - 1].lazy = true
         set_ret(p, 0)
         return true
     if nr == 1042:   # lx_unmap(pid, addr, len)
@@ -618,6 +620,13 @@ export func trap(cpu, v):
         p.slices += 1
         preemptions += 1
         k.stat_set(cpu, 1, preemptions)
+    elif v == PF and p.handler != 0 and p.lazy_miss(hw.peek64(p.ctx + kproc.CTX_CR2)):
+        # a page of a file mapping: the server reads it from the file, then lets the instruction run again
+        if send_to(p.handler, p.pid, "P\t" .. to_string(hw.peek64(p.ctx + kproc.CTX_CR2))):
+            p.state = "lxwait"
+        else:
+            p.exit_code = 139
+            finish(p)
     elif v == PF and p.fault(hw.peek64(p.ctx + kproc.CTX_CR2)):
         pass
     elif v >= ioapic.VECTOR_BASE and v < ioapic.VECTOR_BASE + 24:
