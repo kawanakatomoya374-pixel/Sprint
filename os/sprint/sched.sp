@@ -37,6 +37,7 @@ const GUI = ["guid"]
 const PORTS = {fsd: [0xCF8, 8, 0x1F0, 8, 0x3F6, 1, 0x170, 8, 0x376, 1, 0xC000, 0x100], gpud: [0xCF8, 8], inputd: [0x60, 1, 0x64, 1], netd: [0xCF8, 8]}
 const LX = ["linuxd"]                 # may create and drive Linux programs
 const DRIVERS = ["gpud", "netd", "fsd"]       # may map device registers and allocate DMA memory
+let hb_ticks = 0
 let io_open = {}      # cpu -> the port ranges currently open in its I/O permission bitmap
 let io_pid = {}       # cpu -> pid they belong to
 
@@ -646,6 +647,10 @@ export func trap(cpu, v):
                 p.state = "lxwait"
         p.slices += 1
         preemptions += 1
+        hb_ticks += 1
+        if hb_ticks >= 1500:                      # a sign of life and where each CPU is (a silent hang shows up as the same rip again and again)
+            hb_ticks = 0
+            log("hb cpu " .. to_string(cpu) .. " pid " .. to_string(p.pid) .. " (" .. p.name .. ") rip " .. to_string(hw.peek64(p.ctx + kproc.CTX_RIP)))
         k.stat_set(cpu, 1, preemptions)
     elif v == PF and p.handler != 0 and p.lazy_miss(hw.peek64(p.ctx + kproc.CTX_CR2)):
         # a page of a file mapping: the server reads it from the file, then lets the instruction run again

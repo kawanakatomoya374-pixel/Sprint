@@ -9,7 +9,9 @@ typedef struct {
     uint32_t m[MAXL];
     uint32_t rr[MAXL];
     uint32_t n0;
+    uint64_t n0_64;   /* -m^-1 mod 2^64, for the 64-bit limb path (even limb counts) */
 } mont;
+__extension__ typedef unsigned __int128 u128_t;
 
 static int bn_load(uint32_t *r, size_t n, const uint8_t *b, size_t len) {
     while (len > 0 && *b == 0) { b++; len--; }
@@ -50,6 +52,8 @@ static int bn_iszero(const uint32_t *a, size_t n) {
     return x == 0;
 }
 
+static void mmul(const mont *mt, uint32_t *r, const uint32_t *a, const uint32_t *b);
+#define mmul_n0 mmul
 static int mont_init(mont *mt, const uint8_t *mod, size_t len) {
     while (len > 0 && *mod == 0) { mod++; len--; }
     if (len == 0 || (mod[len - 1] & 1) == 0) return -1;
@@ -61,19 +65,75 @@ static int mont_init(mont *mt, const uint8_t *mod, size_t len) {
     uint32_t inv = mt->m[0];
     for (int i = 0; i < 5; i++) inv *= 2 - mt->m[0] * inv;
     mt->n0 = 0 - inv;
-    /* rr = 2^(64 n) mod m, by doubling 1 that many times */
+    if ((n & 1) == 0) {
+        uint64_t m0 = (uint64_t)mt->m[0] | ((uint64_t)mt->m[1] << 32), iv = m0;
+        for (int i = 0; i < 6; i++) iv *= 2 - m0 * iv;
+        mt->n0_64 = 0 - iv;
+    }
+    /* rr = 2^(64 n) mod m. Start from 2^(bits-1) (smaller than m), double up to R mod m = 2^(32 n) mod m (at most 32 steps), then double once more for the
+       Montgomery form of 2 and square it up to the Montgomery form of 2^(32 n): about eleven multiplications instead of 64 n doublings. */
     uint32_t x[MAXL] = {0};
-    x[0] = 1;
-    for (size_t i = 0; i < 64 * n; i++) {
+    size_t top = n * 32;
+    while (top > 0 && ((mt->m[(top - 1) / 32] >> ((top - 1) % 32)) & 1) == 0) top--;
+    x[(top - 1) / 32] = (uint32_t)1 << ((top - 1) % 32);
+    for (size_t i = top - 1; i < 32 * n + 1; i++) {      /* 2^(top-1) -> 2^(32 n + 1): R mod m, then twice that */
         uint32_t c = bn_add(x, x, x, n);
         if (c || bn_cmp(x, mt->m, n) >= 0) bn_sub(x, x, mt->m, n);
+        if (i + 1 == 32 * n) memcpy(mt->rr, x, n * 4);   /* R mod m: the Montgomery form of 1 */
+    }
+    uint32_t two[MAXL] = {0}, acc[MAXL] = {0};
+    memcpy(two, x, n * 4);                               /* the Montgomery form of 2 */
+    memcpy(acc, mt->rr, n * 4);                          /* the Montgomery form of 1 */
+    size_t e = 32 * n;                                   /* 2^(32 n) = the square-and-multiply of 2 */
+    for (int b = 63; b >= 0; b--) {
+        if (((uint64_t)e >> b) == 0) continue;
+        mmul_n0(mt, acc, acc, acc);
+        if (((uint64_t)e >> b) & 1) mmul_n0(mt, acc, acc, two);
     }
     memset(mt->rr, 0, sizeof mt->rr);
-    memcpy(mt->rr, x, n * 4);
+    memcpy(mt->rr, acc, n * 4);
     return 0;
+}
+/* Montgomery product with 64-bit limbs (the same R = 2^(32 n), so the 32-bit representation is unchanged); n is even */
+static void mmul64(const mont *mt, uint32_t *r, const uint32_t *a32, const uint32_t *b32) {
+    size_t N = mt->n / 2;
+    uint64_t a[MAXL / 2], b[MAXL / 2], md[MAXL / 2], t[MAXL / 2 + 2] = {0};
+    for (size_t i = 0; i < N; i++) {
+        a[i] = (uint64_t)a32[2 * i] | ((uint64_t)a32[2 * i + 1] << 32);
+        b[i] = (uint64_t)b32[2 * i] | ((uint64_t)b32[2 * i + 1] << 32);
+        md[i] = (uint64_t)mt->m[2 * i] | ((uint64_t)mt->m[2 * i + 1] << 32);
+    }
+    for (size_t i = 0; i < N; i++) {
+        uint64_t c = 0;
+        u128_t x;
+        for (size_t j = 0; j < N; j++) {
+            x = (u128_t)t[j] + (u128_t)a[j] * b[i] + c;
+            t[j] = (uint64_t)x;
+            c = (uint64_t)(x >> 64);
+        }
+        x = (u128_t)t[N] + c;
+        t[N] = (uint64_t)x;
+        t[N + 1] = (uint64_t)(x >> 64);
+        uint64_t m = t[0] * mt->n0_64;
+        x = (u128_t)t[0] + (u128_t)m * md[0];
+        c = (uint64_t)(x >> 64);
+        for (size_t j = 1; j < N; j++) {
+            x = (u128_t)t[j] + (u128_t)m * md[j] + c;
+            t[j - 1] = (uint64_t)x;
+            c = (uint64_t)(x >> 64);
+        }
+        x = (u128_t)t[N] + c;
+        t[N - 1] = (uint64_t)x;
+        t[N] = t[N + 1] + (uint64_t)(x >> 64);
+    }
+    uint32_t o[MAXL];
+    for (size_t i = 0; i < N; i++) { o[2 * i] = (uint32_t)t[i]; o[2 * i + 1] = (uint32_t)(t[i] >> 32); }
+    if (t[N] || bn_cmp(o, mt->m, mt->n) >= 0) bn_sub(o, o, mt->m, mt->n);
+    memcpy(r, o, mt->n * 4);
 }
 static void mmul(const mont *mt, uint32_t *r, const uint32_t *a, const uint32_t *b) {
     size_t n = mt->n;
+    if ((n & 1) == 0) { mmul64(mt, r, a, b); return; }
     uint32_t t[MAXL + 2] = {0};
     for (size_t i = 0; i < n; i++) {
         uint64_t c = 0, x;

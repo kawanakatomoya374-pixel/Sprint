@@ -47,9 +47,9 @@ Measured on one core of an x86-64 machine with AES-NI, PCLMULQDQ, SHA extensions
 | ChaCha20-Poly1305 seal | ~1080 MB/s (AVX2 8-way ChaCha20, 44-bit-limb Poly1305) | ~450 MB/s (ChaCha20 600, Poly1305 1977) |
 | SHA-256 | ~1900 MB/s (SHA extensions) | 320 MB/s |
 | SHA-512 | ~440 MB/s | 512 MB/s |
-| P-256 ECDH (point multiplication) | ~3400 /s | ~1850 /s (i15) |
-| ECDSA P-256 verify | ~840 /s | ~620 /s (i15) |
-| RSA-2048 public operation | ~2400 /s | ~4300 /s (i31) |
+| P-256 ECDH (point multiplication) | ~4700 /s | ~1850 /s (i15) |
+| ECDSA P-256 verify | ~1300 /s | ~620 /s (i15) |
+| RSA-2048 public operation | ~14800 /s | ~4300 /s (i31) |
 
 The hardware paths are chosen at run time (CPUID); on a CPU without the instructions the portable C code is used. `sprintssl/tests/accel_test.sh` compares both on
-7000 random inputs. Poly1305 and the AES-GCM counter mode are the next targets, and the big-number code (32-bit limbs) for RSA.
+7000 random inputs. The big-number code multiplies with 64-bit limbs (Montgomery, R = 2^(32 n) as before) and sets up its constants with about eleven multiplications instead of 64 n doublings.
