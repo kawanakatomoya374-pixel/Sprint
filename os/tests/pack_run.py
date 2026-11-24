@@ -5,7 +5,7 @@ The packs (folders of C-OS-APPS, or $COS_APPS) are installed with tools/packinst
 The serial log goes to build/os/shots/packrun.log."""
 import argparse, os, subprocess, sys, tempfile, time
 ap = argparse.ArgumentParser()
-ap.add_argument("--img", required=True); ap.add_argument("--packs", default=""); ap.add_argument("--disk-mb", type=int, default=256); ap.add_argument("--mem", type=int, default=512)
+ap.add_argument("--img", required=True); ap.add_argument("--trace", default=""); ap.add_argument("--packs", default=""); ap.add_argument("--disk-mb", type=int, default=256); ap.add_argument("--mem", type=int, default=512)
 ap.add_argument("--timeout", type=int, default=1800); ap.add_argument("--keep", default=""); ap.add_argument("--reuse", default=""); ap.add_argument("--smp", type=int, default=2)
 ap.add_argument("--http", default="", help="serve this HTML page on the host 127.0.0.1:18090 (10.0.2.2:18090 in the guest)")
 ap.add_argument("--files", default="", help="host:guest,host:guest extra files")
@@ -34,7 +34,7 @@ for x in a.cmds:
         if cur: cmds.append(cur); cur = []
     else: cur.append(x)
 if cur: cmds.append(cur)
-open(os.path.join(tmp, "run.list"), "w").write("\n".join("\t".join(c) for c in cmds) + "\n")
+open(os.path.join(tmp, "run.list"), "w").write(("VERBOSE:" + a.trace + "\n" if a.trace else "") + "\n".join("\t".join(c) for c in cmds) + "\n")
 tool("put", os.path.join(tmp, "run.list"), "/run.list")
 if a.http:
     import socket, threading

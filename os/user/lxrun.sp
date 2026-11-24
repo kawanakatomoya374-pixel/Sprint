@@ -48,6 +48,10 @@ let lines = fs.read_file("/run.list").split("\n")
 for line in lines:
     if line.trim() == "":
         continue
+    if line.starts_with("VERBOSE:"):
+        ipc.send(srv, "verbose\t" .. line.slice(8))
+        ipc.recv_from()
+        continue
     let f = line.split("\t")
     let args = []
     let env = ["HOME=/root", "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", "LANG=C"]
