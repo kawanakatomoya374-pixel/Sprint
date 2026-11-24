@@ -732,6 +732,8 @@ func sys_read(g, a):
         if p.size == 0:
             if p.writers == 0:
                 return 0
+            if f.nonblock:
+                return -11
             p.rwait.append([g, a[1], a[2], cur_tid])
             let tid = cur_tid
             blocked[tid] = () => cancel_pipe_wait(p, tid)
@@ -1126,8 +1128,21 @@ func sys_dup2(g, a):
 func sys_fcntl(g, a):
     if g.fds[a[0]] == nil:
         return -EBADF
+    let f = g.fds[a[0]]
     if a[1] == 0 or a[1] == 1030:       # F_DUPFD, F_DUPFD_CLOEXEC
-        return g.alloc_fd(g.fds[a[0]], a[2])
+        return g.alloc_fd(f, a[2])
+    if a[1] == 3:                       # F_GETFL: the access mode and O_NONBLOCK
+        let acc = 0
+        if f.kind == "file":
+            acc = 2 if (f.readable and f.writable) else (1 if f.writable else 0)
+        elif f.kind == "pipe":
+            acc = 1 if f.end == "w" else 0
+        elif f.kind == "sock" or f.kind == "console":
+            acc = 2
+        return acc | (0o4000 if f.nonblock else 0) | (0o2000 if f.append else 0)
+    if a[1] == 4:                       # F_SETFL
+        f.nonblock = (a[2] & 0o4000) != 0
+        return 0
     return 0
 
 func sys_ioctl(g, a):
@@ -1394,8 +1409,9 @@ func pipe_take(p, n):
 func sys_pipe(g, a):
     let p = new_pipe()
     p.data = []
-    let r = g.alloc_fd({kind: "pipe", pipe: p, end: "r"})
-    let w = g.alloc_fd({kind: "pipe", pipe: p, end: "w"})
+    let nb = (a[1] & 0o4000) != 0           # pipe2 flags
+    let r = g.alloc_fd({kind: "pipe", pipe: p, end: "r", nonblock: nb})
+    let w = g.alloc_fd({kind: "pipe", pipe: p, end: "w", nonblock: nb})
     let b = []
     for i in range(8):
         b.append(0)
@@ -4132,7 +4148,7 @@ func setup():
     table[21] = sys_access
     table[25] = sys_mremap
     table[28] = sys_zero
-    table[22] = sys_pipe
+    table[22] = (g, a) => sys_pipe(g, [a[0], 0, 0])      # pipe(): no flags
     table[293] = sys_pipe
     table[32] = sys_dup
     table[57] = sys_fork
