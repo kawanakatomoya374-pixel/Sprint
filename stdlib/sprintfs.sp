@@ -493,6 +493,7 @@ export class Fs:
     let free_blocks = 0
     let free_inodes = 0
     let cache = nil
+    let dcache = nil          # directory inode -> {name -> entry}: a directory is parsed once, not at every lookup
     let norun = false         # the device has no read_run
     let dirty = nil
     let depth = 0
@@ -506,6 +507,7 @@ export class Fs:
     func init(self, dev, opts):
         self.dev = dev
         self.cache = {}
+        self.dcache = {}
         self.dirty = {}
         self.clock = opts.clock if has(opts, "clock") else nil
         self.readonly = opts.readonly if has(opts, "readonly") else false
@@ -588,6 +590,7 @@ export class Fs:
         self.depth = 0
         self.dirty = {}
         self.cache = {}
+        self.dcache = {}
         self.sb_dirty = false
         let sb = self.dev.read(0)
         self.free_blocks = get64(sb, SB_FREE_BLOCKS)
@@ -1072,11 +1075,17 @@ export class Fs:
                 off += rec
         return out
     func dir_lookup(self, dino, name):
-        for e in self.dir_entries(dino):
-            if e.name == name:
-                return e
-        return nil
+        let m = self.dcache[dino]
+        if m == nil:
+            m = {}
+            for e in self.dir_entries(dino):
+                m[e.name] = e
+            if len(self.dcache) > 512:
+                self.dcache = {}
+            self.dcache[dino] = m
+        return m[name]
     func dir_add(self, dino, name, ino, ftype):
+        self.dcache[dino] = nil
         let d = self.iget(dino)
         let need = entry_size(len(name))
         let nb = d.size // self.bs
@@ -1109,6 +1118,7 @@ export class Fs:
         d.size += self.bs
         self.iput(dino, d)
     func dir_remove(self, dino, name):
+        self.dcache[dino] = nil
         let d = self.iget(dino)
         for l in range(d.size // self.bs):
             let phys = self.bmap_of(d, l)
