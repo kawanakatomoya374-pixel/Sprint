@@ -69,6 +69,9 @@ export class Client:
         s.nlink = to_int(f[3])
         s.mtime = to_int(f[4])
         return s
+    func link(self, existing, path):
+        self.gen += 1
+        self.call("link\t" .. existing .. "\t" .. path)
     func symlink(self, target, path):
         self.gen += 1
         self.call("symlink\t" .. target .. "\t" .. path)

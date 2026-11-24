@@ -4080,6 +4080,31 @@ func sys_mincore(g, a):
         ones.append(1)
     return wr(g, a[2], sslcore.concat([ones]))
 
+# link, linkat: a hard link (the lock files of the X server are made this way)
+func do_link(g, old, new):
+    if old == nil or new == nil:
+        return -EFAULT
+    try:
+        fs.link(abspath_nf(g, old), abspath_nf(g, new))
+        links_changed()
+        return 0
+    catch e:
+        return -errno_of(e.kind)
+
+func sys_link(g, a):
+    return do_link(g, cstr(g, a[0]), cstr(g, a[1]))
+
+func sys_linkat(g, a):
+    let old = cstr(g, a[1])
+    let new = cstr(g, a[3])
+    if old == nil or new == nil:
+        return -EFAULT
+    let o = at_path(g, a[0], old, false)
+    let n = at_path(g, a[2], new, false)
+    if o == nil or n == nil:
+        return -EBADF
+    return do_link(g, o, n)
+
 func sys_eopnotsupp(g, a):
     return -95
 func sys_enodata(g, a):
@@ -4118,6 +4143,8 @@ func setup():
     table[334] = sys_rseq
     table[161] = sys_eperm
     table[27] = sys_mincore
+    table[86] = sys_link
+    table[265] = sys_linkat
     table[29] = sys_shmget
     table[30] = sys_shmat
     table[31] = sys_shmctl

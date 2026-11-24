@@ -50,6 +50,9 @@ func handle(src, q):
     if op == "lstat":
         let s2 = volume.lstat(q[1])
         return ok(s2.kind .. "\t" .. to_string(s2.size) .. "\t" .. to_string(s2.mode) .. "\t" .. to_string(s2.nlink) .. "\t" .. to_string(s2.mtime))
+    if op == "link":
+        volume.link(q[1], q[2])
+        return ok()
     if op == "symlink":
         volume.symlink(q[1], q[2])
         return ok()
