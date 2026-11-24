@@ -13,8 +13,8 @@ import psys
 import str
 import sslcore
 
-const BUF = 65536
-const CHUNK = 60000
+const BUF = 1048576
+const CHUNK = 1000000
 
 func fail(kind, msg):
     throw error(kind, msg)
@@ -29,6 +29,7 @@ export class Stat:
 export class Client:
     let server = 0
     let seg = nil
+    let gen = 0                  # bumped by every request that changes something: a cached view of a file is good while it is unchanged
     let backlog = nil            # messages from other processes that arrived while a call waited for the server's answer (a program that serves
                                  # other clients itself, like linuxd, takes them from here instead of losing them)
     func init(self, server):
@@ -69,10 +70,12 @@ export class Client:
         s.mtime = to_int(f[4])
         return s
     func symlink(self, target, path):
+        self.gen += 1
         self.call("symlink\t" .. target .. "\t" .. path)
     func readlink(self, path):
         return self.call("readlink\t" .. path)[0]
     func chmod(self, path, mode):
+        self.gen += 1
         self.call("chmod\t" .. path .. "\t" .. to_string(mode))
     func exists(self, path):
         return self.call("exists\t" .. path)[0] == "1"
@@ -112,6 +115,7 @@ export class Client:
         return sslcore.concat(parts)
     # the same as write() for a typed.u8
     func write_bytes(self, path, data, off = 0, truncate = false):
+        self.gen += 1
         let done = 0
         let first = truncate
         if len(data) == 0:
@@ -128,6 +132,7 @@ export class Client:
         return self.read(path, 0, -1)
     # writes data at offset off (creating the file); truncate = true first empties it
     func write(self, path, data, off = 0, truncate = false):
+        self.gen += 1
         let done = 0
         let first = truncate
         if len(data) == 0:
@@ -143,14 +148,19 @@ export class Client:
     func write_file(self, path, data):
         return self.write(path, data, 0, true)
     func truncate(self, path, size):
+        self.gen += 1
         self.call("truncate\t" .. path .. "\t" .. to_string(size))
     func mkdir(self, path):
+        self.gen += 1
         self.call("mkdir\t" .. path)
     func unlink(self, path):
+        self.gen += 1
         self.call("unlink\t" .. path)
     func rmdir(self, path):
+        self.gen += 1
         self.call("rmdir\t" .. path)
     func rename(self, old, new):
+        self.gen += 1
         self.call("rename\t" .. old .. "\t" .. new)
     func sync(self):
         self.call("sync")

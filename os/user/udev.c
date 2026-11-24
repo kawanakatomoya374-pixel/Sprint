@@ -788,7 +788,28 @@ static SpStatus u_poke_str(SpVM *vm, int argc, const SpValue *argv, SpValue *ret
     *ret = sp_nil();
     return SP_OK;
 }
+/* mem_get(address, n) -> typed.u8 copy of n bytes of this process's memory (DMA buffers); mem_put(address, typed.u8) copies the other way */
+static SpStatus u_mem_get(SpVM *vm, int argc, const SpValue *argv, SpValue *ret) {
+    (void)argc;
+    int64_t a, n;
+    if (need_i(vm, argv[0], &a) != SP_OK || need_i(vm, argv[1], &n) != SP_OK) return SP_E_RUNTIME;
+    if (n < 0 || n > (64 << 20)) return sp_throw(vm, "ValueError", "uio.mem_get: bad length");
+    *ret = typed_u8_from(vm, (const uint8_t *)(uintptr_t)a, (size_t)n);
+    return SP_OK;
+}
+static SpStatus u_mem_put(SpVM *vm, int argc, const SpValue *argv, SpValue *ret) {
+    (void)argc;
+    int64_t a;
+    if (need_i(vm, argv[0], &a) != SP_OK) return SP_E_RUNTIME;
+    unsigned char *d = typed_u8_data(argv[1]);
+    int64_t len = typed_len(argv[1]);
+    if (!d || len < 0) return sp_throw(vm, "TypeError", "uio.mem_put: expected a typed.u8");
+    memcpy((void *)(uintptr_t)a, d, (size_t)len);
+    *ret = sp_nil();
+    return SP_OK;
+}
 static const SpNativeDesc uio_fns[] = {
+    {"mem_get", 2, 2, 0, SP_NATIVE_ALLOCATES, u_mem_get}, {"mem_put", 2, 2, 0, 0, u_mem_put},
     {"ata_read", 5, 5, 0, SP_NATIVE_ALLOCATES, u_ata_read}, {"ata_write", 5, 5, 0, 0, u_ata_write}, {"inb", 1, 1, 0, 0, u_inb}, {"inw", 1, 1, 0, 0, u_inw}, {"outb", 2, 2, 0, 0, u_outb}, {"outw", 2, 2, 0, 0, u_outw},
     {"inl", 1, 1, 0, 0, u_inl}, {"outl", 2, 2, 0, 0, u_outl}, {"mmio_map", 2, 2, 0, 0, u_mmio_map},
     {"dma_alloc", 1, 1, 0, SP_NATIVE_ALLOCATES, u_dma_alloc},

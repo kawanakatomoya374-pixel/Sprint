@@ -444,6 +444,40 @@ static SpStatus h_memcpy(SpVM *vm, int argc, const SpValue *argv, SpValue *ret) 
     *ret = sp_nil();
     return SP_OK;
 }
+/* the physical address behind virtual address v in the page tables rooted at pml4 (identity-mapped RAM), or 0 when a level is missing */
+static uint64_t walk_user(uint64_t root, uint64_t v) {
+    uint64_t t = root;
+    for (int level = 3; level >= 0; level--) {
+        uint64_t e = ((const uint64_t *)(uintptr_t)t)[(v >> (12 + 9 * level)) & 511u];
+        if ((e & 1u) == 0) return 0;
+        t = e & 0x000FFFFFFFFFF000ull;
+    }
+    return t + (v & 4095u);
+}
+/* copy_user(src_pml4, src_va, dst_pml4, dst_va, n) -> bytes copied: copies between two address spaces page by page and stops at the first page
+   that is not mapped in either (the caller maps it and calls again) */
+static SpStatus h_copy_user(SpVM *vm, int argc, const SpValue *argv, SpValue *ret) {
+    (void)argc;
+    ARG_INT(0, sp4);
+    ARG_INT(1, sva);
+    ARG_INT(2, dp4);
+    ARG_INT(3, dva);
+    ARG_INT(4, n);
+    int64_t done = 0;
+    while (done < n) {
+        uint64_t a = walk_user((uint64_t)sp4, (uint64_t)(sva + done));
+        uint64_t b = walk_user((uint64_t)dp4, (uint64_t)(dva + done));
+        if (a == 0 || b == 0) break;
+        uint64_t chunk = 4096u - (a & 4095u);
+        uint64_t c2 = 4096u - (b & 4095u);
+        if (c2 < chunk) chunk = c2;
+        if (chunk > (uint64_t)(n - done)) chunk = (uint64_t)(n - done);
+        memmove((void *)(uintptr_t)b, (const void *)(uintptr_t)a, (size_t)chunk);
+        done += (int64_t)chunk;
+    }
+    *ret = sp_int(done);
+    return SP_OK;
+}
 /* str_at(addr, len) -> string with the bytes at addr (raw; not validated as UTF-8 by the caller's text) */
 static SpStatus h_str_at(SpVM *vm, int argc, const SpValue *argv, SpValue *ret) {
     (void)argc;
@@ -577,7 +611,7 @@ static const SpNativeDesc hw_fns[] = {
     {"ctx_new", 0, 0, 0, 0, h_ctx_new}, {"ctx_free", 1, 1, 0, 0, h_ctx_free}, {"enter", 1, 1, 0, 0, h_enter},
     {"kernel_cr3", 0, 0, 0, 0, h_kernel_cr3}, {"iopb_set", 4, 4, 0, 0, h_iopb_set}, {"set_ioapic", 1, 1, 0, 0, h_set_ioapic}, {"ioapic_rd", 1, 1, 0, 0, h_ioapic_rd}, {"ioapic_wr", 2, 2, 0, 0, h_ioapic_wr}, {"irq_mask", 2, 2, 0, 0, h_irq_mask}, {"irq_take", 0, 0, 0, 0, h_irq_take}, {"cpu_id", 0, 0, 0, 0, h_cpu_id}, {"invlpg", 1, 1, 0, 0, h_invlpg},
     {"idle", 0, 0, 0, 0, h_idle}, {"irq_count", 1, 1, 0, 0, h_irq_count}, {"set_lapic", 1, 1, 0, 0, h_set_lapic},
-    {"memset", 3, 3, 0, 0, h_memset}, {"memcpy", 3, 3, 0, 0, h_memcpy}, {"str_at", 2, 2, 0, SP_NATIVE_ALLOCATES, h_str_at},
+    {"copy_user", 5, 5, 0, 0, h_copy_user}, {"memset", 3, 3, 0, 0, h_memset}, {"memcpy", 3, 3, 0, 0, h_memcpy}, {"str_at", 2, 2, 0, SP_NATIVE_ALLOCATES, h_str_at},
     {"poke_str", 2, 2, 0, 0, h_poke_str}, {"user_mem", 0, 0, 0, SP_NATIVE_ALLOCATES, h_user_mem},
     {"poweroff", 0, 0, 0, 0, h_poweroff}, {"reboot", 0, 0, 0, 0, h_reboot},
 };

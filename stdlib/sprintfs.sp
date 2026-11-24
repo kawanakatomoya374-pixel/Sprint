@@ -96,6 +96,11 @@ export class MemDevice:
         for k in range(self.bs):
             b[k] = self.data[o + k]
         return b
+    # k blocks from block i in one go
+    func read_run(self, i, k):
+        if i < 0 or i + k > self.n:
+            err("EIO", "read past the end of the device: block " .. to_string(i))
+        return self.data.slice(i * self.bs, (i + k) * self.bs)
     func write(self, i, b):
         if i < 0 or i >= self.n:
             err("EIO", "write past the end of the device: block " .. to_string(i))
@@ -129,6 +134,8 @@ export class FaultyDevice:
         return self.inner.block_size()
     func read(self, i):
         return self.inner.read(i)
+    func read_run(self, i, k):
+        return self.inner.read_run(i, k)
     func write(self, i, b):
         if self.count < self.limit:
             self.count += 1
@@ -486,6 +493,7 @@ export class Fs:
     let free_blocks = 0
     let free_inodes = 0
     let cache = nil
+    let norun = false         # the device has no read_run
     let dirty = nil
     let depth = 0
     let clock = nil
@@ -890,27 +898,76 @@ export class Fs:
         i.ext = out
 
     # ---- file data --------------------------------------------------------------------------------------------------------------------------------
+    # `k` blocks from physical block `n` in one request when the device can (a device may lack read_run: then block by block)
+    func dev_run(self, n, k):
+        if self.norun:
+            let r = typed.u8(k * self.bs)
+            for j in range(k):
+                r.set_from(self.dev.read(n + j), j * self.bs)
+            return r
+        try:
+            return self.dev.read_run(n, k)
+        catch e:
+            if e.kind != "NameError":
+                throw e
+            self.norun = true
+            return self.dev_run(n, k)
     func read_data(self, i, off, n):
         let out = typed.u8(n)
         if i.inline != nil:
-            for k in range(n):
-                out[k] = i.inline[off + k]
+            if n > 0:
+                out.set_from(typed.u8(i.inline).slice(off, off + n), 0)
             return out
         let bs = self.bs
         let done = 0
+        let clean = len(self.dirty) == 0
         while done < n:
             let pos = off + done
             let l = pos // bs
             let within = pos % bs
-            let take = bs - within
-            if take > n - done:
-                take = n - done
-            let phys = self.bmap_of(i, l)
+            # the extent holding block l: how many blocks follow in one piece
+            let phys = -1
+            let run = -1
+            for e in i.ext:
+                if l >= e[0] and l < e[0] + e[1]:
+                    phys = e[2] + (l - e[0])
+                    run = e[0] + e[1] - l
+                    break
+                if e[0] > l:
+                    run = e[0] - l                    # a hole up to the next extent
+                    break
+            if phys < 0 and run < 0:
+                run = (n - done + within + bs - 1) // bs     # a hole to the end of the file
+            let span = run * bs - within                       # bytes available in this run
+            let take = span if span < n - done else n - done
             if phys >= 0:
-                let b = self.rblock(phys) if has(self.dirty, phys) else self.dev.read(phys)
-                for k in range(take):
-                    out[done + k] = b[within + k]
-            done += take
+                let blocks = (within + take + bs - 1) // bs
+                if clean:
+                    while blocks > 0:
+                        let m = blocks if blocks < 128 else 128
+                        let chunk = self.dev_run(phys, m)
+                        let skip = within
+                        let got = m * bs - skip
+                        if got > take:
+                            got = take
+                        out.set_from(chunk.slice(skip, skip + got) if (skip != 0 or got != m * bs) else chunk, done)
+                        done += got
+                        take -= got
+                        phys += m
+                        blocks -= m
+                        within = 0
+                    continue
+                for b in range(blocks):
+                    let blk = self.rblock(phys + b) if has(self.dirty, phys + b) else self.dev.read(phys + b)
+                    let skip = within if b == 0 else 0
+                    let got = bs - skip
+                    if got > take:
+                        got = take
+                    out.set_from(blk.slice(skip, skip + got), done)
+                    done += got
+                    take -= got
+                continue
+            done += take                                       # a hole reads as zeros
         return out
     # write `data` (a string, a typed.u8 or an array of bytes) at `off`; the data blocks go to the disk now (ordered mode), the metadata in the transaction
     func write_at(self, ino, off, data):

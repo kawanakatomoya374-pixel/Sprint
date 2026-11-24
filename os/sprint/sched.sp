@@ -34,9 +34,9 @@ func log(s):
 
 # what a program may do beyond computing: the framebuffer and input (gui), and the I/O ports of a driver
 const GUI = ["guid"]
-const PORTS = {fsd: [0x1F0, 8, 0x3F6, 1, 0x170, 8, 0x376, 1], gpud: [0xCF8, 8], inputd: [0x60, 1, 0x64, 1], netd: [0xCF8, 8]}
+const PORTS = {fsd: [0xCF8, 8, 0x1F0, 8, 0x3F6, 1, 0x170, 8, 0x376, 1, 0xC000, 0x100], gpud: [0xCF8, 8], inputd: [0x60, 1, 0x64, 1], netd: [0xCF8, 8]}
 const LX = ["linuxd"]                 # may create and drive Linux programs
-const DRIVERS = ["gpud", "netd"]       # may map device registers and allocate DMA memory
+const DRIVERS = ["gpud", "netd", "fsd"]       # may map device registers and allocate DMA memory
 let io_open = {}      # cpu -> the port ranges currently open in its I/O permission bitmap
 let io_pid = {}       # cpu -> pid they belong to
 
@@ -242,20 +242,13 @@ func lx_target(p, pid):
 func copy_between(src_p, src_va, dst_p, dst_va, n):
     let done = 0
     while done < n:
-        src_p.ensure(src_va + done, 1)
-        dst_p.ensure(dst_va + done, 1)
-        let a = src_p.space.translate(src_va + done)
-        let b = dst_p.space.translate(dst_va + done)
-        if a == nil or b == nil:
-            return false
-        let chunk = 4096 - (a & 4095)
-        let c2 = 4096 - (b & 4095)
-        if c2 < chunk:
-            chunk = c2
-        if chunk > n - done:
-            chunk = n - done
-        hw.memcpy(b, a, chunk)
-        done += chunk
+        done += hw.copy_user(src_p.space.pml4, src_va + done, dst_p.space.pml4, dst_va + done, n - done)
+        if done < n:
+            # a page is not there yet: map the one that is missing (regions fill on first touch), then go on in C
+            src_p.ensure(src_va + done, 1)
+            dst_p.ensure(dst_va + done, 1)
+            if src_p.space.translate(src_va + done) == nil or dst_p.space.translate(dst_va + done) == nil:
+                return false
     return true
 
 func lx_syscall(p, nr):

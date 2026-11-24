@@ -5,6 +5,7 @@
 import io
 import ipc
 import uata
+import uvblk
 import sprintfs
 import str
 
@@ -12,7 +13,8 @@ func log(s):
     print("[fsd] " .. s)
 
 let volume = nil
-for d in uata.probe():
+let disks = uvblk.probe()
+for d in (disks if len(disks) > 0 else uata.probe()):
     if volume == nil:
         try:
             volume = sprintfs.mount(d)

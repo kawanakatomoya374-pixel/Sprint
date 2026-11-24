@@ -60,6 +60,11 @@ let cur_tid = 0           # the thread whose system call is being served
 let futex_q = {}          # "pid:address" -> [[tid, bitset], ...]
 let table = {}            # system call number -> function(g, a)
 let verbose = false
+let prof = {}             # system call number -> [calls, ms] (verbose "prof")
+let prof_busy = 0
+let prof_wr = 0
+let prof_wrn = 0
+let prof_rd = 0
 let shm_segs = {}         # System V segments, see sys_shmget
 let shm_next = 1
 let shm_attached = {}     # pid -> {address -> [shmid, pages]}
@@ -224,7 +229,11 @@ func rd(g, addr, n):
 func wr(g, addr, b):
     if len(b) == 0:
         return 0
-    return 0 if lx.write(g.pid, addr, b) == 0 else -EFAULT
+    let t0 = psys.ms()
+    let r = lx.write(g.pid, addr, b)
+    prof_wr += psys.ms() - t0
+    prof_wrn += len(b)
+    return 0 if r == 0 else -EFAULT
 
 # a C string from the program's memory (nil on a fault)
 func cstr(g, addr):
@@ -605,6 +614,8 @@ func sys_write(g, a):
     let n = a[2]
     if n < 0:
         return -EINVAL
+    if f.kind == "null":
+        return n                      # nothing to copy
     let b = rd(g, a[1], n)
     if b == nil:
         return -EFAULT
@@ -686,12 +697,18 @@ func do_read(g, f, n, off):
     if not f.readable:
         return -EBADF
     try:
-        let size = fs.stat(f.path).size
+        # the size and the cached whole file are looked up once and stay good until something on the volume changes
+        if f.cgen != fs.gen or f.csize == nil:
+            let st = fs.stat(f.path)
+            f.csize = st.size
+            f.cwhole = cached_file(f.path)
+            f.cgen = fs.gen
+        let size = f.csize
         let at = f.pos if off < 0 else off
         let want = imin(n, size - at)
         if want <= 0:
             return sslcore.concat([[]])
-        let whole = cached_file(f.path)
+        let whole = f.cwhole
         if whole != nil:
             return whole.slice(at, at + want)
         return fs.read_bytes(f.path, at, want)
@@ -722,7 +739,9 @@ func sys_read(g, a):
         let chunk = pipe_take(p, imin(a[2], p.size))
         let e0 = wr(g, a[1], chunk)
         return e0 if e0 < 0 else len(chunk)
+    let t0 = psys.ms()
     let r = do_read(g, f, a[2], -1)
+    prof_rd += psys.ms() - t0
     if type(r) == "int":
         return r
     if f.kind == "file" or f.kind == "mem":
@@ -1162,7 +1181,7 @@ func sys_mmap(g, a):
         if lx.map(g.pid, addr, n, (3 if (prot & 2) != 0 else 1) | 4) != 0:
             return -ENOMEM
         vm_add(g, addr, addr + n, prot & 7, f.path)
-        g.lazy.append([addr, addr + n, f.path, off, {}])
+        g.lazy.append([addr, addr + n, f.path, off, {}, {kind: "file", path: f.path, readable: true, pos: 0}])
         return addr
     if lx.map(g.pid, addr, n, 3 if f != nil else (3 if (prot & 2) != 0 else 1)) != 0:
         return -ENOMEM
@@ -1208,8 +1227,7 @@ func serve_lazy(g, tid, q):
             let lo = imax(pg & ~65535, e[0])
             while lo < hi and e[4][lo >> 12] != nil and lo != pg:
                 lo += 4096
-            let fobj = {kind: "file", path: e[2], readable: true, pos: 0}
-            let data = do_read(g, fobj, hi - lo, e[3] + (lo - e[0]))
+            let data = do_read(g, e[5], hi - lo, e[3] + (lo - e[0]))
             if type(data) == "int":
                 data = sslcore.concat([[]])
             let b = data
@@ -1410,7 +1428,7 @@ func do_fork(g, sp, tls):
         let d = {}
         for kx in keys(e[4]):
             d[kx] = true
-        c.lazy.append([e[0], e[1], e[2], e[3], d])
+        c.lazy.append([e[0], e[1], e[2], e[3], d, e[5]])
     shm_fork(g.pid, pid)
     for fd in g.fds:
         let f = g.fds[fd]
@@ -4257,6 +4275,15 @@ func serve_call(g, q):
         catch e:
             log("pid " .. to_string(g.pid) .. ": system call " .. to_string(nr) .. " failed inside linuxd: " .. to_string(e))
             r = -5
+    let t_end = psys.ms()
+    if verbose == "prof":
+        let pr = prof[nr]
+        if pr == nil:
+            pr = [0, 0]
+            prof[nr] = pr
+        pr[0] += 1
+        pr[1] += t_end - t_start
+        prof_busy += t_end - t_start
     if verbose and psys.ms() - t_start > 150:
         log("slow: tid " .. to_string(cur_tid) .. " syscall " .. to_string(nr) .. " (" .. to_string(a[0]) .. "," .. to_string(a[1]) .. "," .. to_string(a[2]) .. ") took " .. to_string(psys.ms() - t_start) .. " ms")
     if verbose == "trace" and cur_tid >= 8:
@@ -4278,6 +4305,12 @@ func serve_request(src, text):
         verbose = q[1] if len(q) > 1 else true
         ipc.send(src, "ok")
     elif q[0] == "quit":
+        if verbose == "prof":
+            log("prof: lx.write " .. to_string(prof_wr) .. " ms for " .. to_string(prof_wrn) .. " bytes; do_read " .. to_string(prof_rd) .. " ms")
+            log("prof: " .. to_string(prof_busy) .. " ms inside system calls of " .. to_string(psys.ms()) .. " ms")
+            for nr in keys(prof):
+                if prof[nr][1] > 20:
+                    log("prof: syscall " .. to_string(nr) .. " x" .. to_string(prof[nr][0]) .. " " .. to_string(prof[nr][1]) .. " ms")
         ipc.send(src, "ok")
         return false
     return true
