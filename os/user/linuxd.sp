@@ -4054,6 +4054,16 @@ func sys_sched_prio(g, a):
 func sys_sched_prio_min(g, a):
     return 1 if a[0] == 1 or a[0] == 2 else 0
 
+# mincore: every page the program has mapped counts as resident (as C-OS answers)
+func sys_mincore(g, a):
+    let n = (a[1] + 4095) // 4096
+    if n <= 0:
+        return 0
+    let ones = []
+    for i in range(n):
+        ones.append(1)
+    return wr(g, a[2], sslcore.concat([ones]))
+
 func sys_eopnotsupp(g, a):
     return -95
 func sys_enodata(g, a):
@@ -4091,6 +4101,7 @@ func setup():
     table[319] = sys_memfd_create
     table[334] = sys_rseq
     table[161] = sys_eperm
+    table[27] = sys_mincore
     table[29] = sys_shmget
     table[30] = sys_shmat
     table[31] = sys_shmctl
@@ -4188,7 +4199,6 @@ func setup():
     table[19] = sys_readv
     table[23] = sys_select
     table[26] = sys_noop_ok
-    table[27] = sys_noop_ok
     table[40] = sys_sendfile
     table[73] = sys_noop_ok
     table[74] = sys_noop_ok
