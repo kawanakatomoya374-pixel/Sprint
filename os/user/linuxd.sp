@@ -147,6 +147,10 @@ class Guest:
     let nthreads = 1
     let sigs = nil            # signal -> [handler, flags, restorer, mask]
     let pend = 0              # signals sent to the process (bit sig-1)
+    let vm = nil              # memory map for /proc/self/maps: [start, end, prot (4 r, 2 w, 1 x), name]
+    let argv = nil
+    let envp = nil
+    let heap_start = 0
     func init(self, pid, client):
         self.pid = pid
         self.client = client
@@ -154,6 +158,9 @@ class Guest:
         self.zombies = {}
         self.tids = {}
         self.tids[pid] = true
+        self.vm = []
+        self.argv = []
+        self.envp = []
         self.sigs = {}
         self.fds = {}
         self.alloc_fd({kind: "stdin"})
@@ -235,6 +242,53 @@ func abspath(g, p):
         return norm(p)
     return norm(g.cwd .. "/" .. p)
 
+# ---- the memory map of a program (for /proc/self/maps) ----
+func vm_remove(g, a, b):
+    let out = []
+    for r in g.vm:
+        if r[1] <= a or r[0] >= b:
+            out.append(r)
+            continue
+        if r[0] < a:
+            out.append([r[0], a, r[2], r[3]])
+        if r[1] > b:
+            out.append([b, r[1], r[2], r[3]])
+    g.vm = out
+
+func vm_add(g, a, b, prot, name):
+    vm_remove(g, a, b)
+    g.vm.append([a, b, prot, name])
+
+func vm_protect(g, a, b, prot):
+    let out = []
+    for r in g.vm:
+        if r[1] <= a or r[0] >= b:
+            out.append(r)
+            continue
+        if r[0] < a:
+            out.append([r[0], a, r[2], r[3]])
+        out.append([imax(r[0], a), imin(r[1], b), prot, r[3]])
+        if r[1] > b:
+            out.append([b, r[1], r[2], r[3]])
+    g.vm = out
+
+func hexn(v):
+    if v == 0:
+        return "0"
+    let d = "0123456789abcdef"
+    let out = ""
+    let x = v
+    while x > 0:
+        out = d.slice(x & 15, (x & 15) + 1) .. out
+        x = x >> 4
+    return out
+
+func padn(s, n):
+    let o = s
+    while len(o) < n:
+        o = "0" .. o
+    return o
+
 # ---- the ELF loader ----
 func load_elf(pid, img, bias):
     if len(img) < 64 or u32(img, 0) != 0x464C457F or img[4] != 2 or u16(img, 18) != 62:
@@ -262,7 +316,7 @@ func load_elf(pid, img, bias):
         elif kind == 1:
             if off + filesz > len(img):
                 return "a segment lies outside the file"
-            segs.append([va, off, filesz, memsz])
+            segs.append([va, off, filesz, memsz, u32(img, ph + 4)])
             if lowest < 0 or va < lowest:
                 lowest = va
             if va + memsz > top:
@@ -298,7 +352,7 @@ func load_elf(pid, img, bias):
     let first_load = segs[0]
     if phdr == 0:
         phdr = first_load[0] - first_load[1] + phoff
-    return {entry: u64(img, 24) + b, phdr: phdr + b, phent: phent, phnum: phnum, base: b, top: align_up(top + b), interp: interp}
+    return {entry: u64(img, 24) + b, phdr: phdr + b, phent: phent, phnum: phnum, base: b, top: align_up(top + b), interp: interp, segs: segs}
 
 # a small cache of whole files (libraries and programs are read again and again): path -> [size, mtime, bytes]
 let fcache = {}
@@ -403,7 +457,16 @@ func setup_image(pid, img, path, argv, envp, g):
     g.exe = path
     g.brk = info.top + 0x100000
     g.brk_end = g.brk
+    g.heap_start = g.brk
     g.mmap_next = MMAP_BASE
+    g.vm = []
+    g.argv = argv
+    g.envp = envp
+    for sg in info.segs:
+        vm_add(g, (sg[0] + info.base) & ~4095, align_up(sg[0] + info.base + sg[3]), sg[4] & 7, path)
+    if info.interp != nil:
+        vm_add(g, INTERP_BASE, INTERP_BASE + 0x40000, 5, info.interp)
+    vm_add(g, STACK_TOP - STACK_SIZE, STACK_TOP, 6, "[stack]")
     lx.map(pid, STACK_TOP - STACK_SIZE, STACK_SIZE, 3)
     let sp = build_stack(pid, argv, envp, info, ibase)
     if sp == nil:
@@ -522,6 +585,12 @@ func do_read(g, f, n, off):
         return sslcore.concat([z])
     if f.kind == "random":
         return sslcore.random(n)
+    if f.kind == "mem":
+        let at = f.pos if off < 0 else off
+        let want = imin(n, len(f.data) - at)
+        if want <= 0:
+            return sslcore.concat([[]])
+        return f.data.slice(at, at + want)
     if f.kind != "file":
         return -EBADF
     if not f.readable:
@@ -566,14 +635,14 @@ func sys_read(g, a):
     let r = do_read(g, f, a[2], -1)
     if type(r) == "int":
         return r
-    if f.kind == "file":
+    if f.kind == "file" or f.kind == "mem":
         f.pos += len(r)
     let e = wr(g, a[1], r)
     return e if e < 0 else len(r)
 
 func sys_pread(g, a):
     let f = g.fds[a[0]]
-    if f == nil or f.kind != "file":
+    if f == nil or (f.kind != "file" and f.kind != "mem"):
         return -EBADF
     let r = do_read(g, f, a[2], a[3])
     if type(r) == "int":
@@ -599,16 +668,19 @@ func sys_lseek(g, a):
     let f = g.fds[a[0]]
     if f == nil:
         return -EBADF
-    if f.kind != "file" and f.kind != "dir":
+    if f.kind != "file" and f.kind != "dir" and f.kind != "mem":
         return -ESPIPE
     let base = 0
     if a[2] == 1:
         base = f.pos
     elif a[2] == 2:
-        try:
-            base = fs.stat(f.path).size
-        catch e:
-            return -errno_of(e.kind)
+        if f.kind == "mem":
+            base = len(f.data)
+        else:
+            try:
+                base = fs.stat(f.path).size
+            catch e:
+                return -errno_of(e.kind)
     elif a[2] != 0:
         return -EINVAL
     let p = base + a[1]
@@ -629,6 +701,16 @@ func do_open(g, path, flags, mode):
         return g.alloc_fd({kind: "random"})
     if p == "/dev/tty" or p == "/dev/console":
         return g.alloc_fd({kind: "console", fd: 1})
+    if p.starts_with("/proc") or p == "/dev" or p.starts_with("/dev/fd") or p == "/dev/stdin" or p == "/dev/stdout" or p == "/dev/stderr":
+        let vfd = open_virtual(g, p)
+        if vfd != nil:
+            return vfd
+        if p.starts_with("/dev/std") or p.starts_with("/dev/fd/"):
+            let n = 0 if p == "/dev/stdin" else (1 if p == "/dev/stdout" else (2 if p == "/dev/stderr" else to_int(p.slice(8))))
+            let src = g.fds[n]
+            if src == nil:
+                return -ENOENT
+            return g.alloc_fd(src)
     let acc = flags & 3
     let st = nil
     try:
@@ -717,6 +799,13 @@ func stat_path(g, p, buf):
         b[24] = 0o20666 & 255
         b[25] = (0o20666 >> 8) & 255
         return wr(g, buf, b)
+    if ap.starts_with("/proc") or ap == "/dev" or ap.starts_with("/dev/fd") or ap == "/dev/stdin" or ap == "/dev/stdout" or ap == "/dev/stderr":
+        let vk = virtual_stat_kind(g, ap)
+        if vk != nil:
+            let sz = 0
+            if vk == "file":
+                sz = 0
+            return wr(g, buf, fill_stat(vk, sz, 0, path_ino(ap)))
     try:
         let st = fs.stat(ap)
         return wr(g, buf, fill_stat(st.kind, st.size, st.mtime, path_ino(ap)))
@@ -744,6 +833,10 @@ func sys_fstat(g, a):
         b[24] = 0o20666 & 255
         b[25] = (0o20666 >> 8) & 255
         return wr(g, a[1], b)
+    if f.kind == "mem":
+        return wr(g, a[1], fill_stat("file", len(f.data), 0, path_ino(f.path)))
+    if f.kind == "dir" and f.virtual == true:
+        return wr(g, a[1], fill_stat("dir", 0, 0, path_ino(f.path)))
     if f.kind == "pipe" or f.kind == "eventfd" or f.kind == "epoll" or f.kind == "sock":
         let b = fill_stat("file", 0, 0, 7)
         let m = 0o140777 if f.kind == "sock" else (0o10600 if f.kind == "pipe" else 0o600)
@@ -934,6 +1027,8 @@ func sys_brk(g, a):
         if lx.map(g.pid, g.brk_end, top - g.brk_end, 3) != 0:
             return g.brk
         g.brk_end = top
+        vm_remove(g, g.heap_start & ~4095, g.brk_end)
+        vm_add(g, g.heap_start & ~4095, g.brk_end, 6, "[heap]")
     elif top < g.brk_end and want >= g.brk - (256 << 20):
         # (the program keeps what it wrote below the new break; pages above it go)
         pass
@@ -964,6 +1059,7 @@ func sys_mmap(g, a):
             return -EBADF
     if lx.map(g.pid, addr, n, 3 if f != nil else (3 if (prot & 2) != 0 else 1)) != 0:
         return -ENOMEM
+    vm_add(g, addr, addr + n, prot & 7, f.path if f != nil and f.kind == "file" else "")
     if f != nil:
         let data = do_read(g, f, length, off)
         if type(data) == "int":
@@ -978,20 +1074,46 @@ func sys_munmap(g, a):
     if (a[0] & 4095) != 0:
         return -EINVAL
     lx.unmap(g.pid, a[0], a[1])
+    vm_remove(g, a[0], a[0] + align_up(a[1]))
     return 0
 
 func sys_mprotect(g, a):
     lx.protect(g.pid, a[0] & ~4095, a[1], a[2])
+    vm_protect(g, a[0] & ~4095, (a[0] & ~4095) + align_up(a[1]), a[2] & 7)
     return 0
 
+# is [a, b) free of mappings?
+func vm_free(g, a, b):
+    for r in g.vm:
+        if r[0] < b and r[1] > a:
+            return false
+    return true
+
+func vm_find(g, addr):
+    for r in g.vm:
+        if addr >= r[0] and addr < r[1]:
+            return r
+    return nil
+
 func sys_mremap(g, a):
-    # grow by mapping a new region and copying (the old one is released)
     let old = a[0]
     let oldlen = align_up(a[1])
     let newlen = align_up(a[2])
+    let r = vm_find(g, old)
+    if r == nil or (old & 4095) != 0:
+        return -EFAULT                   # (musl's pthread_getattr_np probes the stack with this: unmapped must be EFAULT)
+    if newlen == 0:
+        return -EINVAL
     if newlen <= oldlen:
         if newlen < oldlen:
             lx.unmap(g.pid, old + newlen, oldlen - newlen)
+            vm_remove(g, old + newlen, old + oldlen)
+        return old
+    # grow in place when the pages after it are free
+    if vm_free(g, old + oldlen, old + newlen):
+        if lx.map(g.pid, old + oldlen, newlen - oldlen, 3) != 0:
+            return -ENOMEM
+        vm_add(g, old + oldlen, old + newlen, r[2], r[3])
         return old
     if (a[3] & 1) == 0:
         return -ENOMEM
@@ -1003,6 +1125,8 @@ func sys_mremap(g, a):
     if data == nil or lx.write(g.pid, na, data) != 0:
         return -EFAULT
     lx.unmap(g.pid, old, oldlen)
+    vm_remove(g, old, old + oldlen)
+    vm_add(g, na, na + newlen, r[2], r[3])
     return na
 
 # process, time, misc
@@ -1117,6 +1241,11 @@ func do_fork(g, sp, tls):
     c.brk_end = g.brk_end
     c.mmap_next = g.mmap_next
     c.exe = g.exe
+    c.heap_start = g.heap_start
+    c.argv = g.argv
+    c.envp = g.envp
+    for r in g.vm:
+        c.vm.append(r)
     for fd in g.fds:
         let f = g.fds[fd]
         if f != nil:
@@ -1558,11 +1687,7 @@ func sys_readlink(g, a):
     let path = cstr(g, a[0])
     if path == nil:
         return -EFAULT
-    if path == "/proc/self/exe":
-        let b = sslcore.from_str(g.exe)
-        let r = wr(g, a[1], b.slice(0, imin(len(b), a[2])))
-        return r if r < 0 else imin(len(b), a[2])
-    return -EINVAL
+    return readlink_path(g, abspath(g, path), a[1], a[2])
 
 func sys_sysinfo(g, a):
     let b = []
@@ -2191,6 +2316,15 @@ func readlink_path(g, p, buf, size):
         let n = imin(len(b), size)
         let r = wr(g, buf, b.slice(0, n))
         return r if r < 0 else n
+    if p.starts_with("/proc/self/fd/"):
+        let ff = g.fds[to_int(p.slice(14))]
+        if ff == nil:
+            return -ENOENT
+        let tgt = ff.path if (ff.kind == "file" or ff.kind == "dir" or ff.kind == "mem") else ("pipe:[" .. to_string(len(ff.kind)) .. "]" if ff.kind == "pipe" else ("socket:[1]" if ff.kind == "sock" else "/dev/null"))
+        let tb = sslcore.from_str(tgt)
+        let n2 = imin(len(tb), size)
+        let r2 = wr(g, buf, tb.slice(0, n2))
+        return r2 if r2 < 0 else n2
     if p == "/proc/self/cwd":
         let b = sslcore.from_str(g.cwd)
         let n = imin(len(b), size)
@@ -2646,6 +2780,129 @@ func eventfd_write(g, f, b):
     f.count += u64(b, 0)
     return 8
 
+
+
+
+# ================= /proc and /dev (generated when opened) =================
+func maps_text(g):
+    let lines = []
+    let regs = []
+    for r in g.vm:
+        regs.append(r)
+    regs.sort((x, y) => x[0] < y[0])
+    for r in regs:
+        let pr = ("r" if (r[2] & 4) != 0 else "-") .. ("w" if (r[2] & 2) != 0 else "-") .. ("x" if (r[2] & 1) != 0 else "-") .. "p"
+        let line = padn(hexn(r[0]), 8) .. "-" .. padn(hexn(r[1]), 8) .. " " .. pr .. " 00000000 00:00 0"
+        if r[3] != "":
+            while len(line) < 73:
+                line = line .. " "
+            line = line .. r[3]
+        lines.append(line)
+    return lines.join("\n") .. "\n"
+
+func base_name(p):
+    let i = last_slash(p)
+    return p.slice(i + 1)
+
+func fmt_us(us):
+    return to_string(us // 1000000) .. "." .. padn(to_string((us % 1000000) // 10000), 2)
+
+func proc_text(g, path):
+    let rest = path
+    if path.starts_with("/proc/self/"):
+        rest = path.slice(10)
+    elif path.starts_with("/proc/" .. to_string(g.pid) .. "/"):
+        rest = path.slice(6 + len(to_string(g.pid)))
+    else:
+        rest = nil
+    if rest == "/maps":
+        return maps_text(g)
+    if rest == "/cmdline":
+        let t = ""
+        for a in g.argv:
+            t = t .. a .. "\0"
+        return t
+    if rest == "/environ":
+        let t = ""
+        for a in g.envp:
+            t = t .. a .. "\0"
+        return t
+    if rest == "/comm":
+        return base_name(g.exe) .. "\n"
+    if rest == "/status":
+        let nm = base_name(g.exe)
+        return "Name:\t" .. nm .. "\nState:\tR (running)\nTgid:\t" .. to_string(g.pid) .. "\nPid:\t" .. to_string(g.pid) .. "\nPPid:\t" .. to_string(g.parent if g.parent != 0 else 1) .. "\nUid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nThreads:\t" .. to_string(g.nthreads) .. "\nVmPeak:\t   20000 kB\nVmSize:\t   20000 kB\nVmRSS:\t    8000 kB\nSigQ:\t0/1024\nCpus_allowed:\t1\nCpus_allowed_list:\t0\n"
+    if rest == "/stat":
+        let nm = base_name(g.exe)
+        let f = [to_string(g.pid), "(" .. nm .. ")", "R", to_string(g.parent if g.parent != 0 else 1), to_string(g.pid), to_string(g.pid), "0", "-1", "0", "0", "0", "0", "0", "0", "0", "0", "0", "20", "0", to_string(g.nthreads), "0", "0", "20000000", "2000", "18446744073709551615"]
+        while len(f) < 52:
+            f.append("0")
+        return f.join(" ") .. "\n"
+    if rest == "/limits":
+        return "Limit                     Soft Limit           Hard Limit           Units     \nMax stack size            8388608              unlimited            bytes     \nMax open files            1024                 4096                 files     \n"
+    if path == "/proc/cpuinfo":
+        return "processor\t: 0\nvendor_id\t: SprintOS\ncpu family\t: 6\nmodel\t\t: 1\nmodel name\t: SprintOS virtual CPU\ncpu MHz\t\t: 2000.000\ncache size\t: 1024 KB\nphysical id\t: 0\nsiblings\t: 1\ncore id\t\t: 0\ncpu cores\t: 1\nflags\t\t: fpu tsc msr pae cx8 apic sep cmov pat mmx fxsr sse sse2 syscall nx lm\nbogomips\t: 4000.00\nclflush size\t: 64\naddress sizes\t: 40 bits physical, 48 bits virtual\n\n"
+    if path == "/proc/meminfo":
+        return "MemTotal:       262144 kB\nMemFree:        131072 kB\nMemAvailable:   131072 kB\nBuffers:            0 kB\nCached:         16384 kB\nSwapTotal:          0 kB\nSwapFree:           0 kB\n"
+    if path == "/proc/version":
+        return "Linux version 6.1.0-sprintos (sprint@sprintos) (Sprint) #1 SMP SprintOS\n"
+    if path == "/proc/uptime":
+        return fmt_us(psys.ms() * 1000) .. " " .. fmt_us(psys.ms() * 500) .. "\n"
+    if path == "/proc/loadavg":
+        return "0.00 0.00 0.00 1/" .. to_string(len(guests) + 1) .. " " .. to_string(g.pid) .. "\n"
+    if path == "/proc/stat":
+        return "cpu  100 0 100 10000 0 0 0 0 0 0\ncpu0 100 0 100 10000 0 0 0 0 0 0\nbtime 1700000000\n"
+    if path == "/proc/sys/vm/overcommit_memory":
+        return "1\n"
+    if path == "/proc/sys/kernel/pid_max":
+        return "32768\n"
+    if path == "/proc/sys/kernel/random/boot_id":
+        return "00000000-0000-0000-0000-000000000001\n"
+    return nil
+
+# directories that exist only here: names of their entries
+func vdir_names(g, path):
+    if path == "/proc":
+        return ["self", "cpuinfo", "meminfo", "version", "uptime", "loadavg", "stat", "sys", to_string(g.pid)]
+    if path == "/proc/self" or path == "/proc/" .. to_string(g.pid):
+        return ["maps", "cmdline", "environ", "comm", "status", "stat", "limits", "fd", "cwd", "exe"]
+    if path == "/proc/self/fd" or path == "/proc/" .. to_string(g.pid) .. "/fd":
+        let out = []
+        for fd in keys(g.fds):
+            if g.fds[fd] != nil:
+                out.append(to_string(fd))
+        return out
+    if path == "/proc/sys" or path == "/proc/sys/vm" or path == "/proc/sys/kernel":
+        return ["vm", "kernel"] if path == "/proc/sys" else (["overcommit_memory"] if path == "/proc/sys/vm" else ["pid_max", "random"])
+    if path == "/dev":
+        return ["null", "zero", "urandom", "random", "tty", "console", "stdin", "stdout", "stderr", "fd"]
+    return nil
+
+# open a generated file or directory: an fd, or nil when the path is not one of ours
+func open_virtual(g, p):
+    let names = vdir_names(g, p)
+    if names != nil:
+        let ents = [{kind: "dir", name: "."}, {kind: "dir", name: ".."}]
+        for n in names:
+            ents.append({kind: "dir" if (n == "self" or n == "fd" or n == "sys" or n == "vm" or n == "kernel" or n == "random" or n == to_string(g.pid)) else "file", name: n})
+        return g.alloc_fd({kind: "dir", path: p, pos: 0, names: ents, virtual: true})
+    if p.starts_with("/proc/"):
+        let t = proc_text(g, p)
+        if verbose == "trace":
+            log("proc " .. p .. " -> " .. to_string(len(t) if t != nil else -1) .. " bytes")
+        if t == nil:
+            return -ENOENT
+        return g.alloc_fd({kind: "mem", path: p, pos: 0, data: sslcore.from_str(t), readable: true, writable: false, append: false})
+    return nil
+
+func virtual_stat_kind(g, p):
+    if vdir_names(g, p) != nil:
+        return "dir"
+    if p.starts_with("/proc/") and proc_text(g, p) != nil:
+        return "file"
+    if p == "/proc/self/exe" or p == "/proc/self/cwd":
+        return "symlink"
+    return nil
 
 
 # ================= sockets: AF_UNIX and loopback (in this process; the network ones come later) =================

@@ -18,7 +18,7 @@ glibc_ok = glibc_ok and subprocess.run(["gcc", "-O2", "-pie", "-fPIE", "-o", os.
 glibc_ok = glibc_ok and subprocess.run(["gcc", "-O2", "-pie", "-fPIE", "-o", os.path.join(tmp, "signals_glibc"), os.path.join(src, "signals.c")], capture_output=True).returncode == 0
 glibc_ok = glibc_ok and subprocess.run(["gcc", "-O2", "-pie", "-fPIE", "-pthread", "-o", os.path.join(tmp, "threads_glibc"), os.path.join(src, "threads.c")], capture_output=True).returncode == 0
 check(glibc_ok, "gcc builds glibc dynamic PIE programs")
-for name, flags in (("hello", ["-static-pie"]), ("files", ["-static-pie"]), ("proc", ["-static-pie"]), ("threads", ["-static-pie", "-pthread"]), ("socks", ["-static-pie"]), ("signals", ["-static-pie"]), ("hello_dyn", ["-pie", "-fPIE"])):
+for name, flags in (("hello", ["-static-pie"]), ("files", ["-static-pie"]), ("proc", ["-static-pie"]), ("threads", ["-static-pie", "-pthread"]), ("socks", ["-static-pie"]), ("signals", ["-static-pie"]), ("procfs", ["-static-pie", "-pthread"]), ("hello_dyn", ["-pie", "-fPIE"])):
     r = subprocess.run(["musl-gcc"] + flags + ["-O2", "-o", os.path.join(tmp, name), os.path.join(src, name.replace("_dyn", "") + ".c")], capture_output=True, text=True)
     check(r.returncode == 0, "musl-gcc builds %s (%s)" % (name, " ".join(flags)))
 fsimg = os.path.join(tmp, "fs.img")
@@ -64,7 +64,7 @@ echo "done" | tr a-z A-Z
 exit 5
 """)
 tool("put", os.path.join(tmp, "script.sh"), "/lx/script.sh")
-tool("put", os.path.join(tmp, "signals"), "/bin/signals"); tool("put", os.path.join(tmp, "socks"), "/bin/socks"); tool("mkdir", "/tmp"); tool("put", os.path.join(tmp, "threads"), "/bin/threads"); tool("put", os.path.join(tmp, "proc"), "/bin/proc"); tool("put", os.path.join(tmp, "hello_dyn"), "/bin/hello_dyn")
+tool("put", os.path.join(tmp, "procfs"), "/bin/procfs"); tool("put", os.path.join(tmp, "signals"), "/bin/signals"); tool("put", os.path.join(tmp, "socks"), "/bin/socks"); tool("mkdir", "/tmp"); tool("put", os.path.join(tmp, "threads"), "/bin/threads"); tool("put", os.path.join(tmp, "proc"), "/bin/proc"); tool("put", os.path.join(tmp, "hello_dyn"), "/bin/hello_dyn")
 tool("put", os.path.join(tmp, "hello"), "/bin/hello"); tool("put", os.path.join(tmp, "files"), "/bin/files"); tool("put", os.path.join(tmp, "input.txt"), "/lx/input.txt")
 ser = os.path.join(OUT, "linux.log")
 if os.path.exists(ser): os.remove(ser)
@@ -121,6 +121,12 @@ for tag, n in (("musl", 1), ("glibc", 2)):
     check(L.count("child killed: signaled=1 sig=15 chld=1") >= n, "signals (%s): SIGTERM ends a child by default, SIGCHLD handler runs" % tag)
     check(L.count("SIGSEGV handler: addr=") >= n and L.count("recovered from SIGSEGV") >= n and L.count("recovered from SIGFPE") >= n, "signals (%s): a page fault and a division by zero reach their handlers (siglongjmp out)" % tag)
     check(L.count("unhandled fault: signaled=1 sig=11") >= n and L.count("abort: sig=6") >= n, "signals (%s): an unhandled fault ends with SIGSEGV; abort() gives SIGABRT" % tag)
+check("cmdline: 31 bytes" in L or "cmdline:" in L and "first=/bin/procfs" in L, "/proc/self/cmdline")
+check("status: Name=procfs" in L and "cpuinfo: ok" in L and "meminfo: ok" in L and "uptime: ok" in L, "/proc/self/status, cpuinfo, meminfo, uptime")
+check("maps:" in L and "stack=1 exe=1" in L, "/proc/self/maps lists the program and the [stack]")
+check("exe: /bin/procfs" in L and "fd link: /lx/input.txt" in L and "stat /proc/self: dir=1" in L and "stat /proc/nothing: -1" in L, "readlink of /proc/self/exe and /proc/self/fd/N, stat of /proc paths")
+check("fd entries: 4" in L or "fd entries: 5" in L, "/proc/self/fd can be listed")
+check("pthread_getattr_np: 0 size>0=1" in L, "glibc/musl pthread_getattr_np works (it reads /proc/self/maps)")
 check("lxtest: /bin/nothere: cannot read" in L, "a missing program is reported")
 check("lxtest: done" in L, "the test finished")
 # the host looks at the disk
