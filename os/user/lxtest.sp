@@ -45,6 +45,9 @@ for p in progs:
     run(p, [p, "one", "two words"], ["HOME=/root", "LANG=C"])
 # real programs from the host's distribution (dash, coreutils, sed ...): a shell script with pipes and subshells
 run("/usr/bin/dash", ["dash", "/lx/script.sh"], ["PATH=/usr/bin", "HOME=/root"])
+if ipc.lookup("fs") != nil:
+    run("/usr/bin/lua", ["lua", "-e", "print('lua', 6 * 7, _VERSION)"], ["HOME=/root"])
+    run("/usr/bin/luajit", ["luajit", "-e", "local s = 0 for i = 1, 10000000 do s = s + i end print('luajit', s)"], ["HOME=/root"])
 print("lxtest: missing program:", run("/bin/nothere", ["x"], []))
 print("lxtest: done")
 io.flush()

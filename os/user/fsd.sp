@@ -45,6 +45,17 @@ func handle(src, q):
     if op == "stat":
         let s = volume.stat(q[1])
         return ok(s.kind .. "\t" .. to_string(s.size) .. "\t" .. to_string(s.mode) .. "\t" .. to_string(s.nlink) .. "\t" .. to_string(s.mtime))
+    if op == "lstat":
+        let s2 = volume.lstat(q[1])
+        return ok(s2.kind .. "\t" .. to_string(s2.size) .. "\t" .. to_string(s2.mode) .. "\t" .. to_string(s2.nlink) .. "\t" .. to_string(s2.mtime))
+    if op == "symlink":
+        volume.symlink(q[1], q[2])
+        return ok()
+    if op == "readlink":
+        return ok(volume.readlink(q[1]))
+    if op == "chmod":
+        volume.chmod(q[1], to_int(q[2]))
+        return ok()
     if op == "exists":
         return ok("1" if volume.exists(q[1]) else "0")
     if op == "list":

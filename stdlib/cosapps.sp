@@ -231,6 +231,59 @@ export class BackendSink:
     func executable(self, path):
         self.exec[path] = true
 
+# writes into a SprintFS volume object (sprintfs.mount(...)) below `root`, with the links (symlink) and the executable bits (chmod 755) the pack lists
+export class VolumeSink:
+    let vol = nil
+    let root = ""
+    let made = nil
+    let count = 0
+    let bytes = 0
+    let links = 0
+    func init(self, vol, root = ""):
+        self.vol = vol
+        self.root = root
+        self.made = {}
+    func ensure_dir(self, path):
+        if path == "" or path == "/" or self.made[path]:
+            return nil
+        let i = len(path) - 1
+        while i > 0 and path[i] != 47:
+            i -= 1
+        if i > 0:
+            self.ensure_dir(path.slice(0, i))
+        if not self.vol.exists(path):
+            self.vol.mkdir(path)
+        self.made[path] = true
+    func parent(self, full):
+        let i = len(full) - 1
+        while i > 0 and full[i] != 47:
+            i -= 1
+        return full.slice(0, i)
+    func file(self, path, size, offset, data):
+        let full = self.root .. "/" .. path
+        self.ensure_dir(self.parent(full))
+        let f = self.vol.open(full, "w+" if offset == 0 else "r+")
+        f.seek(offset)
+        f.write(data)
+        f.close()
+        if offset == 0:
+            self.count += 1
+        self.bytes += len(data)
+    func link(self, path, target):
+        let full = self.root .. path
+        self.ensure_dir(self.parent(full))
+        if not self.vol.exists(full):
+            try:
+                self.vol.symlink(target, full)
+                self.links += 1
+            catch e:
+                pass
+    func executable(self, path):
+        try:
+            self.vol.chmod(self.root .. path, 0o755)
+        catch e:
+            pass
+
 export func catalog(src):
     let m = src.get("apps/catalog.manifest")
     if m == nil:

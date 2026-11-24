@@ -63,6 +63,15 @@ x=$(echo subshell); echo "got $x"
 echo "done" | tr a-z A-Z
 curl -s http://10.0.2.2:18090/hello; echo " curl rc=$?"\nexit 5\n""")
 tool("put", os.path.join(tmp, "script.sh"), "/lx/script.sh")
+# an app pack of C-OS (signed; see C-OS-APPS), installed by tools/packinstall.sp when a clone of that repository is at hand
+COSAPPS = os.environ.get("COS_APPS", "/home/user/C-OS-APPS")
+packs = []
+for name in ("lua",):
+    pd = os.path.join(COSAPPS, "apps", name)
+    if os.path.exists(os.path.join(pd, "linuxpack.manifest")):
+        r = subprocess.run([SP, "run", "--allow-read=" + tmp, "--allow-read=" + COSAPPS, "--allow-write=" + tmp, "tools/packinstall.sp", fsimg, pd, "/"], capture_output=True, text=True)
+        check(r.returncode == 0 and "installed" in r.stdout, "packinstall: the %s pack passes its signature and SHA-256 checks and goes onto the disk" % name)
+        if r.returncode == 0: packs.append(name)
 tool("put", os.path.join(tmp, "procfs"), "/bin/procfs"); tool("put", os.path.join(tmp, "nettest"), "/bin/nettest"); tool("mkdir", "/etc"); open(os.path.join(tmp, "resolv.conf"), "w").write("nameserver 10.0.2.2\n"); tool("put", os.path.join(tmp, "resolv.conf"), "/etc/resolv.conf"); tool("put", os.path.join(tmp, "signals"), "/bin/signals"); tool("put", os.path.join(tmp, "socks"), "/bin/socks"); tool("mkdir", "/tmp"); tool("put", os.path.join(tmp, "threads"), "/bin/threads"); tool("put", os.path.join(tmp, "proc"), "/bin/proc"); tool("put", os.path.join(tmp, "hello_dyn"), "/bin/hello_dyn")
 tool("put", os.path.join(tmp, "hello"), "/bin/hello"); tool("put", os.path.join(tmp, "files"), "/bin/files"); tool("put", os.path.join(tmp, "input.txt"), "/lx/input.txt")
 ser = os.path.join(OUT, "linux.log")
@@ -183,6 +192,9 @@ check("nettest: closed port: ECONNREFUSED" in L, "connecting to a closed port gi
 check("nettest: udp: UDP FROM SPRINTOS from 10.0.2.2:18091" in L, "UDP datagram to the host and the answer back (recvfrom with the source address)")
 check("nettest: getaddrinfo: 192.0.2.7" in L, "getaddrinfo (the C library's resolver) asks the DNS server named in /etc/resolv.conf")
 check("nettest: bind=0" in L and "nettest: accepted=1" in L and fwd_reply == b"HELLO THROUGH THE FORWARD", "a TCP server: the host connects through QEMU's port forward and gets the data back")
+if "lua" in packs:
+    check("lua\t42\tLua 5.5" in L, "the C-OS Lua pack: /usr/bin/lua runs (ELF interpreter /lib64/ld-linux-x86-64.so.2 is a link to a link, glibc 2.31 from the pack)")
+    check("luajit\t50000005000000" in L, "the C-OS Lua pack: LuaJIT runs its JIT-compiled loop")
 check("lxtest: /bin/nothere: cannot read" in L, "a missing program is reported")
 check("lxtest: done" in L, "the test finished")
 # the host looks at the disk

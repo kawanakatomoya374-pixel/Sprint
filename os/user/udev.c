@@ -568,6 +568,84 @@ static const SpNativeDesc lx_fns[] = {
     {"reply", 2, 2, 0, 0, l_reply}, {"fork", 1, 1, 0, 0, l_fork}, {"getctx", 1, 1, 0, SP_NATIVE_ALLOCATES, l_getctx}, {"setctx", 2, 2, 0, 0, l_setctx}, {"sigpend", 2, 2, 0, 0, l_sigpend}, {"clone", 2, 2, 0, 0, l_clone}, {"resume", 1, 1, 0, 0, l_resume}, {"setsp", 2, 2, 0, 0, l_setsp}, {"reset", 1, 1, 0, 0, l_reset}, {"kill", 2, 2, 0, 0, l_kill}, {"setfs", 2, 2, 0, 0, l_setfs},
 };
 
+
+/* ---- ATA PIO in C: whole sectors with rep insw / outsw (the ports must be open to this process: fsd) ---- */
+static int ata_wait(uint16_t base, uint8_t mask, uint8_t want) {
+    for (long i = 0; i < 5000000; i++) {
+        uint8_t st;
+        __asm__ volatile("inb %1, %0" : "=a"(st) : "Nd"((uint16_t)(base + 7)));
+        if ((st & mask) == want) return 0;
+        if (st & 0x01) return -1;                /* ERR */
+    }
+    return -2;
+}
+static void ata_select(uint16_t base, int slave, uint64_t lba, int count) {
+    __asm__ volatile("outb %0, %1" : : "a"((uint8_t)(0xE0u | ((unsigned)slave << 4) | (unsigned)((lba >> 24) & 15))), "Nd"((uint16_t)(base + 6)));
+    __asm__ volatile("outb %0, %1" : : "a"((uint8_t)count), "Nd"((uint16_t)(base + 2)));
+    __asm__ volatile("outb %0, %1" : : "a"((uint8_t)lba), "Nd"((uint16_t)(base + 3)));
+    __asm__ volatile("outb %0, %1" : : "a"((uint8_t)(lba >> 8)), "Nd"((uint16_t)(base + 4)));
+    __asm__ volatile("outb %0, %1" : : "a"((uint8_t)(lba >> 16)), "Nd"((uint16_t)(base + 5)));
+}
+static void ata_settle(uint16_t ctl) {
+    for (int i = 0; i < 4; i++) { uint8_t x; __asm__ volatile("inb %1, %0" : "=a"(x) : "Nd"(ctl)); (void)x; }
+}
+/* ata_read(base, ctl, slave, lba, count) -> typed.u8 of count * 512 bytes, or an error number (negative) */
+static SpStatus u_ata_read(SpVM *vm, int argc, const SpValue *argv, SpValue *ret) {
+    (void)argc;
+    int64_t base, ctl, slave, lba, count;
+    if (need_i(vm, argv[0], &base) != SP_OK || need_i(vm, argv[1], &ctl) != SP_OK || need_i(vm, argv[2], &slave) != SP_OK ||
+        need_i(vm, argv[3], &lba) != SP_OK || need_i(vm, argv[4], &count) != SP_OK) return SP_E_RUNTIME;
+    if (count < 1 || count > 4096) return sp_throw(vm, "ValueError", "uio.ata_read: bad sector count");
+    uint8_t *buf = (uint8_t *)malloc((size_t)count * 512);
+    if (!buf) return sp_throw(vm, "MemoryError", "uio.ata_read: out of memory");
+    int64_t done = 0;
+    int err = 0;
+    while (done < count && !err) {
+        int n = (int)((count - done) > 128 ? 128 : (count - done));
+        if (ata_wait((uint16_t)base, 0x80, 0)) { err = -1; break; }
+        ata_select((uint16_t)base, (int)slave, (uint64_t)(lba + done), n);
+        __asm__ volatile("outb %0, %1" : : "a"((uint8_t)0x20), "Nd"((uint16_t)(base + 7)));
+        ata_settle((uint16_t)ctl);
+        for (int s = 0; s < n; s++) {
+            if (ata_wait((uint16_t)base, 0x88, 0x08)) { err = -2; break; }
+            void *dst = buf + (size_t)(done + s) * 512;
+            __asm__ volatile("rep insw" : "+D"(dst), "+c"((long){256}) : "d"((uint16_t)base) : "memory");
+        }
+        done += n;
+    }
+    if (err) { free(buf); *ret = sp_int(err); return SP_OK; }
+    *ret = typed_u8_from(vm, buf, (size_t)count * 512);
+    free(buf);
+    return SP_OK;
+}
+/* ata_write(base, ctl, slave, lba, bytes) -> 0 or a negative error; bytes is a typed.u8 whose length is a multiple of 512 */
+static SpStatus u_ata_write(SpVM *vm, int argc, const SpValue *argv, SpValue *ret) {
+    (void)argc;
+    int64_t base, ctl, slave, lba;
+    if (need_i(vm, argv[0], &base) != SP_OK || need_i(vm, argv[1], &ctl) != SP_OK || need_i(vm, argv[2], &slave) != SP_OK || need_i(vm, argv[3], &lba) != SP_OK) return SP_E_RUNTIME;
+    unsigned char *d = typed_u8_data(argv[4]);
+    int64_t len = typed_len(argv[4]);
+    if (!d || len < 512 || (len % 512) != 0) return sp_throw(vm, "ValueError", "uio.ata_write: expected a typed.u8 of whole sectors");
+    int64_t count = len / 512, done = 0;
+    int err = 0;
+    while (done < count && !err) {
+        int n = (int)((count - done) > 128 ? 128 : (count - done));
+        if (ata_wait((uint16_t)base, 0x80, 0)) { err = -1; break; }
+        ata_select((uint16_t)base, (int)slave, (uint64_t)(lba + done), n);
+        __asm__ volatile("outb %0, %1" : : "a"((uint8_t)0x30), "Nd"((uint16_t)(base + 7)));
+        ata_settle((uint16_t)ctl);
+        for (int s = 0; s < n; s++) {
+            if (ata_wait((uint16_t)base, 0x88, 0x08)) { err = -2; break; }
+            const void *src = d + (size_t)(done + s) * 512;
+            __asm__ volatile("rep outsw" : "+S"(src), "+c"((long){256}) : "d"((uint16_t)base) : "memory");
+        }
+        done += n;
+    }
+    if (!err && ata_wait((uint16_t)base, 0x80, 0)) err = -3;
+    *ret = sp_int(err);
+    return SP_OK;
+}
+
 /* ---- module `uio`: port I/O for a driver process (the kernel opens the ports in its I/O permission bitmap; anything else faults) ---- */
 static SpStatus u_inb(SpVM *vm, int argc, const SpValue *argv, SpValue *ret) {
     (void)argc;
@@ -683,7 +761,7 @@ static SpStatus u_poke_str(SpVM *vm, int argc, const SpValue *argv, SpValue *ret
     return SP_OK;
 }
 static const SpNativeDesc uio_fns[] = {
-    {"inb", 1, 1, 0, 0, u_inb}, {"inw", 1, 1, 0, 0, u_inw}, {"outb", 2, 2, 0, 0, u_outb}, {"outw", 2, 2, 0, 0, u_outw},
+    {"ata_read", 5, 5, 0, SP_NATIVE_ALLOCATES, u_ata_read}, {"ata_write", 5, 5, 0, 0, u_ata_write}, {"inb", 1, 1, 0, 0, u_inb}, {"inw", 1, 1, 0, 0, u_inw}, {"outb", 2, 2, 0, 0, u_outb}, {"outw", 2, 2, 0, 0, u_outw},
     {"inl", 1, 1, 0, 0, u_inl}, {"outl", 2, 2, 0, 0, u_outl}, {"mmio_map", 2, 2, 0, 0, u_mmio_map},
     {"dma_alloc", 1, 1, 0, SP_NATIVE_ALLOCATES, u_dma_alloc},
     {"peek8", 1, 1, 0, 0, u_peek8}, {"peek16", 1, 1, 0, 0, u_peek16}, {"peek32", 1, 1, 0, 0, u_peek32}, {"peek64", 1, 1, 0, 0, u_peek64},

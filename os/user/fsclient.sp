@@ -59,6 +59,21 @@ export class Client:
         s.nlink = to_int(f[3])
         s.mtime = to_int(f[4])
         return s
+    func lstat(self, path):
+        let f = self.call("lstat\t" .. path)
+        let s = Stat()
+        s.kind = f[0]
+        s.size = to_int(f[1])
+        s.mode = to_int(f[2])
+        s.nlink = to_int(f[3])
+        s.mtime = to_int(f[4])
+        return s
+    func symlink(self, target, path):
+        self.call("symlink\t" .. target .. "\t" .. path)
+    func readlink(self, path):
+        return self.call("readlink\t" .. path)[0]
+    func chmod(self, path, mode):
+        self.call("chmod\t" .. path .. "\t" .. to_string(mode))
     func exists(self, path):
         return self.call("exists\t" .. path)[0] == "1"
     # names of a directory: [{kind, size, name}]

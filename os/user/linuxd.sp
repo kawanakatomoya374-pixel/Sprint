@@ -250,10 +250,81 @@ func norm(path):
             out.append(part)
     return "/" .. out.join("/")
 
+# symbolic links: target of the link at `path`, or nil when it is not one (cached; any change of the name space clears the cache)
+let linkcache = {}
+func link_target(path):
+    let c = linkcache[path]
+    if c != nil:
+        return c if c != false else nil
+    let t = nil
+    try:
+        let st = fs.lstat(path)
+        if st.kind == "symlink":
+            t = fs.readlink(path)
+    catch e:
+        t = nil
+    if len(linkcache) > 20000:
+        linkcache = {}
+    linkcache[path] = t if t != nil else false
+    return t
+
+func links_changed():
+    linkcache = {}
+
+# the path with every symbolic link in it replaced by what it points to (the last component too when follow_last)
+func resolve(p, follow_last):
+    if p.starts_with("/proc") or p.starts_with("/dev") or fs == nil:
+        return p
+    let parts = p.split("/").filter(x => x != "")
+    let cur = ""
+    let i = 0
+    let depth = 0
+    while i < len(parts):
+        let comp = parts[i]
+        let cand = cur .. "/" .. comp
+        if comp == "." or comp == "":
+            i += 1
+            continue
+        if comp == "..":
+            let k = last_slash(cur)
+            cur = cur.slice(0, k) if k > 0 else ""
+            i += 1
+            continue
+        if i < len(parts) - 1 or follow_last:
+            let t = link_target(cand)
+            if t != nil:
+                depth += 1
+                if depth > 40:
+                    return cand
+                let rest = parts.slice(i + 1)
+                let np = t.split("/").filter(x => x != "")
+                parts = join_arrays(np, rest)
+                if t.starts_with("/"):
+                    cur = ""
+                i = 0
+                continue
+        cur = cand
+        i += 1
+    return cur if cur != "" else "/"
+
+func join_arrays(a, b):
+    let out = []
+    for x in a:
+        out.append(x)
+    for x in b:
+        out.append(x)
+    return out
+
 func abspath(g, p):
     if p.starts_with("/"):
-        return norm(p)
-    return norm(g.cwd .. "/" .. p)
+        return resolve(norm(p), true)
+    return resolve(norm(g.cwd .. "/" .. p), true)
+
+# the same but a link in the last place stays what it is (lstat, readlink, unlink, rename, symlink)
+func abspath_nf(g, p):
+    if p.starts_with("/"):
+        return resolve(norm(p), false)
+    return resolve(norm(g.cwd .. "/" .. p), false)
 
 # ---- the memory map of a program (for /proc/self/maps) ----
 func vm_remove(g, a, b):
@@ -735,6 +806,7 @@ func do_open(g, path, flags, mode):
         if (flags & 0o100) == 0:
             return -ENOENT
         try:
+            links_changed()
             fs.write_bytes(p, sslcore.concat([[]]), 0, true)
         catch e:
             return -errno_of(e.kind)
@@ -805,8 +877,8 @@ func fill_stat(kind, size, mtime, ino):
     put64(b, 104, mtime)
     return sslcore.concat([b])
 
-func stat_path(g, p, buf):
-    let ap = abspath(g, p)
+func stat_path(g, p, buf, follow = true):
+    let ap = abspath(g, p) if follow else abspath_nf(g, p)
     if ap == "/dev/null" or ap == "/dev/zero" or ap == "/dev/urandom" or ap == "/dev/tty":
         let b = fill_stat("file", 0, 0, 3)
         b[24] = 0o20666 & 255
@@ -820,7 +892,7 @@ func stat_path(g, p, buf):
                 sz = 0
             return wr(g, buf, fill_stat(vk, sz, 0, path_ino(ap)))
     try:
-        let st = fs.stat(ap)
+        let st = fs.stat(ap) if follow else fs.lstat(ap)
         return wr(g, buf, fill_stat(st.kind, st.size, st.mtime, path_ino(ap)))
     catch e:
         return -errno_of(e.kind)
@@ -830,6 +902,12 @@ func sys_stat(g, a):
     if path == nil:
         return -EFAULT
     return stat_path(g, path, a[1])
+
+func sys_lstat(g, a):
+    let path = cstr(g, a[0])
+    if path == nil:
+        return -EFAULT
+    return stat_path(g, path, a[1], false)
 
 func sys_fstat(g, a):
     let f = g.fds[a[0]]
@@ -869,7 +947,7 @@ func sys_newfstatat(g, a):
         if d == nil or d.kind != "dir":
             return -EBADF
         path = d.path .. "/" .. path
-    return stat_path(g, path, a[2])
+    return stat_path(g, path, a[2], (a[3] & 0x100) == 0)
 
 func sys_access(g, a):
     let path = cstr(g, a[0])
@@ -963,7 +1041,8 @@ func sys_unlink(g, a):
     if path == nil:
         return -EFAULT
     try:
-        fs.unlink(abspath(g, path))
+        links_changed()
+        fs.unlink(abspath_nf(g, path))
     catch e:
         return -errno_of(e.kind)
     return 0
@@ -973,7 +1052,8 @@ func sys_rmdir(g, a):
     if path == nil:
         return -EFAULT
     try:
-        fs.rmdir(abspath(g, path))
+        links_changed()
+        fs.rmdir(abspath_nf(g, path))
     catch e:
         return -errno_of(e.kind)
     return 0
@@ -984,7 +1064,8 @@ func sys_rename(g, a):
     if p1 == nil or p2 == nil:
         return -EFAULT
     try:
-        fs.rename(abspath(g, p1), abspath(g, p2))
+        links_changed()
+        fs.rename(abspath_nf(g, p1), abspath_nf(g, p2))
     catch e:
         return -errno_of(e.kind)
     return 0
@@ -1327,6 +1408,33 @@ func sys_exit_thread(g, a):
         return nil
     finish(g, a[0] & 255, (a[0] & 255) << 8)
     return nil
+
+func sys_symlink(g, a):
+    let target = cstr(g, a[0])
+    let path = cstr(g, a[1])
+    if target == nil or path == nil:
+        return -EFAULT
+    try:
+        links_changed()
+        fs.symlink(target, abspath_nf(g, path))
+    catch e:
+        return -errno_of(e.kind)
+    return 0
+
+func sys_symlinkat(g, a):
+    let target = cstr(g, a[0])
+    let path = cstr(g, a[2])
+    if target == nil or path == nil:
+        return -EFAULT
+    let p = at_path(g, a[1], path, false)
+    if p == nil:
+        return -EBADF
+    try:
+        links_changed()
+        fs.symlink(target, p)
+    catch e:
+        return -errno_of(e.kind)
+    return 0
 
 func sys_sched_getaffinity(g, a):
     wr(g, a[2], sslcore.concat([[1, 0, 0, 0, 0, 0, 0, 0]]))
@@ -1700,7 +1808,7 @@ func sys_readlink(g, a):
     let path = cstr(g, a[0])
     if path == nil:
         return -EFAULT
-    return readlink_path(g, abspath(g, path), a[1], a[2])
+    return readlink_path(g, abspath_nf(g, path), a[1], a[2])
 
 func sys_sysinfo(g, a):
     let b = []
@@ -2169,14 +2277,14 @@ func serve_signal_check(g, tid):
 # ================= more of the system call table (after C-OS's cos_linux.c) =================
 
 # a path argument relative to a directory descriptor
-func at_path(g, dirfd0, path):
+func at_path(g, dirfd0, path, follow = true):
     let dirfd = i32(dirfd0)
     if path.starts_with("/") or dirfd == AT_FDCWD:
-        return abspath(g, path)
+        return abspath(g, path) if follow else abspath_nf(g, path)
     let d = g.fds[dirfd]
     if d == nil or d.kind != "dir":
         return nil
-    return norm(d.path .. "/" .. path)
+    return resolve(norm(d.path .. "/" .. path), follow)
 
 func sys_readv(g, a):
     let f = g.fds[a[0]]
@@ -2287,10 +2395,11 @@ func sys_unlinkat(g, a):
     let path = cstr(g, a[1])
     if path == nil:
         return -EFAULT
-    let p = at_path(g, a[0], path)
+    let p = at_path(g, a[0], path, false)
     if p == nil:
         return -EBADF
     try:
+        links_changed()
         if (a[2] & 0x200) != 0:
             fs.rmdir(p)
         else:
@@ -2304,8 +2413,9 @@ func sys_renameat(g, a):
     let p2 = cstr(g, a[3])
     if p1 == nil or p2 == nil:
         return -EFAULT
-    let x = at_path(g, a[0], p1)
-    let y = at_path(g, a[2], p2)
+    let x = at_path(g, a[0], p1, false)
+    let y = at_path(g, a[2], p2, false)
+    links_changed()
     if x == nil or y == nil:
         return -EBADF
     try:
@@ -2318,9 +2428,9 @@ func sys_readlinkat(g, a):
     let path = cstr(g, a[1])
     if path == nil:
         return -EFAULT
-    let p = at_path(g, a[0], path)
+    let p = at_path(g, a[0], path, false)
     if p == nil:
-        p = abspath(g, path)
+        return -EBADF
     return readlink_path(g, p, a[2], a[3])
 
 func readlink_path(g, p, buf, size):
@@ -2338,6 +2448,16 @@ func readlink_path(g, p, buf, size):
         let n2 = imin(len(tb), size)
         let r2 = wr(g, buf, tb.slice(0, n2))
         return r2 if r2 < 0 else n2
+    if not p.starts_with("/proc"):
+        let tt = nil
+        try:
+            tt = fs.readlink(p)
+        catch e:
+            return -errno_of(e.kind) if e.kind != "EINVAL" else -EINVAL
+        let tb2 = sslcore.from_str(tt)
+        let n3 = imin(len(tb2), size)
+        let r3 = wr(g, buf, tb2.slice(0, n3))
+        return r3 if r3 < 0 else n3
     if p == "/proc/self/cwd":
         let b = sslcore.from_str(g.cwd)
         let n = imin(len(b), size)
@@ -3710,7 +3830,7 @@ func setup():
     table[3] = sys_close
     table[4] = sys_stat
     table[5] = sys_fstat
-    table[6] = sys_stat
+    table[6] = sys_lstat
     table[8] = sys_lseek
     table[9] = sys_mmap
     table[10] = sys_mprotect
@@ -3762,6 +3882,8 @@ func setup():
     table[84] = sys_rmdir
     table[87] = sys_unlink
     table[89] = sys_readlink
+    table[88] = sys_symlink
+    table[266] = sys_symlinkat
     table[96] = sys_gettimeofday
     table[99] = sys_sysinfo
     table[102] = sys_getuid

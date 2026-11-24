@@ -47,38 +47,25 @@ export class Disk:
     func read(self, n):
         if n < 0 or n >= self.blocks():
             fail("read past the end: block " .. to_string(n))
-        let out = typed.u8(BLOCK)
-        let lba = n * PER_BLOCK
-        for s in range(PER_BLOCK):
-            wait(self.base, 0x80, 0, "read")
-            self.select(lba + s, 1)
-            uio.outb(self.base + 7, 0x20)
-            uio.inb(self.ctl)                       # 400 ns of settling: four reads of the alternate status
-            uio.inb(self.ctl)
-            uio.inb(self.ctl)
-            uio.inb(self.ctl)
-            wait(self.base, 0x88, 0x08, "read")
-            for w in range(256):
-                let v = uio.inw(self.base)
-                out[s * SECTOR + 2 * w] = v & 255
-                out[s * SECTOR + 2 * w + 1] = v >> 8
-        return out
+        let r = uio.ata_read(self.base, self.ctl, self.slave, n * PER_BLOCK, PER_BLOCK)
+        if type(r) == "int":
+            fail("read error " .. to_string(r) .. " at block " .. to_string(n))
+        return r
+    # k blocks from block n in one go
+    func read_run(self, n, k):
+        if n < 0 or n + k > self.blocks():
+            fail("read past the end: block " .. to_string(n))
+        let r = uio.ata_read(self.base, self.ctl, self.slave, n * PER_BLOCK, k * PER_BLOCK)
+        if type(r) == "int":
+            fail("read error " .. to_string(r) .. " at block " .. to_string(n))
+        return r
     func write(self, n, data):
         if n < 0 or n >= self.blocks():
             fail("write past the end: block " .. to_string(n))
-        let lba = n * PER_BLOCK
-        for s in range(PER_BLOCK):
-            wait(self.base, 0x80, 0, "write")
-            self.select(lba + s, 1)
-            uio.outb(self.base + 7, 0x30)
-            uio.inb(self.ctl)
-            uio.inb(self.ctl)
-            uio.inb(self.ctl)
-            uio.inb(self.ctl)
-            wait(self.base, 0x88, 0x08, "write")
-            for w in range(256):
-                uio.outw(self.base, data[s * SECTOR + 2 * w] | (data[s * SECTOR + 2 * w + 1] << 8))
-        wait(self.base, 0x80, 0, "write")
+        let d = typed.u8(data) if type(data) == "array" else data
+        let r = uio.ata_write(self.base, self.ctl, self.slave, n * PER_BLOCK, d)
+        if r != 0:
+            fail("write error " .. to_string(r) .. " at block " .. to_string(n))
     func flush(self):
         uio.outb(self.base + 6, 0xE0 | (self.slave << 4))
         uio.outb(self.base + 7, 0xE7)               # FLUSH CACHE

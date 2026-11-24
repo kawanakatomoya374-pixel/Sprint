@@ -112,8 +112,7 @@ export class MemDevice:
 export func device_from_bytes(bytes, block_size = 4096):
     let n = len(bytes) // block_size
     let d = MemDevice(n, block_size)
-    for i in range(n * block_size):
-        d.data[i] = bytes[i]
+    d.data.set_from(bytes.slice(0, n * block_size) if len(bytes) != n * block_size else bytes, 0)
     return d
 
 # a device that loses power after `limit` block writes: the later writes and flushes vanish (for crash tests)
