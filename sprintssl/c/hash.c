@@ -78,23 +78,35 @@ static const uint64_t K512[80] = {
     0xca273eceea26619cULL, 0xd186b8c721c0c207ULL, 0xeada7dd6cde0eb1eULL, 0xf57d4f7fee6ed178ULL, 0x06f067aa72176fbaULL, 0x0a637dc5a2c898a6ULL, 0x113f9804bef90daeULL, 0x1b710b35131c471bULL,
     0x28db77f523047d84ULL, 0x32caab7b40c72493ULL, 0x3c9ebe0a15c9bebcULL, 0x431d67c49c100d4cULL, 0x4cc5d4becb3e42b6ULL, 0x597f299cfc657e2aULL, 0x5fcb6fab3ad6faecULL, 0x6c44198c4a475817ULL};
 
+static uint64_t ld64be(const uint8_t *p) {
+    return ((uint64_t)p[0] << 56) | ((uint64_t)p[1] << 48) | ((uint64_t)p[2] << 40) | ((uint64_t)p[3] << 32) | ((uint64_t)p[4] << 24) | ((uint64_t)p[5] << 16) | ((uint64_t)p[6] << 8) | (uint64_t)p[7];
+}
+/* eighty rounds, unrolled by eight so the eight working variables rotate by renaming instead of moving; the message schedule is a 16-word ring */
+#define S512_1(e) (ror64(e, 14) ^ ror64(e, 18) ^ ror64(e, 41))
+#define S512_0(a) (ror64(a, 28) ^ ror64(a, 34) ^ ror64(a, 39))
+#define R512(a, b, c, d, e, f, g, h, i) \
+    do { \
+        uint64_t t1_ = h + S512_1(e) + (g ^ (e & (f ^ g))) + K512[i] + w[(i) & 15]; \
+        d += t1_; \
+        h = t1_ + S512_0(a) + ((a & b) | (c & (a | b))); \
+    } while (0)
+#define W512(i) \
+    w[(i) & 15] += (ror64(w[((i) - 2) & 15], 19) ^ ror64(w[((i) - 2) & 15], 61) ^ (w[((i) - 2) & 15] >> 6)) + w[((i) - 7) & 15] + \
+                   (ror64(w[((i) - 15) & 15], 1) ^ ror64(w[((i) - 15) & 15], 8) ^ (w[((i) - 15) & 15] >> 7))
 static void sha512_block(uint64_t h[8], const uint8_t *p) {
-    uint64_t w[80];
-    for (int i = 0; i < 16; i++) {
-        uint64_t v = 0;
-        for (int j = 0; j < 8; j++) v = (v << 8) | p[8 * i + j];
-        w[i] = v;
-    }
-    for (int i = 16; i < 80; i++) {
-        uint64_t s0 = ror64(w[i - 15], 1) ^ ror64(w[i - 15], 8) ^ (w[i - 15] >> 7);
-        uint64_t s1 = ror64(w[i - 2], 19) ^ ror64(w[i - 2], 61) ^ (w[i - 2] >> 6);
-        w[i] = w[i - 16] + s0 + w[i - 7] + s1;
-    }
+    uint64_t w[16];
+    for (int i = 0; i < 16; i++) w[i] = ld64be(p + 8 * i);
     uint64_t a = h[0], b = h[1], c = h[2], d = h[3], e = h[4], f = h[5], g = h[6], hh = h[7];
-    for (int i = 0; i < 80; i++) {
-        uint64_t t1 = hh + (ror64(e, 14) ^ ror64(e, 18) ^ ror64(e, 41)) + ((e & f) ^ (~e & g)) + K512[i] + w[i];
-        uint64_t t2 = (ror64(a, 28) ^ ror64(a, 34) ^ ror64(a, 39)) + ((a & b) ^ (a & c) ^ (b & c));
-        hh = g; g = f; f = e; e = d + t1; d = c; c = b; b = a; a = t1 + t2;
+    for (int i = 0; i < 80; i += 8) {
+        if (i >= 16) { W512(i); W512(i + 1); W512(i + 2); W512(i + 3); W512(i + 4); W512(i + 5); W512(i + 6); W512(i + 7); }
+        R512(a, b, c, d, e, f, g, hh, i);
+        R512(hh, a, b, c, d, e, f, g, i + 1);
+        R512(g, hh, a, b, c, d, e, f, i + 2);
+        R512(f, g, hh, a, b, c, d, e, i + 3);
+        R512(e, f, g, hh, a, b, c, d, i + 4);
+        R512(d, e, f, g, hh, a, b, c, i + 5);
+        R512(c, d, e, f, g, hh, a, b, i + 6);
+        R512(b, c, d, e, f, g, hh, a, i + 7);
     }
     h[0] += a; h[1] += b; h[2] += c; h[3] += d; h[4] += e; h[5] += f; h[6] += g; h[7] += hh;
 }

@@ -36,6 +36,8 @@ int ssl_accel_gcm(int seal, const uint8_t *key, size_t kl, const uint8_t *nonce,
 size_t ssl_chacha_xor4(const uint8_t key[32], uint32_t ctr, const uint8_t nonce[12], const uint8_t *in, size_t n, uint8_t *out); /* whole 256-byte groups; returns the bytes done */
 int ssl_accel_sha256(void);   /* 1 when this CPU has the SHA extensions */
 void ssl_accel_sha256_blocks(uint32_t st[8], const uint8_t *data, size_t blocks);
+int ssl_accel_avx2(void);
+size_t ssl_chacha_xor8(const uint8_t key[32], uint32_t ctr, const uint8_t nonce[12], const uint8_t *in, size_t n, uint8_t *out); /* whole 512-byte groups (AVX2) */
 void ssl_chacha_seal(const uint8_t key[32], const uint8_t nonce[12], const uint8_t *aad, size_t al, const uint8_t *pt, size_t n, uint8_t *out);
 int ssl_chacha_open(const uint8_t key[32], const uint8_t nonce[12], const uint8_t *aad, size_t al, const uint8_t *ct, size_t n, uint8_t *out);
 

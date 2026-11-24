@@ -79,17 +79,19 @@ TARGET static __m128i bswap128(__m128i x) {
     return _mm_shuffle_epi8(x, _mm_set_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15));
 }
 
-/* a * b in GF(2^128), both byte-reflected */
-TARGET static __m128i gfmul(__m128i a, __m128i b) {
-    __m128i t3 = _mm_clmulepi64_si128(a, b, 0x00);
-    __m128i t4 = _mm_clmulepi64_si128(a, b, 0x10);
-    __m128i t5 = _mm_clmulepi64_si128(a, b, 0x01);
-    __m128i t6 = _mm_clmulepi64_si128(a, b, 0x11);
-    t4 = _mm_xor_si128(t4, t5);
-    t5 = _mm_slli_si128(t4, 8);
-    t4 = _mm_srli_si128(t4, 8);
-    t3 = _mm_xor_si128(t3, t5);
-    t6 = _mm_xor_si128(t6, t4);
+/* carry-less products of a and b added into three accumulators (low, middle, high halves) without reducing */
+TARGET static void clmul_acc(__m128i a, __m128i b, __m128i *lo, __m128i *mid, __m128i *hi) {
+    *lo = _mm_xor_si128(*lo, _mm_clmulepi64_si128(a, b, 0x00));
+    *mid = _mm_xor_si128(*mid, _mm_xor_si128(_mm_clmulepi64_si128(a, b, 0x10), _mm_clmulepi64_si128(a, b, 0x01)));
+    *hi = _mm_xor_si128(*hi, _mm_clmulepi64_si128(a, b, 0x11));
+}
+
+/* the 256-bit sum of products to a 128-bit result modulo x^128 + x^7 + x^2 + x + 1 (reflected) */
+TARGET static __m128i ghash_reduce(__m128i lo, __m128i mid, __m128i hi) {
+    __m128i t5 = _mm_slli_si128(mid, 8);
+    __m128i t4 = _mm_srli_si128(mid, 8);
+    __m128i t3 = _mm_xor_si128(lo, t5);
+    __m128i t6 = _mm_xor_si128(hi, t4);
     __m128i t7 = _mm_srli_epi32(t3, 31), t8 = _mm_srli_epi32(t6, 31);
     t3 = _mm_slli_epi32(t3, 1);
     t6 = _mm_slli_epi32(t6, 1);
@@ -114,15 +116,35 @@ TARGET static __m128i gfmul(__m128i a, __m128i b) {
     return _mm_xor_si128(t6, t3);
 }
 
-TARGET static __m128i ghash_run(__m128i y, __m128i h, const uint8_t *p, size_t n) { /* n bytes, a partial last block is zero padded */
+TARGET static __m128i gfmul(__m128i a, __m128i b) {
+    __m128i lo = _mm_setzero_si128(), mid = lo, hi = lo;
+    clmul_acc(a, b, &lo, &mid, &hi);
+    return ghash_reduce(lo, mid, hi);
+}
+
+/* y = ghash over n bytes (a partial last block is zero padded); four blocks share one reduction using the powers h, h^2, h^3, h^4 */
+TARGET static __m128i ghash_run(__m128i y, const __m128i hp[4], const uint8_t *p, size_t n) {
+    while (n >= 64) {
+        __m128i x0 = _mm_xor_si128(y, bswap128(_mm_loadu_si128((const __m128i *)(const void *)p)));
+        __m128i x1 = bswap128(_mm_loadu_si128((const __m128i *)(const void *)(p + 16)));
+        __m128i x2 = bswap128(_mm_loadu_si128((const __m128i *)(const void *)(p + 32)));
+        __m128i x3 = bswap128(_mm_loadu_si128((const __m128i *)(const void *)(p + 48)));
+        __m128i lo = _mm_setzero_si128(), mid = lo, hi = lo;
+        clmul_acc(x0, hp[3], &lo, &mid, &hi);
+        clmul_acc(x1, hp[2], &lo, &mid, &hi);
+        clmul_acc(x2, hp[1], &lo, &mid, &hi);
+        clmul_acc(x3, hp[0], &lo, &mid, &hi);
+        y = ghash_reduce(lo, mid, hi);
+        p += 64; n -= 64;
+    }
     while (n >= 16) {
-        y = gfmul(_mm_xor_si128(y, bswap128(_mm_loadu_si128((const __m128i *)(const void *)p))), h);
+        y = gfmul(_mm_xor_si128(y, bswap128(_mm_loadu_si128((const __m128i *)(const void *)p))), hp[0]);
         p += 16; n -= 16;
     }
     if (n) {
         uint8_t last[16] = {0};
         memcpy(last, p, n);
-        y = gfmul(_mm_xor_si128(y, bswap128(_mm_loadu_si128((const __m128i *)(const void *)last))), h);
+        y = gfmul(_mm_xor_si128(y, bswap128(_mm_loadu_si128((const __m128i *)(const void *)last))), hp[0]);
     }
     return y;
 }
@@ -206,6 +228,69 @@ size_t ssl_chacha_xor4(const uint8_t key[32], uint32_t ctr, const uint8_t nonce[
     return done;
 }
 
+/* ChaCha20 with AVX2: eight blocks at a time (one state word of eight consecutive blocks per vector); whole groups of 512 bytes, returns the bytes done */
+int ssl_accel_avx2(void) {
+    static int state;
+    if (state == 0) {
+        __builtin_cpu_init();
+        state = __builtin_cpu_supports("avx2") ? 1 : 2;
+    }
+    return state == 1;
+}
+
+#define ROTL8(v, c) _mm256_or_si256(_mm256_slli_epi32(v, c), _mm256_srli_epi32(v, 32 - (c)))
+#define QR8(a, b, c, d) \
+    a = _mm256_add_epi32(a, b); d = _mm256_xor_si256(d, a); d = _mm256_shuffle_epi8(d, rot16); \
+    c = _mm256_add_epi32(c, d); b = _mm256_xor_si256(b, c); b = ROTL8(b, 12); \
+    a = _mm256_add_epi32(a, b); d = _mm256_xor_si256(d, a); d = _mm256_shuffle_epi8(d, rot8); \
+    c = _mm256_add_epi32(c, d); b = _mm256_xor_si256(b, c); b = ROTL8(b, 7)
+
+__attribute__((target("avx2"))) static void transpose8(const __m256i r[8], __m256i out[8]) {
+    __m256i t0 = _mm256_unpacklo_epi32(r[0], r[1]), t1 = _mm256_unpackhi_epi32(r[0], r[1]);
+    __m256i t2 = _mm256_unpacklo_epi32(r[2], r[3]), t3 = _mm256_unpackhi_epi32(r[2], r[3]);
+    __m256i t4 = _mm256_unpacklo_epi32(r[4], r[5]), t5 = _mm256_unpackhi_epi32(r[4], r[5]);
+    __m256i t6 = _mm256_unpacklo_epi32(r[6], r[7]), t7 = _mm256_unpackhi_epi32(r[6], r[7]);
+    __m256i u0 = _mm256_unpacklo_epi64(t0, t2), u1 = _mm256_unpackhi_epi64(t0, t2), u2 = _mm256_unpacklo_epi64(t1, t3), u3 = _mm256_unpackhi_epi64(t1, t3);
+    __m256i u4 = _mm256_unpacklo_epi64(t4, t6), u5 = _mm256_unpackhi_epi64(t4, t6), u6 = _mm256_unpacklo_epi64(t5, t7), u7 = _mm256_unpackhi_epi64(t5, t7);
+    out[0] = _mm256_permute2x128_si256(u0, u4, 0x20); out[1] = _mm256_permute2x128_si256(u1, u5, 0x20);
+    out[2] = _mm256_permute2x128_si256(u2, u6, 0x20); out[3] = _mm256_permute2x128_si256(u3, u7, 0x20);
+    out[4] = _mm256_permute2x128_si256(u0, u4, 0x31); out[5] = _mm256_permute2x128_si256(u1, u5, 0x31);
+    out[6] = _mm256_permute2x128_si256(u2, u6, 0x31); out[7] = _mm256_permute2x128_si256(u3, u7, 0x31);
+}
+
+__attribute__((target("avx2"))) size_t ssl_chacha_xor8(const uint8_t key[32], uint32_t ctr, const uint8_t nonce[12], const uint8_t *in, size_t n, uint8_t *out) {
+    size_t done = 0;
+    uint32_t base[16] = {0x61707865, 0x3320646e, 0x79622d32, 0x6b206574};
+    for (int i = 0; i < 8; i++) base[4 + i] = ld32(key + 4 * i);
+    for (int i = 0; i < 3; i++) base[13 + i] = ld32(nonce + 4 * i);
+    const __m256i rot16 = _mm256_set_epi8(13, 12, 15, 14, 9, 8, 11, 10, 5, 4, 7, 6, 1, 0, 3, 2, 13, 12, 15, 14, 9, 8, 11, 10, 5, 4, 7, 6, 1, 0, 3, 2);
+    const __m256i rot8 = _mm256_set_epi8(14, 13, 12, 15, 10, 9, 8, 11, 6, 5, 4, 7, 2, 1, 0, 3, 14, 13, 12, 15, 10, 9, 8, 11, 6, 5, 4, 7, 2, 1, 0, 3);
+    while (n - done >= 512) {
+        __m256i o[16], x[16];
+        for (int i = 0; i < 16; i++) o[i] = _mm256_set1_epi32((int)base[i]);
+        o[12] = _mm256_add_epi32(_mm256_set1_epi32((int)ctr), _mm256_set_epi32(7, 6, 5, 4, 3, 2, 1, 0));
+        for (int i = 0; i < 16; i++) x[i] = o[i];
+        for (int r = 0; r < 10; r++) {
+            QR8(x[0], x[4], x[8], x[12]); QR8(x[1], x[5], x[9], x[13]); QR8(x[2], x[6], x[10], x[14]); QR8(x[3], x[7], x[11], x[15]);
+            QR8(x[0], x[5], x[10], x[15]); QR8(x[1], x[6], x[11], x[12]); QR8(x[2], x[7], x[8], x[13]); QR8(x[3], x[4], x[9], x[14]);
+        }
+        for (int i = 0; i < 16; i++) x[i] = _mm256_add_epi32(x[i], o[i]);
+        __m256i lo[8], hi[8];
+        transpose8(x, lo);
+        transpose8(x + 8, hi);
+        for (int blk = 0; blk < 8; blk++) {
+            size_t at = done + (size_t)blk * 64;
+            __m256i a = _mm256_xor_si256(lo[blk], _mm256_loadu_si256((const __m256i *)(const void *)(in + at)));
+            __m256i b = _mm256_xor_si256(hi[blk], _mm256_loadu_si256((const __m256i *)(const void *)(in + at + 32)));
+            _mm256_storeu_si256((__m256i *)(void *)(out + at), a);
+            _mm256_storeu_si256((__m256i *)(void *)(out + at + 32), b);
+        }
+        ctr += 8;
+        done += 512;
+    }
+    return done;
+}
+
 /* SHA-256 with the SHA extensions (SHA-NI): `blocks` 64-byte blocks into the state */
 int ssl_accel_sha256(void) {
     static int state;
@@ -266,15 +351,19 @@ TARGET int ssl_accel_gcm(int seal, const uint8_t *key, size_t kl, const uint8_t 
     memcpy(jb, nonce, 12);
     jb[15] = 1;
     __m128i base = _mm_loadu_si128((const __m128i *)(const void *)jb);
-    __m128i h = bswap128(aes_block(&k, _mm_setzero_si128()));
+    __m128i hp[4];
+    hp[0] = bswap128(aes_block(&k, _mm_setzero_si128()));
+    hp[1] = gfmul(hp[0], hp[0]);
+    hp[2] = gfmul(hp[1], hp[0]);
+    hp[3] = gfmul(hp[1], hp[1]);
     const uint8_t *ct = seal ? out : in;
     if (seal) ctr_xor(&k, base, in, cl, out);
-    __m128i y = ghash_run(_mm_setzero_si128(), h, aad, al);
-    y = ghash_run(y, h, ct, cl);
+    __m128i y = ghash_run(_mm_setzero_si128(), hp, aad, al);
+    y = ghash_run(y, hp, ct, cl);
     uint8_t lens[16];
     uint64_t ab = (uint64_t)al * 8, cb = (uint64_t)cl * 8;
     for (int i = 0; i < 8; i++) { lens[i] = (uint8_t)(ab >> (56 - 8 * i)); lens[8 + i] = (uint8_t)(cb >> (56 - 8 * i)); }
-    y = ghash_run(y, h, lens, 16);
+    y = ghash_run(y, hp, lens, 16);
     __m128i tag = _mm_xor_si128(bswap128(y), aes_block(&k, base));
     uint8_t tb[16];
     _mm_storeu_si128((__m128i *)(void *)tb, tag);
@@ -291,6 +380,11 @@ TARGET int ssl_accel_gcm(int seal, const uint8_t *key, size_t kl, const uint8_t 
 
 #else
 int ssl_accel_aesgcm(void) { return 0; }
+int ssl_accel_avx2(void) { return 0; }
+size_t ssl_chacha_xor8(const uint8_t key[32], uint32_t ctr, const uint8_t nonce[12], const uint8_t *in, size_t n, uint8_t *out) {
+    (void)key; (void)ctr; (void)nonce; (void)in; (void)n; (void)out;
+    return 0;
+}
 int ssl_accel_sha256(void) { return 0; }
 void ssl_accel_sha256_blocks(uint32_t st[8], const uint8_t *data, size_t blocks) { (void)st; (void)data; (void)blocks; }
 size_t ssl_chacha_xor4(const uint8_t key[32], uint32_t ctr, const uint8_t nonce[12], const uint8_t *in, size_t n, uint8_t *out) {

@@ -35,3 +35,21 @@ Outside the tree: build `c/*.c` with `make` here (needs `-I<Sprint>/src`), regis
 - No TLS 1.2, no session resumption, no 0-RTT, no client certificates (an empty one is sent when asked), no HelloRetryRequest (only X25519 is offered), no revocation checking (OCSP / CRL), no name constraints, no P-521 or SHA-1 certificates.
 - The random generator mixes `getrandom` (Linux) or RDRAND / the time-stamp counter (SprintOS) with seeds from the caller. Under QEMU's default CPU there is no RDRAND, so the output is only as good as `sslcore.seed()` input: fine for tests, not for production.
 - The root store is whatever you pass in; SprintOS does not ship one yet.
+
+## Speed
+
+Measured on one core of an x86-64 machine with AES-NI, PCLMULQDQ, SHA extensions and AVX2 (`gcc -O2`), next to BearSSL 0.6 built from source on the same machine
+(its portable big-endian/ct64/i31 code, which is what it uses without assembly):
+
+| | SprintSSL | BearSSL |
+|---|---|---|
+| AES-128-GCM seal | ~3200 MB/s (AES-NI + PCLMULQDQ, 4-block aggregated GHASH) | ~190 MB/s (CTR 319 + GHASH 463) |
+| ChaCha20-Poly1305 seal | ~1080 MB/s (AVX2 8-way ChaCha20, 44-bit-limb Poly1305) | ~450 MB/s (ChaCha20 600, Poly1305 1977) |
+| SHA-256 | ~1900 MB/s (SHA extensions) | 320 MB/s |
+| SHA-512 | ~440 MB/s | 512 MB/s |
+| P-256 ECDH (point multiplication) | ~3400 /s | ~1850 /s (i15) |
+| ECDSA P-256 verify | ~840 /s | ~620 /s (i15) |
+| RSA-2048 public operation | ~2400 /s | ~4300 /s (i31) |
+
+The hardware paths are chosen at run time (CPUID); on a CPU without the instructions the portable C code is used. `sprintssl/tests/accel_test.sh` compares both on
+7000 random inputs. Poly1305 and the AES-GCM counter mode are the next targets, and the big-number code (32-bit limbs) for RSA.

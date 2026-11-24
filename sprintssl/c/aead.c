@@ -190,8 +190,13 @@ static void chacha_xor(const uint8_t key[32], uint32_t ctr, const uint8_t nonce[
     uint8_t b[64];
     size_t off = 0;
 #ifndef SSL_NO_ACCEL
-    off = ssl_chacha_xor4(key, ctr, nonce, in, n, out);
-    ctr += (uint32_t)(off / 64);
+    if (ssl_accel_avx2()) {
+        off = ssl_chacha_xor8(key, ctr, nonce, in, n, out);
+        ctr += (uint32_t)(off / 64);
+    }
+    size_t o4 = ssl_chacha_xor4(key, ctr, nonce, in + off, n - off, out + off);
+    off += o4;
+    ctr += (uint32_t)(o4 / 64);
 #endif
     for (; off < n; off += 64, ctr++) {
         chacha_block(key, ctr, nonce, b);
@@ -200,62 +205,74 @@ static void chacha_xor(const uint8_t key[32], uint32_t ctr, const uint8_t nonce[
     }
 }
 
-/* ---- Poly1305 (26-bit limbs) ---- */
-static void poly1305(const uint8_t key[32], const uint8_t *aad, size_t al, const uint8_t *ct, size_t cl, uint8_t tag[16]) {
-    uint32_t r0 = ld32le(key) & 0x3ffffff, r1 = (ld32le(key + 3) >> 2) & 0x3ffff03, r2 = (ld32le(key + 6) >> 4) & 0x3ffc0ff;
-    uint32_t r3 = (ld32le(key + 9) >> 6) & 0x3f03fff, r4 = (ld32le(key + 12) >> 8) & 0x00fffff;
-    uint32_t s1 = r1 * 5, s2 = r2 * 5, s3 = r3 * 5, s4 = r4 * 5;
-    uint32_t h0 = 0, h1 = 0, h2 = 0, h3 = 0, h4 = 0;
-    for (int part = 0; part < 3; part++) {
-        const uint8_t *p = part == 0 ? aad : ct;
-        size_t n = part == 0 ? al : cl;
-        uint8_t lenblk[16];
-        if (part == 2) {
-            uint64_t a = al, c = cl;
-            for (int i = 0; i < 8; i++) { lenblk[i] = (uint8_t)(a >> (8 * i)); lenblk[8 + i] = (uint8_t)(c >> (8 * i)); }
-            p = lenblk; n = 16;
-        }
-        while (n > 0) {
-            uint8_t blk[17] = {0};
-            size_t k = n < 16 ? n : 16;
-            memcpy(blk, p, k);
-            blk[16] = 1;                  /* the AEAD construction zero-pads both parts to 16 bytes, so every block is a full one */
-            h0 += ld32le(blk) & 0x3ffffff;
-            h1 += (ld32le(blk + 3) >> 2) & 0x3ffffff;
-            h2 += (ld32le(blk + 6) >> 4) & 0x3ffffff;
-            h3 += (ld32le(blk + 9) >> 6) & 0x3ffffff;
-            h4 += (ld32le(blk + 12) >> 8) | ((uint32_t)blk[16] << 24);
-            uint64_t d0 = (uint64_t)h0 * r0 + (uint64_t)h1 * s4 + (uint64_t)h2 * s3 + (uint64_t)h3 * s2 + (uint64_t)h4 * s1;
-            uint64_t d1 = (uint64_t)h0 * r1 + (uint64_t)h1 * r0 + (uint64_t)h2 * s4 + (uint64_t)h3 * s3 + (uint64_t)h4 * s2;
-            uint64_t d2 = (uint64_t)h0 * r2 + (uint64_t)h1 * r1 + (uint64_t)h2 * r0 + (uint64_t)h3 * s4 + (uint64_t)h4 * s3;
-            uint64_t d3 = (uint64_t)h0 * r3 + (uint64_t)h1 * r2 + (uint64_t)h2 * r1 + (uint64_t)h3 * r0 + (uint64_t)h4 * s4;
-            uint64_t d4 = (uint64_t)h0 * r4 + (uint64_t)h1 * r3 + (uint64_t)h2 * r2 + (uint64_t)h3 * r1 + (uint64_t)h4 * r0;
-            uint32_t c = (uint32_t)(d0 >> 26); h0 = (uint32_t)d0 & 0x3ffffff;
-            d1 += c; c = (uint32_t)(d1 >> 26); h1 = (uint32_t)d1 & 0x3ffffff;
-            d2 += c; c = (uint32_t)(d2 >> 26); h2 = (uint32_t)d2 & 0x3ffffff;
-            d3 += c; c = (uint32_t)(d3 >> 26); h3 = (uint32_t)d3 & 0x3ffffff;
-            d4 += c; c = (uint32_t)(d4 >> 26); h4 = (uint32_t)d4 & 0x3ffffff;
-            h0 += c * 5; c = h0 >> 26; h0 &= 0x3ffffff; h1 += c;
-            p += k; n -= k;
-        }
+/* ---- Poly1305 (44-bit limbs, 64x64 -> 128 bit products) ---- */
+__extension__ typedef unsigned __int128 poly_u128;
+static uint64_t ld64le(const uint8_t *p) { return (uint64_t)ld32le(p) | ((uint64_t)ld32le(p + 4) << 32); }
+#define M44 0xfffffffffffULL
+#define M42 0x3ffffffffffULL
+
+typedef struct { uint64_t r0, r1, r2, s1, s2, h0, h1, h2; } poly_state;
+
+/* n whole 16-byte blocks (each with the 2^128 bit set) */
+static void poly_blocks(poly_state *st, const uint8_t *p, size_t n) {
+    uint64_t r0 = st->r0, r1 = st->r1, r2 = st->r2, s1 = st->s1, s2 = st->s2, h0 = st->h0, h1 = st->h1, h2 = st->h2;
+    for (; n > 0; n--, p += 16) {
+        uint64_t t0 = ld64le(p), t1 = ld64le(p + 8);
+        h0 += t0 & M44;
+        h1 += ((t0 >> 44) | (t1 << 20)) & M44;
+        h2 += ((t1 >> 24) & M42) | (1ULL << 40);
+        poly_u128 d0 = (poly_u128)h0 * r0 + (poly_u128)h1 * s2 + (poly_u128)h2 * s1;
+        poly_u128 d1 = (poly_u128)h0 * r1 + (poly_u128)h1 * r0 + (poly_u128)h2 * s2;
+        poly_u128 d2 = (poly_u128)h0 * r2 + (poly_u128)h1 * r1 + (poly_u128)h2 * r0;
+        uint64_t c = (uint64_t)(d0 >> 44); h0 = (uint64_t)d0 & M44;
+        d1 += c; c = (uint64_t)(d1 >> 44); h1 = (uint64_t)d1 & M44;
+        d2 += c; c = (uint64_t)(d2 >> 42); h2 = (uint64_t)d2 & M42;
+        h0 += c * 5; c = h0 >> 44; h0 &= M44; h1 += c;
     }
-    uint32_t c = h1 >> 26; h1 &= 0x3ffffff; h2 += c; c = h2 >> 26; h2 &= 0x3ffffff; h3 += c; c = h3 >> 26; h3 &= 0x3ffffff;
-    h4 += c; c = h4 >> 26; h4 &= 0x3ffffff; h0 += c * 5; c = h0 >> 26; h0 &= 0x3ffffff; h1 += c;
-    uint32_t g0 = h0 + 5, g1, g2, g3, g4;
-    c = g0 >> 26; g0 &= 0x3ffffff;
-    g1 = h1 + c; c = g1 >> 26; g1 &= 0x3ffffff;
-    g2 = h2 + c; c = g2 >> 26; g2 &= 0x3ffffff;
-    g3 = h3 + c; c = g3 >> 26; g3 &= 0x3ffffff;
-    g4 = h4 + c - (1u << 26);
-    uint32_t mask = (g4 >> 31) - 1;     /* all ones when h >= p */
-    g0 &= mask; g1 &= mask; g2 &= mask; g3 &= mask; g4 &= mask;
+    st->h0 = h0; st->h1 = h1; st->h2 = h2;
+}
+
+/* a run of bytes, the last partial block zero padded (the AEAD construction pads each part to 16 bytes) */
+static void poly_padded(poly_state *st, const uint8_t *p, size_t n) {
+    poly_blocks(st, p, n / 16);
+    p += (n / 16) * 16;
+    n %= 16;
+    if (n) {
+        uint8_t last[16] = {0};
+        memcpy(last, p, n);
+        poly_blocks(st, last, 1);
+    }
+}
+
+static void poly1305(const uint8_t key[32], const uint8_t *aad, size_t al, const uint8_t *ct, size_t cl, uint8_t tag[16]) {
+    poly_state st = {0};
+    uint64_t t0 = ld64le(key), t1 = ld64le(key + 8);
+    st.r0 = t0 & 0xffc0fffffffULL;
+    st.r1 = ((t0 >> 44) | (t1 << 20)) & 0xfffffc0ffffULL;
+    st.r2 = (t1 >> 24) & 0x00ffffffc0fULL;
+    st.s1 = st.r1 * 20;
+    st.s2 = st.r2 * 20;
+    poly_padded(&st, aad, al);
+    poly_padded(&st, ct, cl);
+    uint8_t lenblk[16];
+    uint64_t a = al, c = cl;
+    for (int i = 0; i < 8; i++) { lenblk[i] = (uint8_t)(a >> (8 * i)); lenblk[8 + i] = (uint8_t)(c >> (8 * i)); }
+    poly_blocks(&st, lenblk, 1);
+    uint64_t h0 = st.h0, h1 = st.h1, h2 = st.h2, g0, g1, g2, cc;
+    cc = h1 >> 44; h1 &= M44; h2 += cc; cc = h2 >> 42; h2 &= M42; h0 += cc * 5; cc = h0 >> 44; h0 &= M44; h1 += cc;
+    cc = h1 >> 44; h1 &= M44; h2 += cc; cc = h2 >> 42; h2 &= M42; h0 += cc * 5; cc = h0 >> 44; h0 &= M44; h1 += cc;
+    g0 = h0 + 5; cc = g0 >> 44; g0 &= M44;
+    g1 = h1 + cc; cc = g1 >> 44; g1 &= M44;
+    g2 = h2 + cc - (1ULL << 42);
+    uint64_t mask = (g2 >> 63) - 1;     /* all ones when h >= 2^130 - 5 */
+    g0 &= mask; g1 &= mask; g2 &= mask;
     mask = ~mask;
-    h0 = (h0 & mask) | g0; h1 = (h1 & mask) | g1; h2 = (h2 & mask) | g2; h3 = (h3 & mask) | g3; h4 = (h4 & mask) | g4;
-    uint64_t f0 = (uint64_t)(h0 | (h1 << 26)) + ld32le(key + 16);
-    uint64_t f1 = (uint64_t)((h1 >> 6) | (h2 << 20)) + ld32le(key + 20) + (f0 >> 32);
-    uint64_t f2 = (uint64_t)((h2 >> 12) | (h3 << 14)) + ld32le(key + 24) + (f1 >> 32);
-    uint64_t f3 = (uint64_t)((h3 >> 18) | (h4 << 8)) + ld32le(key + 28) + (f2 >> 32);
-    st32le(tag, (uint32_t)f0); st32le(tag + 4, (uint32_t)f1); st32le(tag + 8, (uint32_t)f2); st32le(tag + 12, (uint32_t)f3);
+    h0 = (h0 & mask) | g0; h1 = (h1 & mask) | g1; h2 = (h2 & mask) | g2;
+    uint64_t f0 = h0 | (h1 << 44), f1 = (h1 >> 20) | (h2 << 24);
+    uint64_t k0 = ld64le(key + 16), k1 = ld64le(key + 24);
+    f0 += k0;
+    f1 += k1 + (f0 < k0);
+    for (int i = 0; i < 8; i++) { tag[i] = (uint8_t)(f0 >> (8 * i)); tag[8 + i] = (uint8_t)(f1 >> (8 * i)); }
 }
 
 static void poly_padded_tag(const uint8_t key[32], const uint8_t nonce[12], const uint8_t *aad, size_t al, const uint8_t *ct, size_t n, uint8_t tag[16]) {
