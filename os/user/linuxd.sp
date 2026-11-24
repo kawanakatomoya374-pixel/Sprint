@@ -4010,6 +4010,41 @@ func shm_exit(pid):
     return 0
 
 
+# ================= more of the system call table, as C-OS has it =================
+let memfd_n = 0
+
+# memfd_create: an anonymous file, kept on the volume under /tmp/.memfd and unlinked when the program ends with it
+func sys_memfd_create(g, a):
+    memfd_n += 1
+    let path = "/tmp/.memfd-" .. to_string(g.pid) .. "-" .. to_string(memfd_n)
+    try:
+        fs.mkdir("/tmp")
+    catch e:
+        pass
+    return do_open(g, path, 0o102 | 0o2, 0o600)
+
+# inotify: the descriptor exists and can be polled, but nothing ever changes under it (Firefox only wants it not to fail)
+let inotify_wd = 0
+func sys_inotify_init(g, a):
+    return g.alloc_fd({kind: "eventfd", count: 0, sem: false})
+func sys_inotify_add_watch(g, a):
+    inotify_wd += 1
+    return inotify_wd
+
+func sys_sched_prio(g, a):
+    return 99 if a[0] == 1 or a[0] == 2 else 0
+func sys_sched_prio_min(g, a):
+    return 1 if a[0] == 1 or a[0] == 2 else 0
+
+func sys_eopnotsupp(g, a):
+    return -95
+func sys_enodata(g, a):
+    return -61
+func sys_eperm(g, a):
+    return -1
+func sys_rseq(g, a):
+    return -38
+
 func setup():
     table[0] = sys_read
     table[1] = sys_write
@@ -4020,6 +4055,24 @@ func setup():
     table[6] = sys_lstat
     table[8] = sys_lseek
     table[9] = sys_mmap
+    for nr in [116, 117, 119, 122, 123, 125, 126, 135, 140, 141, 142, 143, 144, 145, 149, 150, 151, 152, 251, 252, 272, 306, 308, 314, 325]:
+        table[nr] = sys_zero      # setgroups, setres[ug]id, setfs[ug]id, capget/capset, personality, [gs]etpriority, sched_*, mlock*, ioprio_*, unshare, syncfs, setns, sched_setattr, mlock2
+    table[146] = sys_sched_prio
+    table[147] = sys_sched_prio_min
+    table[148] = sys_zero
+    for nr in [188, 189, 190]:
+        table[nr] = sys_eopnotsupp    # setxattr: not supported
+    for nr in [191, 192, 193, 197, 198, 199]:
+        table[nr] = sys_enodata       # getxattr, removexattr: no attributes
+    for nr in [194, 195, 196]:
+        table[nr] = sys_zero          # listxattr: an empty list
+    table[253] = sys_inotify_init
+    table[294] = sys_inotify_init
+    table[254] = sys_inotify_add_watch
+    table[255] = sys_zero
+    table[319] = sys_memfd_create
+    table[334] = sys_rseq
+    table[161] = sys_eperm
     table[29] = sys_shmget
     table[30] = sys_shmat
     table[31] = sys_shmctl
