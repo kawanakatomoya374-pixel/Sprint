@@ -99,6 +99,12 @@ func seq_lt(a, b):
 func seq_le(a, b):
     return a == b or seq_lt(a, b)
 
+func keys_of(t):
+    let out = []
+    for k in t:
+        out.append(k)
+    return out
+
 func same(a, b):
     if len(a) != len(b):
         return false
@@ -164,6 +170,9 @@ export class Stack:
     let gw = 0
     let dns = 0
     let dns_port = 53
+    let async_mode = false       # never wait inside a call: packets for an address that is not resolved yet are queued until the ARP answer comes
+    let arp_wait = nil
+    let arp_asked = nil
     let lease = 0
     let arp = nil
     let udp = nil
@@ -184,6 +193,8 @@ export class Stack:
         self.clock = clock
         self.mac = mac
         self.arp = {}
+        self.arp_wait = {}
+        self.arp_asked = {}
         self.udp = {}
         self.conns = {}
         self.listeners = {}
@@ -262,6 +273,7 @@ export class Stack:
         let tip = u32(f, 38)
         if sip != 0:
             self.arp[sip] = [smac, self.clock() + 60000]
+            self.arp_flush(sip)
         if op == 1 and tip == self.ip and self.ip != 0:
             self.send_eth(smac, ETH_ARP, self.arp_packet(2, smac, sip))
 
@@ -271,16 +283,44 @@ export class Stack:
         let hostmask = (~self.mask) & MASK32
         return self.mask != 0 and (dst & hostmask) == hostmask and (dst & self.mask) == (self.ip & self.mask)
 
+    func hop_for(self, dst):
+        if (dst & self.mask) != (self.ip & self.mask):
+            return self.gw
+        return dst
+
+    # packets that waited for an ARP answer are sent now
+    func arp_flush(self, hop):
+        let q = self.arp_wait[hop]
+        if q == nil:
+            return nil
+        self.arp_wait[hop] = nil
+        self.arp_asked[hop] = nil
+        for p in q:
+            self.ip_send(p[0], p[1], p[2], p[3])
+
+    # (async mode) ask again, or give up on, the addresses that have not answered
+    func arp_timers(self):
+        let now = self.clock()
+        for hop in keys_of(self.arp_wait):
+            let st = self.arp_asked[hop]
+            if st != nil and now - st[0] >= 300:
+                if st[1] >= 4:
+                    self.arp_wait[hop] = nil
+                    self.arp_asked[hop] = nil
+                else:
+                    self.arp_asked[hop] = [now, st[1] + 1]
+                    self.send_eth(BCAST_MAC, ETH_ARP, self.arp_packet(1, [0, 0, 0, 0, 0, 0], hop))
+
     # the Ethernet address for an IP destination (asking with ARP when it is not known); nil if nobody answers
     func mac_for(self, dst):
         if self.is_bcast(dst):
             return BCAST_MAC
-        let hop = dst
-        if (dst & self.mask) != (self.ip & self.mask):
-            hop = self.gw
+        let hop = self.hop_for(dst)
         let e = self.arp[hop]
         if e != nil and e[1] > self.clock():
             return e[0]
+        if self.async_mode:
+            return nil
         for attempt in range(4):
             self.send_eth(BCAST_MAC, ETH_ARP, self.arp_packet(1, [0, 0, 0, 0, 0, 0], hop))
             let ok = self.run_until(() => self.arp[hop] != nil and self.arp[hop][1] > self.clock(), 300)
@@ -297,6 +337,16 @@ export class Stack:
         else:
             dmac = self.mac_for(dst)
         if dmac == nil:
+            if self.async_mode:
+                let hop = self.hop_for(dst)
+                if self.arp_wait[hop] == nil:
+                    self.arp_wait[hop] = []
+                if len(self.arp_wait[hop]) < 32:
+                    self.arp_wait[hop].append([proto, dst, payload, src])
+                if self.arp_asked[hop] == nil:
+                    self.arp_asked[hop] = [self.clock(), 1]
+                    self.send_eth(BCAST_MAC, ETH_ARP, self.arp_packet(1, [0, 0, 0, 0, 0, 0], hop))
+                return true
             return false
         let h = [0x45, 0]
         p16(h, 20 + len(payload))
@@ -733,6 +783,60 @@ export class Stack:
             return nil
         return c
 
+    # ---- the same without waiting (for a server that must keep serving other things): start a connection, move data into and out of the buffers ----
+    func tcp_connect_start(self, dst, port):
+        let c = Conn()
+        c.lport = self.alloc_port()
+        c.rip = dst
+        c.rport = port
+        c.iss = self.new_isn()
+        c.snd_una = c.iss
+        c.snd_nxt = (c.iss + 1) & MASK32
+        c.state = "SYN_SENT"
+        self.conns[self.conn_key(c.lport, dst, port)] = c
+        self.tcp_xmit(c, c.iss, F_SYN, [])
+        c.rto_at = self.clock() + c.rto
+        return c
+
+    # queue as much of data as the send buffer takes; returns how many bytes (0 when the buffer is full), -1 when the connection cannot send
+    func tcp_send_nb(self, c, data):
+        if c.state != "ESTABLISHED" and c.state != "CLOSE_WAIT":
+            return -1
+        let n = SEND_LIMIT - len(c.sbuf)
+        if n > len(data):
+            n = len(data)
+        if n <= 0:
+            return 0
+        c.sbuf.extend(data.slice(0, n) if n < len(data) else data)
+        self.tcp_output(c)
+        return n
+
+    func tcp_space(self, c):
+        return SEND_LIMIT - len(c.sbuf)
+
+    # bytes (up to max); [] at the end of the stream; nil when nothing is there; throws on a reset
+    func tcp_recv_nb(self, c, max):
+        if len(c.rbuf) > 0:
+            let n = max if max < len(c.rbuf) else len(c.rbuf)
+            let out = c.rbuf.slice(0, n)
+            c.rbuf = c.rbuf.slice(n)
+            if len(c.rbuf) + n >= RECV_LIMIT - 2 * MSS_DEFAULT:
+                self.tcp_ack(c)
+            return out
+        if c.err != nil:
+            fail("ECONNRESET", c.err)
+        if c.fin_rcvd or c.state == "CLOSED":
+            return []
+        return nil
+
+    func tcp_close_nb(self, c):
+        if c.state == "CLOSED" or c.state == "SYN_SENT" or c.state == "SYN_RCVD":
+            c.state = "CLOSED"
+            self.conns[self.conn_key(c.lport, c.rip, c.rport)] = nil
+            return nil
+        c.fin_pending = true
+        self.tcp_output(c)
+
     func tcp_listen(self, port):
         let l = Listener(port)
         self.listeners[port] = l
@@ -991,6 +1095,8 @@ export class Stack:
     # ---- timers: retransmission and the end of TIME_WAIT ----
     func timers(self):
         let now = self.clock()
+        if self.async_mode and len(self.arp_wait) > 0:
+            self.arp_timers()
         let dead = []
         for k in self.conns:
             let c = self.conns[k]

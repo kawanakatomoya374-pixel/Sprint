@@ -2,7 +2,7 @@
 """Linux programs on SprintOS. Static-pie programs built with musl-gcc are put on a SprintFS disk; init=lxtest starts the file system server and linuxd (the Linux personality
 server, Sprint). The kernel forwards each program's `syscall` instruction to linuxd as a message; linuxd answers it (ELF loading, memory, files, time, ...) with the lx
 mechanisms (map / copy / start / reply). The host checks what the programs printed and what they left on the disk."""
-import os, shutil, subprocess, sys, tempfile
+import os, shutil, socket, subprocess, sys, tempfile, threading, time
 IMG = sys.argv[1]
 SP = os.environ.get("SPRINT", "build/sprint")
 OUT = os.path.join(os.path.dirname(IMG), "shots")
@@ -18,7 +18,7 @@ glibc_ok = glibc_ok and subprocess.run(["gcc", "-O2", "-pie", "-fPIE", "-o", os.
 glibc_ok = glibc_ok and subprocess.run(["gcc", "-O2", "-pie", "-fPIE", "-o", os.path.join(tmp, "signals_glibc"), os.path.join(src, "signals.c")], capture_output=True).returncode == 0
 glibc_ok = glibc_ok and subprocess.run(["gcc", "-O2", "-pie", "-fPIE", "-pthread", "-o", os.path.join(tmp, "threads_glibc"), os.path.join(src, "threads.c")], capture_output=True).returncode == 0
 check(glibc_ok, "gcc builds glibc dynamic PIE programs")
-for name, flags in (("hello", ["-static-pie"]), ("files", ["-static-pie"]), ("proc", ["-static-pie"]), ("threads", ["-static-pie", "-pthread"]), ("socks", ["-static-pie"]), ("signals", ["-static-pie"]), ("procfs", ["-static-pie", "-pthread"]), ("hello_dyn", ["-pie", "-fPIE"])):
+for name, flags in (("hello", ["-static-pie"]), ("files", ["-static-pie"]), ("proc", ["-static-pie"]), ("threads", ["-static-pie", "-pthread"]), ("socks", ["-static-pie"]), ("signals", ["-static-pie"]), ("procfs", ["-static-pie", "-pthread"]), ("nettest", ["-static-pie"]), ("hello_dyn", ["-pie", "-fPIE"])):
     r = subprocess.run(["musl-gcc"] + flags + ["-O2", "-o", os.path.join(tmp, name), os.path.join(src, name.replace("_dyn", "") + ".c")], capture_output=True, text=True)
     check(r.returncode == 0, "musl-gcc builds %s (%s)" % (name, " ".join(flags)))
 fsimg = os.path.join(tmp, "fs.img")
@@ -64,16 +64,65 @@ echo "done" | tr a-z A-Z
 exit 5
 """)
 tool("put", os.path.join(tmp, "script.sh"), "/lx/script.sh")
-tool("put", os.path.join(tmp, "procfs"), "/bin/procfs"); tool("put", os.path.join(tmp, "signals"), "/bin/signals"); tool("put", os.path.join(tmp, "socks"), "/bin/socks"); tool("mkdir", "/tmp"); tool("put", os.path.join(tmp, "threads"), "/bin/threads"); tool("put", os.path.join(tmp, "proc"), "/bin/proc"); tool("put", os.path.join(tmp, "hello_dyn"), "/bin/hello_dyn")
+tool("put", os.path.join(tmp, "procfs"), "/bin/procfs"); tool("put", os.path.join(tmp, "nettest"), "/bin/nettest"); tool("mkdir", "/etc"); open(os.path.join(tmp, "resolv.conf"), "w").write("nameserver 10.0.2.2\n"); tool("put", os.path.join(tmp, "resolv.conf"), "/etc/resolv.conf"); tool("put", os.path.join(tmp, "signals"), "/bin/signals"); tool("put", os.path.join(tmp, "socks"), "/bin/socks"); tool("mkdir", "/tmp"); tool("put", os.path.join(tmp, "threads"), "/bin/threads"); tool("put", os.path.join(tmp, "proc"), "/bin/proc"); tool("put", os.path.join(tmp, "hello_dyn"), "/bin/hello_dyn")
 tool("put", os.path.join(tmp, "hello"), "/bin/hello"); tool("put", os.path.join(tmp, "files"), "/bin/files"); tool("put", os.path.join(tmp, "input.txt"), "/lx/input.txt")
 ser = os.path.join(OUT, "linux.log")
 if os.path.exists(ser): os.remove(ser)
-try:
-    subprocess.run(["qemu-system-x86_64", "-m", "256", "-smp", "2", "-drive", "format=raw,file=" + IMG + ",if=ide,index=0", "-drive", "format=raw,file=" + fsimg + ",if=ide,index=1",
-                    "-display", "none", "-no-reboot", "-serial", "file:" + ser, "-device", "isa-debug-exit,iobase=0xf4,iosize=4"],
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=240)
-except subprocess.TimeoutExpired:
-    pass
+# the host side of the network tests: an HTTP server (18090), a UDP echo (18091), a DNS server on port 53 (QEMU's 10.0.2.2 is the host)
+BIGDATA = bytes((i * 13 + (i >> 8)) & 255 for i in range(300000))
+def serve_http():
+    ls = socket.socket(); ls.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); ls.bind(("127.0.0.1", 18090)); ls.listen(8)
+    def h(c):
+        try:
+            req = c.recv(4096)
+            body = BIGDATA if b"/big" in req else b"hello from the host"
+            c.sendall(b"HTTP/1.0 200 OK\r\nContent-Length: %d\r\n\r\n" % len(body) + body)
+        finally: c.close()
+    while True:
+        try: c, _ = ls.accept()
+        except OSError: return
+        threading.Thread(target=h, args=(c,), daemon=True).start()
+def serve_udp():
+    u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); u.bind(("127.0.0.1", 18091))
+    while True:
+        d, a = u.recvfrom(2048); u.sendto(d.upper(), a)
+def serve_dns():
+    try:
+        d = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); d.bind(("127.0.0.1", 53))
+    except OSError: return
+    while True:
+        q, a = d.recvfrom(512)
+        o = 12
+        while q[o]: o += q[o] + 1
+        o += 5
+        r = bytearray(q[:o]); r[2] = 0x81; r[3] = 0x80; r[7] = 1
+        r += bytes([0xC0, 12, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 192, 0, 2, 7])
+        d.sendto(bytes(r), a)
+for fn in (serve_http, serve_udp, serve_dns): threading.Thread(target=fn, daemon=True).start()
+q = subprocess.Popen(["qemu-system-x86_64", "-m", "256", "-smp", "2", "-drive", "format=raw,file=" + IMG + ",if=ide,index=0", "-drive", "format=raw,file=" + fsimg + ",if=ide,index=1",
+                      "-netdev", "user,id=n0,hostfwd=tcp:127.0.0.1:17001-:7001", "-device", "e1000,netdev=n0",
+                      "-display", "none", "-no-reboot", "-serial", "file:" + ser], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+fwd_reply = b""
+connected = False
+deadline = time.time() + 420
+while time.time() < deadline and q.poll() is None:
+    cur = open(ser, errors="replace").read() if os.path.exists(ser) else ""
+    if "nettest: listening 7001" in cur and not connected:
+        connected = True
+        try:
+            c = socket.create_connection(("127.0.0.1", 17001), timeout=15)
+            c.sendall(b"hello through the forward"); c.shutdown(socket.SHUT_WR); c.settimeout(20)
+            while True:
+                d = c.recv(4096)
+                if not d: break
+                fwd_reply += d
+            c.close()
+        except OSError as e:
+            print("host side of the server test:", e)
+    if "lxtest: done" in cur: break
+    time.sleep(0.5)
+try: q.wait(timeout=5)
+except subprocess.TimeoutExpired: q.kill()
 L = open(ser, errors="replace").read()
 check("lxtest: linuxd is pid" in L, "the Linux personality server starts")
 check("hello from a Linux program on SprintOS" in L, "a static-pie musl program runs and prints through write()")
@@ -127,6 +176,13 @@ check("maps:" in L and "stack=1 exe=1" in L, "/proc/self/maps lists the program 
 check("exe: /bin/procfs" in L and "fd link: /lx/input.txt" in L and "stat /proc/self: dir=1" in L and "stat /proc/nothing: -1" in L, "readlink of /proc/self/exe and /proc/self/fd/N, stat of /proc paths")
 check("fd entries: 4" in L or "fd entries: 5" in L, "/proc/self/fd can be listed")
 check("pthread_getattr_np: 0 size>0=1" in L, "glibc/musl pthread_getattr_np works (it reads /proc/self/maps)")
+check("nettest: connect=0" in L and "nettest: http: [HTTP/1.0 200 OK]" in L, "TCP client to a server on the host: connect, write, read until EOF")
+check("nettest: big=300043" in L, "a 300000-byte download over TCP through netd, E1000 and QEMU's network")
+check("nettest: nb connect=-1 einprogress=1" in L and "so_error=0" in L and "nb poll=1 out=1" in L, "nonblocking connect: EINPROGRESS, poll for writability, SO_ERROR")
+check("nettest: closed port: ECONNREFUSED" in L, "connecting to a closed port gives ECONNREFUSED")
+check("nettest: udp: UDP FROM SPRINTOS from 10.0.2.2:18091" in L, "UDP datagram to the host and the answer back (recvfrom with the source address)")
+check("nettest: getaddrinfo: 192.0.2.7" in L, "getaddrinfo (the C library's resolver) asks the DNS server named in /etc/resolv.conf")
+check("nettest: bind=0" in L and "nettest: accepted=1" in L and fwd_reply == b"HELLO THROUGH THE FORWARD", "a TCP server: the host connects through QEMU's port forward and gets the data back")
 check("lxtest: /bin/nothere: cannot read" in L, "a missing program is reported")
 check("lxtest: done" in L, "the test finished")
 # the host looks at the disk

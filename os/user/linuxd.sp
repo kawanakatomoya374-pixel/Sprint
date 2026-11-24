@@ -7,10 +7,13 @@
 # "err<TAB>why", and later "exit<TAB>pid<TAB>status" when the program ended. The server registers as "linux".
 import io
 import ipc
+import uio
 import lx
 import psys
 import fsclient
 import sslcore
+import netstack
+import typed
 
 const USER_BASE = 0x8000000000
 const STACK_TOP = USER_BASE + 0x40000000
@@ -38,6 +41,16 @@ const ESPIPE = 29
 const ERANGE = 34
 const ENOSYS = 38
 const ENOTEMPTY = 39
+const AF_UNIX = 1
+const AF_INET = 2
+const AF_INET6 = 10
+const ECONNREFUSED = 111
+const EADDRINUSE = 98
+const EISCONN = 106
+const ENOTCONN = 107
+const EAFNOSUPPORT = 97
+const EPIPE = 32
+const ENETUNREACH = 101
 
 let fs = nil
 let guests = {}           # pid of the first thread -> Guest (a process)
@@ -691,7 +704,7 @@ func sys_lseek(g, a):
 
 func do_open(g, path, flags, mode):
     let p = abspath(g, path)
-    if verbose == "paths":
+    if verbose == "paths" or verbose == "trace":
         log("open " .. p .. " by " .. to_string(g.pid))
     if p == "/dev/null":
         return g.alloc_fd({kind: "null"})
@@ -2905,17 +2918,269 @@ func virtual_stat_kind(g, p):
     return nil
 
 
+
+# ================= the network: TCP/IP stack (netstack) over netd's frame interface =================
+const EINPROGRESS = 115
+const ETIMEDOUT = 110
+const ECONNRESET = 104
+
+let net = nil              # {link, st} once the stack is up
+let net_failed = false
+let extra_inbox = []       # messages that arrived while the stack waited for netd (DHCP): the main loop serves them first
+
+# netstack's link over netd: frames come in as "rx" notices, go out through the shared segment; nothing here blocks the server except the DHCP at start
+class PushLink:
+    let pid = 0
+    let seg = nil
+    let va = 0
+    let mac = nil
+    let rxq = nil
+    let txq = nil
+    let tx_busy = false
+    let sync_wait = false
+    func init(self):
+        self.pid = ipc.lookup("net")
+        if self.pid == nil or self.pid <= 0:
+            throw error("ENODEV", "no netd")
+        self.rxq = []
+        self.txq = []
+        self.seg = ipc.shm_create(4096)
+        self.va = self.seg[1]
+        ipc.send(self.pid, "sub\t" .. to_string(self.seg[0]))
+        while true:
+            let m = ipc.recv_from()
+            if m[0] != self.pid:
+                extra_inbox.append(m)
+                continue
+            let q = m[1].split("\t")
+            if q[0] == "ok":
+                let h = q[1].split(":")
+                self.mac = h.map(x => hexbyte(x))
+                break
+            if q[0] == "err":
+                throw error("ENODEV", q[1])
+    func send(self, f):
+        self.txq.append(f)
+        self.pump_tx()
+    func pump_tx(self):
+        if self.tx_busy or len(self.txq) == 0:
+            return nil
+        let f = self.txq.remove_at(0)
+        for i in range(len(f)):
+            uio.poke8(self.va + 2048 + i, f[i])
+        self.tx_busy = true
+        ipc.send(self.pid, "tx\t" .. to_string(len(f)))
+    func on_msg(self, text):
+        let q = text.split("\t")
+        if q[0] == "rx":
+            let n = to_int(q[1])
+            let f = []
+            f.reserve(n)
+            for i in range(n):
+                f.append(uio.peek8(self.va + i))
+            ipc.send(self.pid, "ack")
+            if len(self.rxq) < 256:
+                self.rxq.append(f)
+        elif q[0] == "ok" or q[0] == "err":
+            self.tx_busy = false
+            self.pump_tx()
+    # during the DHCP at start the call may wait; later it only hands over what has arrived
+    func recv(self, ms):
+        if len(self.rxq) > 0:
+            return self.rxq.remove_at(0)
+        if not self.sync_wait or ms <= 0:
+            return nil
+        let m = ipc.recv_from(true, ms)
+        if m == nil:
+            return nil
+        if m[0] == self.pid:
+            self.on_msg(m[1])
+        else:
+            extra_inbox.append(m)
+        if len(self.rxq) > 0:
+            return self.rxq.remove_at(0)
+        return nil
+
+func hexbyte(h):
+    let v = 0
+    for i in range(len(h)):
+        let c = h[i]
+        v = v * 16 + (c - 48 if c <= 57 else c - 87)
+    return v
+
+func net_up():
+    if net != nil:
+        return true
+    if net_failed:
+        return false
+    try:
+        let link = PushLink()
+        let st = netstack.Stack(link, psys.ms, link.mac)
+        link.sync_wait = true
+        let ok = st.dhcp(6000)
+        link.sync_wait = false
+        if not ok:
+            log("network: no DHCP answer")
+            net_failed = true
+            return false
+        st.async_mode = true
+        net = {link: link, st: st}
+        log("network up: " .. netstack.ip_str(st.ip) .. " gateway " .. netstack.ip_str(st.gw) .. " dns " .. netstack.ip_str(st.dns))
+        return true
+    catch e:
+        net_failed = true
+        return false
+
+# frames from netd, timers
+func net_message(text):
+    net.link.on_msg(text)
+    net_pump()
+
+func net_pump():
+    if net == nil:
+        return nil
+    let l = net.link
+    while len(l.rxq) > 0:
+        net.st.rx_frame(l.rxq.remove_at(0))
+    net.st.timers()
+    l.pump_tx()
+
+func net_deadline():
+    if net == nil:
+        return 0
+    if len(net.st.conns) > 0 or len(net.st.arp_wait) > 0:
+        return 40
+    return 0
+
+func to_typed(a):
+    return sslcore.concat([a])
+
+func ip_to_str(v):
+    return netstack.ip_str(v)
+
+# connect (TCP): start the handshake; wait for it unless the socket is nonblocking
+func net_connect(g, f, sa):
+    if sa[0] != "inet" or not net_up():
+        return -ENETUNREACH
+    let c = net.st.tcp_connect_start(sa[1], sa[2])
+    f.conn = c
+    f.state = "connecting"
+    f.name = "inet"
+    f.port = c.lport
+    f.peer_ip = sa[1]
+    f.peer_port = sa[2]
+    net_pump()
+    if f.nonblock:
+        return -EINPROGRESS
+    func check():
+        net_pump()
+        if c.state == "ESTABLISHED":
+            f.state = "connected"
+            return 0
+        if c.state == "CLOSED":
+            f.state = "new"
+            f.conn = nil
+            return -ETIMEDOUT if c.err == "timed out" else -ECONNREFUSED
+        return nil
+    return block(check, -1, -ETIMEDOUT)
+
+func net_tcp_send(g, f, data, nonblock):
+    let c = f.conn
+    let sent = {n: 0}
+    func check():
+        net_pump()
+        if c.state != "ESTABLISHED" and c.state != "CLOSE_WAIT":
+            return -EPIPE if sent.n == 0 else sent.n
+        let rest = data if sent.n == 0 else data.slice(sent.n)
+        let n = net.st.tcp_send_nb(c, rest.to_array())
+        if n < 0:
+            return -EPIPE if sent.n == 0 else sent.n
+        sent.n += n
+        net_pump()
+        if sent.n >= len(data):
+            return sent.n
+        return nil
+    let r = check()
+    if r != nil:
+        return r
+    if nonblock:
+        return sent.n if sent.n > 0 else -EAGAIN
+    return block(check, -1, -EAGAIN)
+
+func net_tcp_recv(f, n, peek):
+    net_pump()
+    let c = f.conn
+    if peek:
+        if len(c.rbuf) > 0:
+            return to_typed(c.rbuf.slice(0, imin(n, len(c.rbuf))))
+    else:
+        try:
+            let r = net.st.tcp_recv_nb(c, n)
+            if r == nil:
+                return nil
+            return to_typed(r)
+        catch e:
+            return -ECONNRESET
+    if c.fin_rcvd or c.state == "CLOSED":
+        return sslcore.concat([[]])
+    return nil
+
+func net_udp_socket(f):
+    if f.usock == nil:
+        f.usock = net.st.udp_open(f.port)
+        f.port = f.usock.port
+    return f.usock
+
+func net_udp_send(f, data, ip, port):
+    let u = net_udp_socket(f)
+    net.st.udp_send(u, ip, port, data.to_array())
+    net_pump()
+    return len(data)
+
+func net_is_ip_local(v):
+    return (v >> 24) == 127
+
+func net_sock_ready(f):
+    net_pump()
+    if f.tl != nil:
+        return POLLIN if len(f.tl.queue) > 0 else 0
+    if f.usock != nil:
+        return (POLLIN if len(f.usock.queue) > 0 else 0) | POLLOUT
+    let c = f.conn
+    if c == nil:
+        return 0
+    if f.state == "connecting":
+        if c.state == "ESTABLISHED":
+            f.state = "connected"
+        elif c.state == "CLOSED":
+            return POLLOUT | POLLERR | POLLHUP
+        else:
+            return 0
+    let r = 0
+    if len(c.rbuf) > 0:
+        r = POLLIN
+    if c.fin_rcvd or c.state == "CLOSED":
+        r = r | POLLIN | POLLHUP
+    if (c.state == "ESTABLISHED" or c.state == "CLOSE_WAIT") and net.st.tcp_space(c) > 0:
+        r = r | POLLOUT
+    return r
+
+func net_sock_close(f):
+    if net == nil:
+        return nil
+    if f.conn != nil:
+        if f.conn.state == "ESTABLISHED" or f.conn.state == "CLOSE_WAIT":
+            net.st.tcp_close_nb(f.conn)
+        else:
+            net.st.tcp_close_nb(f.conn)
+    if f.tl != nil:
+        net.st.tcp_unlisten(f.tl)
+    if f.usock != nil:
+        net.st.udp_close(f.usock)
+    net_pump()
+
+
 # ================= sockets: AF_UNIX and loopback (in this process; the network ones come later) =================
-const AF_UNIX = 1
-const AF_INET = 2
-const AF_INET6 = 10
-const ECONNREFUSED = 111
-const EADDRINUSE = 98
-const EISCONN = 106
-const ENOTCONN = 107
-const EAFNOSUPPORT = 97
-const EPIPE = 32
-const ENETUNREACH = 101
 
 let unix_names = {}      # path -> listening / bound socket
 let inet_ports = {}      # port -> listening / bound socket (loopback)
@@ -2932,6 +3197,13 @@ func sock_of(g, fd):
     return f
 
 func sock_ready(f):
+    if f.conn != nil or f.usock != nil or f.tl != nil:
+        let nr = net_sock_ready(f)
+        if f.tl != nil and len(f.backlog) > 0:
+            nr = nr | POLLIN
+        if f.usock != nil and len(f.msgs) > 0:
+            nr = nr | POLLIN
+        return nr
     if f.state == "listening":
         return POLLIN if len(f.backlog) > 0 else 0
     if f.type == 2:
@@ -2948,6 +3220,8 @@ func sock_ready(f):
     return r
 
 func sock_close(f):
+    if f.conn != nil or f.usock != nil or f.tl != nil:
+        net_sock_close(f)
     if f.name != nil:
         if f.domain == AF_UNIX and unix_names[f.name] == f:
             unix_names[f.name] = nil
@@ -3001,6 +3275,24 @@ func u16le(v):
     return [v & 255, (v >> 8) & 255]
 
 func sockaddr_bytes(f, local):
+    if f.conn != nil and f.domain != AF_UNIX:
+        let ip = (net.st.ip if net != nil else 0) if local else f.peer_ip
+        let prt = f.conn.lport if local else f.peer_port
+        if f.domain == AF_INET6:
+            let b = []
+            for i in range(28):
+                b.append(0)
+            put16(b, 0, AF_INET6)
+            b[2] = (prt >> 8) & 255
+            b[3] = prt & 255
+            b[18] = 255
+            b[19] = 255
+            b[20] = (ip >> 24) & 255
+            b[21] = (ip >> 16) & 255
+            b[22] = (ip >> 8) & 255
+            b[23] = ip & 255
+            return sslcore.concat([b])
+        return sslcore.concat([u16le(AF_INET), [(prt >> 8) & 255, prt & 255, (ip >> 24) & 255, (ip >> 16) & 255, (ip >> 8) & 255, ip & 255], [0, 0, 0, 0, 0, 0, 0, 0]])
     let other = f if local else f.peer
     if other == nil:
         return sslcore.concat([u16le(f.domain)])
@@ -3084,6 +3376,9 @@ func sys_bind(g, a):
         inet_ports[port] = f
         f.port = port
         f.name = "inet"
+        f.bind_ip = sa[1]
+        if f.type == 2 and net != nil and not net_is_ip_local(sa[1]):
+            net_udp_socket(f)
     f.state = "bound"
     return 0
 
@@ -3100,6 +3395,8 @@ func sys_listen(g, a):
         f.name = "inet"
     f.state = "listening"
     f.opts.backlog = imax(1, a[1])
+    if f.domain != AF_UNIX and net != nil and not net_is_ip_local(f.bind_ip ?? 0):
+        f.tl = net.st.tcp_listen(f.port)
     return 0
 
 func connect_loopback(g, f, target):
@@ -3121,9 +3418,6 @@ func connect_loopback(g, f, target):
     target.backlog.append(srv)
     return 0
 
-func net_connect(g, f, sa):
-    return -ENETUNREACH
-
 func sys_connect(g, a):
     let f = sock_of(g, a[0])
     if f == nil:
@@ -3133,6 +3427,9 @@ func sys_connect(g, a):
         return -EINVAL
     if f.state == "connected":
         return -EISCONN
+    if f.state == "connecting":
+        net_sock_ready(f)
+        return 0 if f.state == "connected" else -114
     if f.type == 2:
         f.opts.dest = sa          # a datagram socket just remembers where to send
         f.state = "connected"
@@ -3151,6 +3448,18 @@ func sys_accept(g, a):
         return -EINVAL
     let nb = f.nonblock or (a[3] & 0x800) != 0
     func check():
+        if f.tl != nil:
+            net_pump()
+            if len(f.tl.queue) > 0 and len(f.backlog) == 0:
+                let nc = f.tl.queue.remove_at(0)
+                let ns = new_sock(f.domain, 1, 0)
+                ns.state = "connected"
+                ns.conn = nc
+                ns.name = "inet"
+                ns.port = nc.lport
+                ns.peer_ip = nc.rip
+                ns.peer_port = nc.rport
+                f.backlog.append(ns)
         if len(f.backlog) == 0:
             return nil
         let c = f.backlog.remove_at(0)
@@ -3165,10 +3474,16 @@ func sys_accept3(g, a):
     return sys_accept(g, [a[0], a[1], a[2], 0])
 
 func sock_send(g, f, data, flags, dest):
+    if f.conn != nil:
+        return net_tcp_send(g, f, data, f.nonblock or (flags & 0x40) != 0)
     if f.type == 2:
         let d = dest if dest != nil else f.opts.dest
         if d == nil:
             return -89
+        if d[0] == "inet" and not net_is_ip_local(d[1]):
+            if not net_up():
+                return -ENETUNREACH
+            return net_udp_send(f, data, d[1], d[2])
         let target = nil
         if d[0] == "unix":
             target = unix_names[d[1]]
@@ -3196,7 +3511,15 @@ func sock_take(f, n):
 
 # bytes, an errno, or nil when the caller has to wait
 func sock_recv_check(f, n, peek):
+    if f.conn != nil:
+        return net_tcp_recv(f, n, peek)
     if f.type == 2:
+        if f.usock != nil:
+            net_pump()
+            if len(f.usock.queue) > 0 and len(f.msgs) == 0:
+                let dgram = f.usock.queue.remove_at(0)
+                f.msgs.append([to_typed(dgram[2]), nil])
+                f.last_src = [dgram[0], dgram[1]]
         if len(f.msgs) == 0:
             return nil
         let m = f.msgs[0]
@@ -3240,7 +3563,16 @@ func sys_recvfrom(g, a):
             if e < 0:
                 return e
         if a[4] != 0 and a[5] != 0:
-            put_sockaddr(g, f, false, a[4], a[5])
+            if f.type == 2 and f.usock != nil and f.last_src != nil:
+                let ip = f.last_src[0]
+                let pt = f.last_src[1]
+                let sa = sslcore.concat([u16le(AF_INET), [(pt >> 8) & 255, pt & 255, (ip >> 24) & 255, (ip >> 16) & 255, (ip >> 8) & 255, ip & 255], [0, 0, 0, 0, 0, 0, 0, 0]])
+                let lb = rd(g, a[5], 4)
+                if lb != nil:
+                    wr(g, a[4], sa.slice(0, imin(u32(lb, 0), 16)))
+                    wr(g, a[5], sslcore.concat([[16, 0, 0, 0]]))
+            else:
+                put_sockaddr(g, f, false, a[4], a[5])
         return len(r)
     return block(check, 0 if nb else -1, -EAGAIN)
 
@@ -3296,6 +3628,19 @@ func sys_recvmsg(g, a):
             let k = imin(s[1], len(r) - off)
             wr(g, s[0], r.slice(off, off + k))
             off += k
+        if u64(mh, 0) != 0:                                               # msg_name: who sent it
+            let sa = nil
+            if f.type == 2 and f.usock != nil and f.last_src != nil:
+                let ip = f.last_src[0]
+                let pt = f.last_src[1]
+                sa = sslcore.concat([u16le(AF_INET), [(pt >> 8) & 255, pt & 255, (ip >> 24) & 255, (ip >> 16) & 255, (ip >> 8) & 255, ip & 255], [0, 0, 0, 0, 0, 0, 0, 0]])
+            elif f.peer != nil or f.conn != nil:
+                sa = sockaddr_bytes(f, false)
+            if sa != nil:
+                wr(g, u64(mh, 0), sa.slice(0, imin(u32(mh, 8), len(sa))))
+                wr(g, a[1] + 8, sslcore.concat([[len(sa), 0, 0, 0]]))
+            else:
+                wr(g, a[1] + 8, sslcore.concat([[0, 0, 0, 0]]))
         wr(g, a[1] + 40, sslcore.concat([[0, 0, 0, 0, 0, 0, 0, 0]]))     # controllen = 0
         wr(g, a[1] + 48, sslcore.concat([[0, 0, 0, 0]]))                  # flags
         return len(r)
@@ -3341,6 +3686,13 @@ func sys_getsockopt(g, a):
         v = f.type
     elif a[1] == 1 and (a[2] == 7 or a[2] == 8):     # SO_SNDBUF, SO_RCVBUF
         v = 212992
+    elif a[1] == 1 and a[2] == 4:                    # SO_ERROR: the result of a nonblocking connect
+        if f.conn != nil and f.state == "connecting":
+            net_sock_ready(f)
+        if f.conn == nil and f.state == "new" and f.peer_ip != nil:
+            v = ECONNREFUSED
+        elif f.conn != nil and f.conn.state == "CLOSED" and f.state == "connecting":
+            v = ETIMEDOUT if f.conn.err == "timed out" else ECONNREFUSED
     if a[3] != 0:
         let b = []
         for i in range(4):
@@ -3569,6 +3921,8 @@ try:
 catch e:
     log("no file system server: " .. to_string(e))
 setup()
+if ipc.lookup("net") != nil:
+    net_up()
 ipc.register("linux")
 log("serving as \"linux\", pid " .. to_string(psys.pid()))
 let running = true
@@ -3590,12 +3944,17 @@ while running:
         wake_sleepers()
         fire_alarms()
         if m == nil:
+            net_pump()
             recheck()
             continue
         let src = m[0]
         let text = m[1]
         if verbose == "trace" and src >= 8:
             log("recv from " .. to_string(src) .. ": " .. text.slice(0, imin(30, len(text))))
+        if net != nil and src == net.link.pid:
+            net_message(text)
+            recheck()
+            continue
         let g = tmap[src]
         if g != nil:
             if text == "S":

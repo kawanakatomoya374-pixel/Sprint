@@ -5,6 +5,11 @@ import ipc
 import io
 
 let fsd = sys.spawn("fsd")
+let netd = sys.spawn("netd")
+for i in range(500):
+    if ipc.lookup("net") != nil:
+        break
+    sys.sleep_ms(10)
 let lxd = sys.spawn("linuxd")
 let srv = nil
 for i in range(500):
@@ -34,7 +39,7 @@ func run(path, args, env):
 
 ipc.send(srv, "verbose")
 ipc.recv_from()
-let progs = ["/bin/hello", "/bin/files", "/bin/proc", "/bin/hello_dyn", "/bin/glibc", "/bin/dl", "/bin/threads", "/bin/threads_glibc", "/bin/socks", "/bin/signals", "/bin/signals_glibc", "/bin/procfs"]
+let progs = ["/bin/hello", "/bin/files", "/bin/proc", "/bin/hello_dyn", "/bin/glibc", "/bin/dl", "/bin/threads", "/bin/threads_glibc", "/bin/socks", "/bin/signals", "/bin/signals_glibc", "/bin/procfs", "/bin/nettest"]
 
 for p in progs:
     run(p, [p, "one", "two words"], ["HOME=/root", "LANG=C"])
@@ -45,5 +50,7 @@ print("lxtest: done")
 io.flush()
 ipc.send(srv, "quit")
 sys.wait(lxd)
+ipc.send(ipc.lookup("net"), "quit")
+sys.wait(netd)
 ipc.send(fsd, "quit")
 sys.wait(fsd)
