@@ -26,8 +26,8 @@ if not a.reuse:
         r = subprocess.run([SP, "run", "--max-heap", "8589934592", "--allow-read=" + tmp, "--allow-read=" + COSAPPS, "--allow-write=" + tmp, "tools/packinstall.sp", disk, pd, "/"], capture_output=True, text=True)
         print("install %s: %s (%.0f s)" % (name, (r.stdout.strip().splitlines() or [r.stderr.strip()[:200]])[-1], time.time() - t0)); sys.stdout.flush()
         if r.returncode != 0: print(r.stderr[:500]); sys.exit(1)
-    for spec in [x for x in a.files.split(",") if x]:
-        h, g = spec.split(":"); import shutil; shutil.copy(h, os.path.join(tmp, "f")); tool("put", os.path.join(tmp, "f"), g)
+for spec in [x for x in a.files.split(",") if x]:
+    h, g = spec.split(":"); import shutil; shutil.copy(h, os.path.join(tmp, "f")); tool("rm", g); tool("put", os.path.join(tmp, "f"), g)
 cmds, cur = [], []
 for x in a.cmds:
     if x == "--":
@@ -35,7 +35,7 @@ for x in a.cmds:
     else: cur.append(x)
 if cur: cmds.append(cur)
 open(os.path.join(tmp, "run.list"), "w").write(("VERBOSE:" + a.trace + "\n" if a.trace else "") + "\n".join("\t".join(c) for c in cmds) + "\n")
-tool("put", os.path.join(tmp, "run.list"), "/run.list")
+tool("rm", "/run.list"); tool("put", os.path.join(tmp, "run.list"), "/run.list")
 if a.http:
     import socket, threading
     def serve():
