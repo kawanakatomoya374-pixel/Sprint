@@ -12,9 +12,30 @@
 #include <string.h>
 
 typedef volatile int Spin;
+/* a lock that stays taken for ~seconds means a deadlock: say which one (its address) and from where, once, then keep waiting */
+static void spin_stuck(Spin *l, void *ret) {
+    char b[96];
+    const char *h = "0123456789abcdef";
+    int n = 0;
+    const char *m = "[kernel] SPIN stuck lock ";
+    while (*m) b[n++] = *m++;
+    uint64_t v = (uint64_t)(uintptr_t)l;
+    for (int i = 60; i >= 0; i -= 4) b[n++] = h[(v >> i) & 15u];
+    m = " caller ";
+    while (*m) b[n++] = *m++;
+    v = (uint64_t)(uintptr_t)ret;
+    for (int i = 60; i >= 0; i -= 4) b[n++] = h[(v >> i) & 15u];
+    b[n++] = '\n';
+    b[n] = 0;
+    serial_puts(b);
+}
 static inline void spin_lock(Spin *l) {
+    uint64_t spins = 0;
     while (__atomic_exchange_n(l, 1, __ATOMIC_ACQUIRE))
-        while (__atomic_load_n(l, __ATOMIC_RELAXED)) __builtin_ia32_pause();
+        while (__atomic_load_n(l, __ATOMIC_RELAXED)) {
+            __builtin_ia32_pause();
+            if (++spins == (1ull << 29)) spin_stuck(l, __builtin_return_address(0));
+        }
 }
 static inline void spin_unlock(Spin *l) { __atomic_store_n(l, 0, __ATOMIC_RELEASE); }
 
