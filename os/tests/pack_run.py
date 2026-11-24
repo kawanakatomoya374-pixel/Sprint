@@ -17,7 +17,7 @@ OUT = os.path.join(os.path.dirname(a.img), "shots"); os.makedirs(OUT, exist_ok=T
 tmp = tempfile.mkdtemp()
 disk = a.reuse or os.path.join(tmp, "disk.img")
 def tool(*args, allow=()):
-    return subprocess.run([SP, "run", "--max-heap", "8589934592", "--allow-read=" + tmp, "--allow-write=" + tmp] + ["--allow-read=" + x for x in allow] + ["tools/sprintfs.sp", disk] + list(args), capture_output=True, text=True)
+    return subprocess.run([SP, "run", "--max-heap", "8589934592", "--allow-read=" + tmp, "--allow-write=" + tmp, "--allow-read=" + os.path.dirname(os.path.abspath(disk)), "--allow-write=" + os.path.dirname(os.path.abspath(disk))] + ["--allow-read=" + x for x in allow] + ["tools/sprintfs.sp", disk] + list(args), capture_output=True, text=True)
 if not a.reuse:
     r = tool("mkfs", str(a.disk_mb)); assert r.returncode == 0, r.stderr
     for name in [x for x in a.packs.split(",") if x]:
@@ -26,8 +26,11 @@ if not a.reuse:
         r = subprocess.run([SP, "run", "--max-heap", "8589934592", "--allow-read=" + tmp, "--allow-read=" + COSAPPS, "--allow-write=" + tmp, "tools/packinstall.sp", disk, pd, "/"], capture_output=True, text=True)
         print("install %s: %s (%.0f s)" % (name, (r.stdout.strip().splitlines() or [r.stderr.strip()[:200]])[-1], time.time() - t0)); sys.stdout.flush()
         if r.returncode != 0: print(r.stderr[:500]); sys.exit(1)
+def must(r):
+    if r.returncode != 0 and "ENOENT" not in r.stderr:
+        print("host tool failed:", r.stderr[:300]); sys.exit(1)
 for spec in [x for x in a.files.split(",") if x]:
-    h, g = spec.split(":"); import shutil; shutil.copy(h, os.path.join(tmp, "f")); tool("rm", g); tool("put", os.path.join(tmp, "f"), g)
+    h, g = spec.split(":"); import shutil; shutil.copy(h, os.path.join(tmp, "f")); tool("rm", g); must(tool("put", os.path.join(tmp, "f"), g))
 cmds, cur = [], []
 for x in a.cmds:
     if x == "--":
@@ -35,7 +38,7 @@ for x in a.cmds:
     else: cur.append(x)
 if cur: cmds.append(cur)
 open(os.path.join(tmp, "run.list"), "w").write(("VERBOSE:" + a.trace + "\n" if a.trace else "") + "\n".join("\t".join(c) for c in cmds) + "\n")
-tool("rm", "/run.list"); tool("put", os.path.join(tmp, "run.list"), "/run.list")
+tool("rm", "/run.list"); must(tool("put", os.path.join(tmp, "run.list"), "/run.list"))
 if a.http:
     import socket, threading
     def serve():
