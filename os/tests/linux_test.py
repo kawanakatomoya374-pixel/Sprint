@@ -24,7 +24,7 @@ for name, flags in (("hello", ["-static-pie"]), ("files", ["-static-pie"]), ("pr
 fsimg = os.path.join(tmp, "fs.img")
 def tool(*a):
     return subprocess.run([SP, "run", "--allow-read=" + tmp, "--allow-write=" + tmp, "tools/sprintfs.sp", fsimg] + list(a), capture_output=True, text=True)
-tool("mkfs", "40"); tool("mkdir", "/bin"); tool("mkdir", "/lx")
+tool("mkfs", "96"); tool("mkdir", "/bin"); tool("mkdir", "/lx")
 open(os.path.join(tmp, "input.txt"), "w").write("hello from the SprintFS disk\nsecond line\n")
 tool("mkdir", "/lib"); import shutil; shutil.copy("/lib/ld-musl-x86_64.so.1", os.path.join(tmp, "ld-musl")); tool("put", os.path.join(tmp, "ld-musl"), "/lib/ld-musl-x86_64.so.1")
 if glibc_ok:
@@ -32,7 +32,7 @@ if glibc_ok:
     for host, guest in (("/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2", "/lib64/ld-linux-x86-64.so.2"), ("/lib/x86_64-linux-gnu/libc.so.6", "/lib/x86_64-linux-gnu/libc.so.6")):
         shutil.copy(os.path.realpath(host), os.path.join(tmp, "glibc_lib")); tool("put", os.path.join(tmp, "glibc_lib"), guest)
     tool("put", os.path.join(tmp, "glibc"), "/bin/glibc"); tool("put", os.path.join(tmp, "signals_glibc"), "/bin/signals_glibc"); tool("put", os.path.join(tmp, "dl"), "/bin/dl"); tool("put", os.path.join(tmp, "threads_glibc"), "/bin/threads_glibc")
-REAL = ["dash", "cat", "sort", "sed", "ls", "echo", "wc", "tr", "head"]
+REAL = ["dash", "cat", "sort", "sed", "ls", "echo", "wc", "tr", "head", "curl"]
 made = set()
 def put_real(binpath):
     """a program of the host's distribution with the shared libraries it needs, at the same paths"""
@@ -61,8 +61,7 @@ cat /lx/input.txt | sed 's/hello/HELLO/' | head -1
 for i in 1 2 3; do echo -n "$i "; done; echo
 x=$(echo subshell); echo "got $x"
 echo "done" | tr a-z A-Z
-exit 5
-""")
+curl -s http://10.0.2.2:18090/hello; echo " curl rc=$?"\nexit 5\n""")
 tool("put", os.path.join(tmp, "script.sh"), "/lx/script.sh")
 tool("put", os.path.join(tmp, "procfs"), "/bin/procfs"); tool("put", os.path.join(tmp, "nettest"), "/bin/nettest"); tool("mkdir", "/etc"); open(os.path.join(tmp, "resolv.conf"), "w").write("nameserver 10.0.2.2\n"); tool("put", os.path.join(tmp, "resolv.conf"), "/etc/resolv.conf"); tool("put", os.path.join(tmp, "signals"), "/bin/signals"); tool("put", os.path.join(tmp, "socks"), "/bin/socks"); tool("mkdir", "/tmp"); tool("put", os.path.join(tmp, "threads"), "/bin/threads"); tool("put", os.path.join(tmp, "proc"), "/bin/proc"); tool("put", os.path.join(tmp, "hello_dyn"), "/bin/hello_dyn")
 tool("put", os.path.join(tmp, "hello"), "/bin/hello"); tool("put", os.path.join(tmp, "files"), "/bin/files"); tool("put", os.path.join(tmp, "input.txt"), "/lx/input.txt")
@@ -104,7 +103,7 @@ q = subprocess.Popen(["qemu-system-x86_64", "-m", "256", "-smp", "2", "-drive", 
                       "-display", "none", "-no-reboot", "-serial", "file:" + ser], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 fwd_reply = b""
 connected = False
-deadline = time.time() + 420
+deadline = time.time() + 900
 while time.time() < deadline and q.poll() is None:
     cur = open(ser, errors="replace").read() if os.path.exists(ser) else ""
     if "nettest: listening 7001" in cur and not connected:
@@ -154,6 +153,7 @@ check("threads done: counter=2000 sum=12 main tls=0" in L and "short threads: 20
 check(L.count("threads done: counter=2000 sum=12 main tls=0") == 2 and L.count("short threads: 20 counter=12000") == 2, "the same threads program built against glibc (clone3 falls back to clone, robust lists, rseq refused)")
 check("shell works" in L and "a\nb\nc" in L.replace("\r", "") and "HELLO from the SprintFS disk" in L, "dash from the distribution runs a script: pipes, sort, ls, sed, cat, head")
 check("1 2 3" in L and "got subshell" in L and "DONE" in L, "dash: loops, command substitution (fork + pipe), tr")
+check("hello from the host" in L.split("lxtest: /usr/bin/dash")[0] and " curl rc=0" in L, "curl from the distribution (libcurl and ~30 libraries) fetches a page over HTTP from the host through SprintOS's own TCP/IP stack")
 check("lxtest: /usr/bin/dash exited with 5" in L, "the script's exit status")
 check("dlopen: ok" in L and "dlsym: serialize=found compile=found" in L, "dlopen / dlsym of a real shared library (libpcre2) finds its symbols")
 check("socketpair: ping" in L and "after shutdown: read=0" in L, "socketpair and shutdown(SHUT_WR) give EOF")
