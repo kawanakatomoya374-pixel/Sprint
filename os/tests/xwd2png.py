@@ -2,7 +2,7 @@
 """Converts the screen file of Xvfb (-fbdir: an XWD image) into a PNG. usage: xwd2png.py IN.xwd OUT.png"""
 import struct, sys, zlib
 d = open(sys.argv[1], "rb").read()
-hs, ver, fmt, depth, w, h, xoff, bo, bu, bbo, bp, bpp, bpl, vc, rm, gm, bm, bpr, cs, ne, ncol = struct.unpack(">21I", d[:84])
+hs, ver, fmt, depth, w, h, xoff, bo, bu, bbo, bp, bpp, bpl, vc, rm, gm, bm, bpr, cs, ncol, ww = struct.unpack(">21I", d[:84])
 if w == 0 or h == 0:
     sys.exit("no image in the file (header is empty)")
 off = hs + ncol * 12
