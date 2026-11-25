@@ -38,6 +38,7 @@ const PORTS = {fsd: [0xCF8, 8, 0x1F0, 8, 0x3F6, 1, 0x170, 8, 0x376, 1, 0xC000, 0
 const LX = ["linuxd"]                 # may create and drive Linux programs
 const DRIVERS = ["gpud", "netd", "fsd"]       # may map device registers and allocate DMA memory
 let hb_ticks = 0
+let idle_picks = 0
 let io_open = {}      # cpu -> the port ranges currently open in its I/O permission bitmap
 let io_pid = {}       # cpu -> pid they belong to
 
@@ -610,6 +611,14 @@ export func pick(cpu):
             switches += 1
             k.stat_set(cpu, 0, switches)
             return p.ctx
+    idle_picks += 1
+    if idle_picks >= 4000:                    # idle for a long time: say what everybody here is waiting for
+        idle_picks = 0
+        let line = ""
+        for pid in order:
+            let q = procs[pid]
+            line = line .. " " .. to_string(q.pid) .. ":" .. q.name .. "/" .. q.state .. ("(" .. to_string(len(q.inbox)) .. " msgs)" if len(q.inbox) > 0 else "")
+        log("idle cpu " .. to_string(cpu) .. ":" .. line)
     if k.flag_get(1) != 0 and k.nproc() == 0:
         done()
     return 0
