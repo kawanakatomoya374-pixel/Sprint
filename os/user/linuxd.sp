@@ -346,6 +346,13 @@ func abspath_nf(g, p):
 
 # ---- the memory map of a program (for /proc/self/maps) ----
 func vm_remove(g, a, b):
+    let hit = false
+    for r in g.vm:
+        if r[1] > a and r[0] < b:
+            hit = true
+            break
+    if not hit:
+        return nil                       # (the usual case: a fresh mapping replaces nothing, so no list is rebuilt)
     let out = []
     for r in g.vm:
         if r[1] <= a or r[0] >= b:
@@ -1295,7 +1302,7 @@ func shared_writeback(path):
 
 func sys_msync(g, a):
     let r = vm_find(g, a[0])
-    if r != nil and sharedfiles[r[3]] != nil:
+    if r != nil and sharedfiles[r[3]] != nil and sharedfiles[r[3]][2] <= 262144:      # (a big mapping like the X screen is written back by the heartbeat and at munmap/exit, not at every msync)
         return shared_writeback(r[3])
     return 0
 
