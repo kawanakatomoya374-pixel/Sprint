@@ -65,6 +65,7 @@ let recv_fds = nil        # the descriptors of the message sock_recv_check just 
 let prof = {}             # system call number -> [calls, ms] (verbose "prof")
 let prof_busy = 0
 let next_beat = 0
+let beat_n = 0
 let prof_wr = 0
 let prof_wrn = 0
 let prof_rd = 0
@@ -4656,6 +4657,10 @@ while running:
                 let gg = tmap[t]
                 line = line .. " " .. to_string(t) .. ":" .. to_string(last_nr[t]) .. "/" .. to_string(gg.calls if gg != nil else 0) .. ("*" if blocked[t] != nil else "")
             log("beat at " .. to_string(psys.ms()) .. " ms (tid:last syscall/calls, * blocked):" .. line)
+            beat_n += 1
+            if beat_n % 3 == 0:                      # keep the files behind shared mappings (the X screen) up to date on the volume, so a run that gets cut off still leaves its picture
+                for path in keys(sharedfiles):
+                    shared_writeback(path)
         if m == nil:
             net_pump()
             recheck()
