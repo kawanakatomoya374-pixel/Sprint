@@ -42,6 +42,7 @@ static inline void spin_unlock(Spin *l) { __atomic_store_n(l, 0, __ATOMIC_RELEAS
 /* ---- physical pages for user processes (a bitmap, 1 = free) ---- */
 enum { PG = 4096, PG_WORDS = 1u << 14 }; /* up to 1 Mi pages = 4 GiB */
 static uint64_t pg_bits[PG_WORDS];
+static uint16_t pg_ref[PG_WORDS * 64];   /* how many page tables map a page (copy-on-write sharing after fork); a page goes back to the free map with its last reference */
 static uint64_t pg_base, pg_span;
 static Spin pg_lock;
 static uint64_t pg_cursor, pg_free_n, pg_total_n;
@@ -82,6 +83,7 @@ uint64_t upage_alloc(void) {
             pg_cursor = w;
             pg_free_n--;
             out = pg_base + (w * 64 + (uint64_t)b) * PG;
+            pg_ref[w * 64 + (uint64_t)b] = 1;
             break;
         }
     }
@@ -95,11 +97,29 @@ void upage_free(uint64_t a) {
     uint64_t k = (a - pg_base) / PG;
     if (k >= pg_span) return;
     spin_lock(&pg_lock);
-    if (!(pg_bits[k / 64] & (1ull << (k % 64)))) {
+    if (pg_ref[k] > 1) {
+        pg_ref[k]--;
+    } else if (!(pg_bits[k / 64] & (1ull << (k % 64)))) {
+        pg_ref[k] = 0;
         pg_bits[k / 64] |= 1ull << (k % 64);
         pg_free_n++;
     }
     spin_unlock(&pg_lock);
+}
+
+/* one more mapping of a page that is in use (fork shares pages until one side writes) */
+void upage_ref(uint64_t a) {
+    if (a < pg_base) return;
+    uint64_t k = (a - pg_base) / PG;
+    if (k >= pg_span) return;
+    spin_lock(&pg_lock);
+    if (pg_ref[k] < 65535) pg_ref[k]++;
+    spin_unlock(&pg_lock);
+}
+uint64_t upage_refs(uint64_t a) {
+    if (a < pg_base) return 0;
+    uint64_t k = (a - pg_base) / PG;
+    return k < pg_span ? pg_ref[k] : 0;
 }
 
 /* n physically contiguous zeroed pages, or 0 */
@@ -113,7 +133,7 @@ uint64_t upage_alloc_contig(uint64_t n) {
             run++;
             if (run == n) {
                 uint64_t first = k + 1 - n;
-                for (uint64_t j = first; j <= k; j++) pg_bits[j / 64] &= ~(1ull << (j % 64));
+                for (uint64_t j = first; j <= k; j++) { pg_bits[j / 64] &= ~(1ull << (j % 64)); pg_ref[j] = 1; }
                 pg_free_n -= n;
                 out = pg_base + first * PG;
                 break;
@@ -197,6 +217,19 @@ static SpStatus k_page_free(SpVM *vm, int argc, const SpValue *argv, SpValue *re
     ARG(0, a);
     upage_free((uint64_t)a);
     *ret = sp_nil();
+    return SP_OK;
+}
+static SpStatus k_page_ref(SpVM *vm, int argc, const SpValue *argv, SpValue *ret) {
+    (void)argc;
+    ARG(0, a);
+    upage_ref((uint64_t)a);
+    *ret = sp_nil();
+    return SP_OK;
+}
+static SpStatus k_page_refs(SpVM *vm, int argc, const SpValue *argv, SpValue *ret) {
+    (void)argc;
+    ARG(0, a);
+    *ret = sp_int((int64_t)upage_refs((uint64_t)a));
     return SP_OK;
 }
 static SpStatus k_page_alloc_contig(SpVM *vm, int argc, const SpValue *argv, SpValue *ret) {
@@ -538,7 +571,7 @@ static SpStatus k_ipi(SpVM *vm, int argc, const SpValue *argv, SpValue *ret) {
 }
 
 static const SpNativeDesc k_fns[] = {
-    {"page_alloc", 0, 0, 0, 0, k_page_alloc}, {"page_free", 1, 1, 0, 0, k_page_free}, {"page_alloc_contig", 1, 1, 0, 0, k_page_alloc_contig},
+    {"page_ref", 1, 1, 0, 0, k_page_ref}, {"page_refs", 1, 1, 0, 0, k_page_refs}, {"page_alloc", 0, 0, 0, 0, k_page_alloc}, {"page_free", 1, 1, 0, 0, k_page_free}, {"page_alloc_contig", 1, 1, 0, 0, k_page_alloc_contig},
     {"pages_free", 0, 0, 0, 0, k_pages_free}, {"pages_total", 0, 0, 0, 0, k_pages_total},
     {"pid_new", 1, 1, 0, 0, k_pid_new}, {"pid_cpu", 1, 1, 0, 0, k_pid_cpu}, {"pid_gone", 1, 1, 0, 0, k_pid_gone}, {"nproc", 0, 0, 0, 0, k_nproc},
     {"load_set", 2, 2, 0, 0, k_load_set}, {"load_get", 1, 1, 0, 0, k_load_get}, {"ready_set", 1, 1, 0, 0, k_ready_set}, {"ready", 1, 1, 0, 0, k_ready},

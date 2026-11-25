@@ -114,8 +114,36 @@ export class Process:
     func lazy_miss(self, addr):
         let r = self.find_region(addr)
         return r != nil and r.lazy and not self.space.is_mapped(addr & ~4095)
+    # a write to a page that fork shares: take a private copy (or the page itself when this is its last mapping). false = not a copy-on-write page
+    func cow_fault(self, addr):
+        let a = addr & ~4095
+        let e = self.space.entry(a, false)
+        if e == 0:
+            return false
+        let x = hw.peek64(e)
+        if x & vmm.P == 0 or x & vmm.COW == 0:
+            return false
+        let old = x & 0x000FFFFFFFFFF000
+        if kmem.refs(old) > 1:
+            let q = kmem.alloc()
+            hw.memcpy(q, old, 4096)
+            hw.poke64(e, q | ((x & 0xFFF & ~vmm.COW) | vmm.W | vmm.P))
+            kmem.release(old)
+        else:
+            hw.poke64(e, (x & ~vmm.COW) | vmm.W)
+        hw.invlpg(a)
+        return true
     # make sure [addr, addr + n) is backed (a kernel write into a not yet touched page of a region)
     func ensure(self, addr, n):
+        let a = addr & ~4095
+        while a < addr + n:
+            if not self.space.is_mapped(a):
+                self.fault(a)
+            else:
+                self.cow_fault(a)                  # the kernel is about to write there: not into a page another process still shares
+            a += 4096
+    # the same for a page the kernel only reads
+    func ensure_read(self, addr, n):
         let a = addr & ~4095
         while a < addr + n:
             if not self.space.is_mapped(a):
@@ -223,7 +251,7 @@ export class Process:
             if e != 0:
                 let x = hw.peek64(e)
                 if x & vmm.P != 0:
-                    hw.poke64(e, (x & ~(vmm.W | vmm.NX)) | (flags & vmm.W))
+                    hw.poke64(e, (x & ~(vmm.W | vmm.NX)) | (flags & vmm.W if x & vmm.COW == 0 else 0))
                     hw.invlpg(v)
             v += 4096
     # mremap(old, oldlen, newlen, may_move): grow by moving the pages (no copying); returns the address or -ENOMEM
@@ -318,14 +346,22 @@ export func fork(src, pid):
         c.regions[len(c.regions) - 1].lazy = r.lazy
         let a = r.start
         while a < r.end:
-            let p = o.space.translate(a)
-            if p != nil and o.space.flags_of(a) & vmm.DEVICE != 0:
-                c.space.map(a, p & ~4095, o.space.flags_of(a) & 0xFFF & ~vmm.P)   # a shared segment stays shared
-            elif p != nil:
-                let q = kmem.alloc()
-                c.space.pages.append(q)
-                hw.memcpy(q, p & ~4095, 4096)
-                c.space.map(a, q, o.space.flags_of(a) & 0xFFF & ~vmm.P)
+            let sk = o.space.skip_for(a)              # (a region that was only reserved has no page tables: nothing to share)
+            if sk > 0:
+                a += sk
+                continue
+            let e = o.space.entry(a, false)
+            let x = hw.peek64(e) if e != 0 else 0
+            if x & vmm.P != 0:
+                let phys = x & 0x000FFFFFFFFFF000
+                let fl = x & 0xFFF
+                if fl & vmm.DEVICE == 0:
+                    if fl & vmm.W != 0:               # both sides now map the page read-only; the first one to write gets its own copy
+                        fl = (fl & ~vmm.W) | vmm.COW
+                        hw.poke64(e, (x & ~vmm.W) | vmm.COW)
+                        hw.invlpg(a)
+                    kmem.ref(phys)
+                c.space.map(a, phys, fl & ~vmm.P)
             a += 4096
     for e in o.shm:                       # attached shared segments are inherited
         shm.attach_at(c, e[1], e[0], e[3] if len(e) > 3 else 0, e[2] if len(e) > 2 else -1)

@@ -445,11 +445,12 @@ static SpStatus h_memcpy(SpVM *vm, int argc, const SpValue *argv, SpValue *ret) 
     return SP_OK;
 }
 /* the physical address behind virtual address v in the page tables rooted at pml4 (identity-mapped RAM), or 0 when a level is missing */
-static uint64_t walk_user(uint64_t root, uint64_t v) {
+static uint64_t walk_user(uint64_t root, uint64_t v, int need_write) {
     uint64_t t = root;
     for (int level = 3; level >= 0; level--) {
         uint64_t e = ((const uint64_t *)(uintptr_t)t)[(v >> (12 + 9 * level)) & 511u];
         if ((e & 1u) == 0) return 0;
+        if (level == 0 && need_write && (e & 2u) == 0) return 0;   /* a read-only (or copy-on-write) page: the caller deals with it */
         t = e & 0x000FFFFFFFFFF000ull;
     }
     return t + (v & 4095u);
@@ -465,8 +466,8 @@ static SpStatus h_copy_user(SpVM *vm, int argc, const SpValue *argv, SpValue *re
     ARG_INT(4, n);
     int64_t done = 0;
     while (done < n) {
-        uint64_t a = walk_user((uint64_t)sp4, (uint64_t)(sva + done));
-        uint64_t b = walk_user((uint64_t)dp4, (uint64_t)(dva + done));
+        uint64_t a = walk_user((uint64_t)sp4, (uint64_t)(sva + done), 0);
+        uint64_t b = walk_user((uint64_t)dp4, (uint64_t)(dva + done), 1);
         if (a == 0 || b == 0) break;
         uint64_t chunk = 4096u - (a & 4095u);
         uint64_t c2 = 4096u - (b & 4095u);

@@ -9,6 +9,7 @@ export const P = 1
 export const W = 2
 export const U = 4
 export const NX = 1 << 63
+export const COW = 1 << 10     # software bit: a page shared by fork, read-only until one side writes
 export const DEVICE = 1 << 9   # software bit: a device page (framebuffer); never returned to the allocator
 export const USER_BASE = 0x8000000000
 const ADDR_MASK = 0x000FFFFFFFFFF000

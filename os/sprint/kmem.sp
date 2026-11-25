@@ -23,3 +23,10 @@ export func total_count():
 # n physically contiguous zeroed pages (a device's DMA ring), or 0 when no such run is free
 export func alloc_contig(n):
     return k.page_alloc_contig(n)
+
+# another page table now maps page a (fork shares pages); release() takes one mapping away and frees the page with the last one
+export func ref(a):
+    k.page_ref(a)
+
+export func refs(a):
+    return k.page_refs(a)

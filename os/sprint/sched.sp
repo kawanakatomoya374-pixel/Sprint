@@ -246,13 +246,24 @@ func lx_target(p, pid):
 func copy_between(src_p, src_va, dst_p, dst_va, n):
     let done = 0
     while done < n:
-        done += hw.copy_user(src_p.space.pml4, src_va + done, dst_p.space.pml4, dst_va + done, n - done)
-        if done < n:
-            # a page is not there yet: map the one that is missing (regions fill on first touch), then go on in C
-            src_p.ensure(src_va + done, 1)
+        let got = hw.copy_user(src_p.space.pml4, src_va + done, dst_p.space.pml4, dst_va + done, n - done)
+        done += got
+        if done < n and got == 0:
+            # a page is missing, or the destination is read-only / shared by fork: back it, take a private copy, then go on in C
+            src_p.ensure_read(src_va + done, 1)
             dst_p.ensure(dst_va + done, 1)
-            if src_p.space.translate(src_va + done) == nil or dst_p.space.translate(dst_va + done) == nil:
+            let a = src_p.space.translate(src_va + done)
+            let b = dst_p.space.translate(dst_va + done)
+            if a == nil or b == nil:
                 return false
+            got = hw.copy_user(src_p.space.pml4, src_va + done, dst_p.space.pml4, dst_va + done, n - done)
+            if got == 0:                             # (a read-only mapping the server fills: the kernel may write it)
+                let chunk = 4096 - (a & 4095)
+                if 4096 - (b & 4095) < chunk:
+                    chunk = 4096 - (b & 4095)
+                got = chunk if chunk < n - done else n - done
+                hw.memcpy(b, a, got)
+            done += got
     return true
 
 func lx_syscall(p, nr):
@@ -456,6 +467,14 @@ func trap_dump(p):
     log("  stack at rsp " .. hex64(rsp) .. ":" .. dump_words(p, rsp & ~7, 24))
     log("  regs rbx=" .. hex64(hw.peek64(p.ctx + 8)) .. " rbp=" .. hex64(hw.peek64(p.ctx + 48)) .. " rdi=" .. hex64(hw.peek64(p.ctx + 40)) .. " rsi=" .. hex64(hw.peek64(p.ctx + 32)))
 
+# is [va, va + n) mapped and writable right now (not absent, not shared by fork)?
+func lx_writable(p, va, n):
+    for off in [0, n - 1]:
+        let f = p.space.flags_of(va + off)
+        if f & vmm.P == 0 or f & vmm.W == 0:
+            return false
+    return true
+
 # clock_gettime, gettimeofday, time, getpid, gettid for a Linux program, answered without the server; false when the program's buffer is not mapped yet (the server takes it then)
 func lx_fast(p, nr):
     if nr == 39:                       # getpid: the process, not the thread
@@ -470,14 +489,14 @@ func lx_fast(p, nr):
     if nr == 228:                      # clock_gettime(clock, &ts): every clock counts from boot
         if a1 == 0:
             return false
-        if p.space.translate(a1) == nil or p.space.translate(a1 + 15) == nil:
+        if not lx_writable(p, a1, 16):
             return false
         p.space.write64(a1, us // 1000000)
         p.space.write64(a1 + 8, (us % 1000000) * 1000)
         set_ret(p, 0)
         return true
     if nr == 96:                       # gettimeofday(&tv, &tz)
-        if a0 == 0 or p.space.translate(a0) == nil or p.space.translate(a0 + 15) == nil:
+        if a0 == 0 or not lx_writable(p, a0, 16):
             return false
         if a1 != 0:
             return false
@@ -487,7 +506,7 @@ func lx_fast(p, nr):
         return true
     if nr == 201:                      # time(&t)
         if a0 != 0:
-            if p.space.translate(a0) == nil:
+            if not lx_writable(p, a0, 8):
                 return false
             p.space.write64(a0, us // 1000000)
         set_ret(p, us // 1000000)
@@ -710,6 +729,8 @@ export func trap(cpu, v):
             hb_ticks = 0
             log("hb cpu " .. to_string(cpu) .. " pid " .. to_string(p.pid) .. " (" .. p.name .. ") rip " .. to_string(hw.peek64(p.ctx + kproc.CTX_RIP)) .. " |" .. proc_states())
         k.stat_set(cpu, 1, preemptions)
+    elif v == PF and (hw.peek64(p.ctx + kproc.CTX_ERR) & 3) == 3 and p.cow_fault(hw.peek64(p.ctx + kproc.CTX_CR2)):
+        pass                                  # a write to a page fork shares: the process has its own copy now
     elif v == PF and p.handler != 0 and p.lazy_miss(hw.peek64(p.ctx + kproc.CTX_CR2)):
         # a page of a file mapping: the server reads it from the file, then lets the instruction run again
         if send_to(p.handler, p.pid, "P\t" .. to_string(hw.peek64(p.ctx + kproc.CTX_CR2))):

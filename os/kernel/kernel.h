@@ -21,6 +21,8 @@ extern int g_nuser_mem;
 void upage_init(void);
 uint64_t upage_alloc(void);
 void upage_free(uint64_t a);
+void upage_ref(uint64_t a);
+uint64_t upage_refs(uint64_t a);
 uint64_t upage_alloc_contig(uint64_t n);
 
 static inline void outb(uint16_t p, uint8_t v) { __asm__ volatile("outb %0, %1" : : "a"(v), "Nd"(p)); }
