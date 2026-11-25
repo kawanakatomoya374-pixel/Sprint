@@ -19,7 +19,7 @@ const USER_BASE = 0x8000000000
 const STACK_TOP = USER_BASE + 0x7000000000     # far above the mmap area (the JVM reserves gigabytes)
 const STACK_SIZE = 8 << 20
 const PIE_BASE = USER_BASE + 0x400000
-const INTERP_BASE = USER_BASE + 0x200000000
+const INTERP_BASE = USER_BASE + 0x8000000       # (below the mmap area: a program that reserves 128 GB must not run over the dynamic loader)
 const MMAP_BASE = USER_BASE + 0x10000000
 const AT_FDCWD = -100
 
@@ -1186,7 +1186,13 @@ func sys_mmap(g, a):
             return -EINVAL
     else:
         addr = g.mmap_next
-        g.mmap_next += n + 4096
+        if not vm_free(g, addr, addr + n):         # something is already there (the loader, an earlier fixed mapping): go above everything
+            let top = addr
+            for r in g.vm:
+                if r[1] > top and r[0] < STACK_TOP - STACK_SIZE:
+                    top = r[1]
+            addr = align_up(top) + 4096
+        g.mmap_next = addr + n + 4096
     let f = nil
     if (flags & 0x20) == 0:
         f = g.fds[i32(fd)]
