@@ -129,5 +129,13 @@ int main(int argc, char **argv) {
     }
     st = sp_run(vm, prog, argc > 1 ? argc - 1 : 0, argc > 1 ? (const char *const *)argv + 1 : NULL);
     (void)fflush(stdout);
+    if (st != SP_OK) {                                 /* an error nobody caught: say what it was, the server is gone */
+        for (size_t i = 0; i < sp_diagnostic_count(vm); i++) {
+            const SpDiagnostic *d = sp_diagnostic(vm, i);
+            (void)fprintf(stderr, "[%s] uncaught %s: %s (%s:%u)\n", entry, d->kind, d->message, d->file ? d->file : "?", d->line);
+        }
+        (void)fprintf(stderr, "[%s] ended with status %d\n", entry, (int)st);
+        (void)fflush(stderr);
+    }
     return st == SP_OK ? 0 : 1;
 }
