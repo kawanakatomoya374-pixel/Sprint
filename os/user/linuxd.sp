@@ -60,6 +60,8 @@ let cur_tid = 0           # the thread whose system call is being served
 let futex_q = {}          # "pid:address" -> [[tid, bitset], ...]
 let table = {}            # system call number -> function(g, a)
 let verbose = false
+let send_fds = nil        # descriptors travelling with the message sock_send is about to queue (SCM_RIGHTS)
+let recv_fds = nil        # the descriptors of the message sock_recv_check just took
 let prof = {}             # system call number -> [calls, ms] (verbose "prof")
 let prof_busy = 0
 let next_beat = 0
@@ -3569,7 +3571,7 @@ let next_port = 40000
 
 func new_sock(domain, type, flags):
     return {kind: "sock", domain: domain, type: type & 15, nonblock: (type & 0x800) != 0, state: "new", name: nil, port: 0, backlog: [], peer: nil,
-            data: [], size: 0, msgs: [], eof: false, shut_wr: false, shut_rd: false, opts: {}}
+            data: [], size: 0, msgs: [], pkts: [], eof: false, shut_wr: false, shut_rd: false, opts: {}}
 
 func sock_of(g, fd):
     let f = g.fds[i32(fd)]
@@ -3590,7 +3592,7 @@ func sock_ready(f):
     if f.type == 2:
         return (POLLIN if len(f.msgs) > 0 else 0) | POLLOUT
     let r = 0
-    if f.size > 0 or f.eof or f.shut_rd:
+    if f.size > 0 or len(f.pkts) > 0 or f.eof or f.shut_rd:
         r = POLLIN
     if f.eof:
         r = r | POLLHUP | POLLIN
@@ -3878,6 +3880,10 @@ func sock_send(g, f, data, flags, dest):
         return -ENOTCONN
     if f.shut_wr or f.peer == nil:
         return -EPIPE
+    if f.type == 5:                                   # SOCK_SEQPACKET: whole messages, which may carry descriptors (SCM_RIGHTS)
+        f.peer.pkts.append([data, send_fds])
+        send_fds = nil
+        return len(data)
     f.peer.data.append(data)
     f.peer.size += len(data)
     return len(data)
@@ -3907,6 +3913,18 @@ func sock_recv_check(f, n, peek):
         if not peek:
             f.msgs.remove_at(0)
         return m[0].slice(0, imin(n, len(m[0])))
+    if f.type == 5:
+        if len(f.pkts) > 0:
+            let pk = f.pkts[0]
+            if not peek:
+                f.pkts.remove_at(0)
+                recv_fds = pk[1]
+            return pk[0].slice(0, imin(n, len(pk[0])))
+        if f.eof or f.shut_rd or f.state == "closed":
+            return sslcore.concat([[]])
+        if f.state != "connected":
+            return -ENOTCONN
+        return nil
     if f.size > 0:
         if peek:
             return sslcore.concat(f.data).slice(0, imin(n, f.size))
@@ -3977,7 +3995,35 @@ func sys_sendmsg(g, a):
                 return -EFAULT
             parts.append(d)
     let dest = read_sockaddr(g, u64(mh, 0), u32(mh, 8)) if u64(mh, 0) != 0 else nil
-    return sock_send(g, f, sslcore.concat(parts), a[2], dest)
+    send_fds = nil
+    if u64(mh, 32) != 0 and u64(mh, 40) >= 16:                 # msg_control: SCM_RIGHTS carries open descriptors
+        let cl = u64(mh, 40)
+        let cm = rd(g, u64(mh, 32), imin(cl, 4096))
+        if cm == nil:
+            return -EFAULT
+        let at = 0
+        while at + 16 <= len(cm):
+            let clen = u64(cm, at)
+            if clen < 16 or at + clen > len(cm):
+                break
+            if u32(cm, at + 8) == 1 and u32(cm, at + 12) == 1:
+                let objs = []
+                for k in range((clen - 16) // 4):
+                    let o = g.fds[i32(u32(cm, at + 16 + 4 * k))]
+                    if o == nil:
+                        for held in objs:
+                            fclose(held)
+                        return -EBADF
+                    o.refs += 1                                   # the message holds the description until it is received
+                    objs.append(o)
+                send_fds = objs
+            at += (clen + 7) & ~7
+    let r = sock_send(g, f, sslcore.concat(parts), a[2], dest)
+    if send_fds != nil:                                           # not queued (an error, or a socket kind without descriptor passing)
+        for held in send_fds:
+            fclose(held)
+        send_fds = nil
+    return r
 
 func sys_recvmsg(g, a):
     let f = sock_of(g, a[0])
@@ -4022,8 +4068,37 @@ func sys_recvmsg(g, a):
                 wr(g, a[1] + 8, sslcore.concat([[len(sa), 0, 0, 0]]))
             else:
                 wr(g, a[1] + 8, sslcore.concat([[0, 0, 0, 0]]))
-        wr(g, a[1] + 40, sslcore.concat([[0, 0, 0, 0, 0, 0, 0, 0]]))     # controllen = 0
-        wr(g, a[1] + 48, sslcore.concat([[0, 0, 0, 0]]))                  # flags
+        let ctl = 0
+        let mflags = 0
+        let got = recv_fds
+        recv_fds = nil
+        if got != nil and len(got) > 0:
+            let need = 16 + 4 * len(got)
+            if u64(mh, 32) != 0 and u64(mh, 40) >= need:
+                let cmsg = []
+                for i in range(need):
+                    cmsg.append(0)
+                put64(cmsg, 0, need)
+                put32(cmsg, 8, 1)
+                put32(cmsg, 12, 1)
+                let k = 0
+                for o in got:
+                    let nfd = g.alloc_fd(o)
+                    fclose(o)                                      # the message's own reference is gone
+                    put32(cmsg, 16 + 4 * k, nfd)
+                    k += 1
+                wr(g, u64(mh, 32), sslcore.concat([cmsg]))
+                ctl = (need + 7) & ~7
+            else:
+                for o in got:
+                    fclose(o)
+                mflags = 8                                         # MSG_CTRUNC
+        let cb = []
+        for i in range(8):
+            cb.append(0)
+        put64(cb, 0, ctl)
+        wr(g, a[1] + 40, sslcore.concat([cb]))                    # controllen
+        wr(g, a[1] + 48, sslcore.concat([[mflags, 0, 0, 0]]))     # flags
         return len(r)
     return block(check, 0 if nb else -1, -EAGAIN)
 

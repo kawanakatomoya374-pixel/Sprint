@@ -456,9 +456,51 @@ func trap_dump(p):
     log("  stack at rsp " .. hex64(rsp) .. ":" .. dump_words(p, rsp & ~7, 24))
     log("  regs rbx=" .. hex64(hw.peek64(p.ctx + 8)) .. " rbp=" .. hex64(hw.peek64(p.ctx + 48)) .. " rdi=" .. hex64(hw.peek64(p.ctx + 40)) .. " rsi=" .. hex64(hw.peek64(p.ctx + 32)))
 
+# clock_gettime, gettimeofday, time, getpid, gettid for a Linux program, answered without the server; false when the program's buffer is not mapped yet (the server takes it then)
+func lx_fast(p, nr):
+    if nr == 39:                       # getpid: the process, not the thread
+        set_ret(p, p.owner().pid)
+        return true
+    if nr == 186:                      # gettid
+        set_ret(p, p.pid)
+        return true
+    let us = hw.ticks_us()
+    let a0 = hw.peek64(p.ctx + kproc.CTX_RDI)
+    let a1 = hw.peek64(p.ctx + kproc.CTX_RSI)
+    if nr == 228:                      # clock_gettime(clock, &ts): every clock counts from boot
+        if a1 == 0:
+            return false
+        if p.space.translate(a1) == nil or p.space.translate(a1 + 15) == nil:
+            return false
+        p.space.write64(a1, us // 1000000)
+        p.space.write64(a1 + 8, (us % 1000000) * 1000)
+        set_ret(p, 0)
+        return true
+    if nr == 96:                       # gettimeofday(&tv, &tz)
+        if a0 == 0 or p.space.translate(a0) == nil or p.space.translate(a0 + 15) == nil:
+            return false
+        if a1 != 0:
+            return false
+        p.space.write64(a0, us // 1000000)
+        p.space.write64(a0 + 8, us % 1000000)
+        set_ret(p, 0)
+        return true
+    if nr == 201:                      # time(&t)
+        if a0 != 0:
+            if p.space.translate(a0) == nil:
+                return false
+            p.space.write64(a0, us // 1000000)
+        set_ret(p, us // 1000000)
+        return true
+    return false
+
 func syscall(p):
     let nr = hw.peek64(p.ctx + kproc.CTX_RAX)
     if p.handler != 0:
+        # the cheap calls the kernel answers itself: a round trip to the server costs a message, two switches and its interpreter (tens of ms on a slow machine)
+        if nr == 228 or nr == 96 or nr == 201 or nr == 39 or nr == 186:
+            if lx_fast(p, nr):
+                return true
         # a Linux program: the system call goes to its server as a message "nr<TAB>a0 ... a5", and the program waits for lx_reply
         let m = to_string(nr)
         for r in [kproc.CTX_RDI, kproc.CTX_RSI, kproc.CTX_RDX, kproc.CTX_R10, kproc.CTX_R8, kproc.CTX_R9]:
