@@ -180,6 +180,8 @@ func finish(p):
     # free the address space now and tell the parent how it ended; the process is gone
     let code = p.exit_code
     let handler = p.handler
+    if handler == 0:
+        log("pid " .. to_string(p.pid) .. " (" .. p.name .. ") ended with status " .. to_string(code))
     p.state = "zombie"
     p.destroy()
     reap(p.pid)
