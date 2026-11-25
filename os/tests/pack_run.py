@@ -54,7 +54,7 @@ if a.http:
 ser = os.path.join(OUT, "packrun.log")
 if os.path.exists(ser): os.remove(ser)
 q = subprocess.Popen(["qemu-system-x86_64", "-m", str(a.mem), "-smp", str(a.smp), "-drive", "format=raw,file=" + a.img + ",if=ide,index=0", "-drive", "format=raw,file=" + disk + ",if=none,id=d1,cache=unsafe", "-device", "virtio-blk-pci,drive=d1",
-                      "-netdev", "user,id=n0", "-device", "e1000,netdev=n0", "-display", "none", "-no-reboot", "-serial", "file:" + ser], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                      "-netdev", "user,id=n0", "-device", "e1000,netdev=n0", "-display", "none", "-no-reboot", "-serial", "file:" + ser, "-monitor", "unix:" + os.path.join(OUT, "mon.sock") + ",server,nowait"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 t0 = time.time(); seen = 0
 while time.time() - t0 < a.timeout and q.poll() is None:
     time.sleep(2)
