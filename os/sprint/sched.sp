@@ -662,6 +662,35 @@ export func boot_done():
     started = true
     k.flag_set(1)
 
+let idle_since = 0
+let idle_us = 0
+let pf_n = 0
+let pf_us = 0
+let pf_cow = 0
+let pf_lazy = 0
+# a user page fault: a copy-on-write copy, a page of a file mapping the server fills, or a fresh zero page; false = a real fault. Counted and timed (the heartbeat reports it)
+func timed_pf(p):
+    let t0 = hw.ticks_us()
+    let cr2 = hw.peek64(p.ctx + kproc.CTX_CR2)
+    let r = false
+    pf_n += 1
+    if (hw.peek64(p.ctx + kproc.CTX_ERR) & 3) == 3 and p.cow_fault(cr2):
+        pf_cow += 1
+        r = true                              # a write to a page fork shares: the process has its own copy now
+    elif p.handler != 0 and p.lazy_miss(cr2):
+        pf_lazy += 1
+        # a page of a file mapping: the server reads it from the file, then lets the instruction run again
+        if send_to(p.handler, p.pid, "P\t" .. to_string(cr2)):
+            p.state = "lxwait"
+        else:
+            p.exit_code = 139
+            finish(p)
+        r = true
+    elif p.fault(cr2):
+        r = true
+    pf_us += hw.ticks_us() - t0
+    return r
+
 # called by a CPU that has nothing to do: the context to run next (0 = idle until the next interrupt)
 export func pick(cpu):
     if t_start == 0:
@@ -678,11 +707,16 @@ export func pick(cpu):
             rr = (j + 1) % n
             p.state = "on"
             p.cpu = cpu
+            if idle_since != 0:
+                idle_us += now - idle_since
+                idle_since = 0
             io_apply(cpu, p)
             cur[cpu] = p
             switches += 1
             k.stat_set(cpu, 0, switches)
             return p.ctx
+    if idle_since == 0:
+        idle_since = now
     idle_picks += 1
     if idle_picks >= 4000:                    # idle for a long time: say what everybody here is waiting for
         idle_picks = 0
@@ -727,18 +761,9 @@ export func trap(cpu, v):
         hb_ticks += 1
         if hb_ticks >= 1500:                      # a sign of life and where each CPU is (a silent hang shows up as the same rip again and again)
             hb_ticks = 0
-            log("hb cpu " .. to_string(cpu) .. " pid " .. to_string(p.pid) .. " (" .. p.name .. ") rip " .. to_string(hw.peek64(p.ctx + kproc.CTX_RIP)) .. " |" .. proc_states())
+            log("hb cpu " .. to_string(cpu) .. " pid " .. to_string(p.pid) .. " (" .. p.name .. ") rip " .. to_string(hw.peek64(p.ctx + kproc.CTX_RIP)) .. " | idle " .. to_string(idle_us // 1000) .. " ms of " .. to_string((hw.ticks_us() - t_start) // 1000) .. " | faults " .. to_string(pf_n) .. " (" .. to_string(pf_cow) .. " cow, " .. to_string(pf_lazy) .. " file) took " .. to_string(pf_us // 1000) .. " ms |" .. proc_states())
         k.stat_set(cpu, 1, preemptions)
-    elif v == PF and (hw.peek64(p.ctx + kproc.CTX_ERR) & 3) == 3 and p.cow_fault(hw.peek64(p.ctx + kproc.CTX_CR2)):
-        pass                                  # a write to a page fork shares: the process has its own copy now
-    elif v == PF and p.handler != 0 and p.lazy_miss(hw.peek64(p.ctx + kproc.CTX_CR2)):
-        # a page of a file mapping: the server reads it from the file, then lets the instruction run again
-        if send_to(p.handler, p.pid, "P\t" .. to_string(hw.peek64(p.ctx + kproc.CTX_CR2))):
-            p.state = "lxwait"
-        else:
-            p.exit_code = 139
-            finish(p)
-    elif v == PF and p.fault(hw.peek64(p.ctx + kproc.CTX_CR2)):
+    elif v == PF and timed_pf(p):
         pass
     elif v >= ioapic.VECTOR_BASE and v < ioapic.VECTOR_BASE + 24:
         hw.irq_mask(v - ioapic.VECTOR_BASE, 1)
