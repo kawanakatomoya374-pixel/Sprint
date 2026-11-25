@@ -215,6 +215,10 @@ export class Process:
         self.regions = out
         let v = a & ~4095
         while v < end:
+            let sk = self.space.skip_for(v)
+            if sk > 0:
+                v += sk
+                continue
             let e = self.space.entry(v, false)
             if e != 0:
                 let x = hw.peek64(e)

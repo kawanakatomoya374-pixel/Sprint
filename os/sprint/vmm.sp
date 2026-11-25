@@ -130,10 +130,24 @@ export class Space:
         hw.invlpg(dst)
         return true
     # unmap [v, v + len) and give the frames back
+    # when a table on the way to `a` is missing: how many bytes to the next address that has one (0 = all tables are there)
+    func skip_for(self, a):
+        let t = self.pml4
+        for level in [3, 2, 1]:
+            let x = hw.peek64(t + idx(a, level) * 8)
+            if x & P == 0:
+                let span = 1 << (12 + 9 * level)
+                return span - (a & (span - 1))
+            t = x & ADDR_MASK
+        return 0
     func unmap_free(self, v, len):
         let a = v & ~(PAGE - 1)
         let end = v + len
         while a < end:
+            let sk = self.skip_for(a)
+            if sk > 0:
+                a += sk                  # a reservation of gigabytes costs nothing unless it was touched
+                continue
             let e = self.entry(a, false)
             if e != 0:
                 let x = hw.peek64(e)
