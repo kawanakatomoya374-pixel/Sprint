@@ -4573,7 +4573,7 @@ func serve_call(g, q):
             log("pid " .. to_string(g.pid) .. ": system call " .. to_string(nr) .. " failed inside linuxd: " .. to_string(e))
             r = -5
     let t_end = psys.ms()
-    if verbose == "prof":
+    if verbose == "prof" or verbose == "beat":
         let pr = prof[nr]
         if pr == nil:
             pr = [0, 0]
@@ -4658,6 +4658,15 @@ while running:
                 line = line .. " " .. to_string(t) .. ":" .. to_string(last_nr[t]) .. "/" .. to_string(gg.calls if gg != nil else 0) .. ("*" if blocked[t] != nil else "")
             log("beat at " .. to_string(psys.ms()) .. " ms (tid:last syscall/calls, * blocked):" .. line)
             beat_n += 1
+            if beat_n % 3 == 0:
+                let top = []
+                for nr in keys(prof):
+                    top.append([prof[nr][1], nr, prof[nr][0]])
+                top.sort((x, y) => x[0] > y[0])
+                let tl = ""
+                for i in range(imin(8, len(top))):
+                    tl = tl .. " " .. to_string(top[i][1]) .. ":" .. to_string(top[i][2]) .. "x/" .. to_string(top[i][0]) .. "ms"
+                log("prof: " .. to_string(prof_busy) .. " ms inside system calls (of " .. to_string(psys.ms()) .. " ms); top by time:" .. tl)
             if beat_n % 3 == 0:                      # keep the files behind shared mappings (the X screen) up to date on the volume, so a run that gets cut off still leaves its picture
                 for path in keys(sharedfiles):
                     shared_writeback(path)
