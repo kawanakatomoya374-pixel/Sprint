@@ -2341,7 +2341,7 @@ func fire_alarms():
         if al != nil and al[0] <= now:
             let g = guests[pid]
             if al[1] > 0:
-                alarms[pid] = [now + al[1], al[1]]
+                alarms[pid] = [now + imax(al[1], 100), al[1]]     # (a program's 20 ms timer would eat a machine this slow: at most ten ticks a second)
             else:
                 alarms[pid] = nil
             if g != nil:
@@ -4109,6 +4109,14 @@ func sys_linkat(g, a):
         return -EBADF
     return do_link(g, o, n)
 
+# getresuid, getresgid: root all three
+func sys_getres(g, a):
+    let z = sslcore.concat([[0, 0, 0, 0]])
+    for i in range(3):
+        if a[i] != 0 and wr(g, a[i], z) != 0:
+            return -EFAULT
+    return 0
+
 func sys_eopnotsupp(g, a):
     return -95
 func sys_enodata(g, a):
@@ -4147,6 +4155,8 @@ func setup():
     table[334] = sys_rseq
     table[161] = sys_eperm
     table[27] = sys_mincore
+    table[118] = sys_getres
+    table[120] = sys_getres
     table[86] = sys_link
     table[265] = sys_linkat
     table[29] = sys_shmget
