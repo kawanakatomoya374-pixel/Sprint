@@ -18,7 +18,7 @@ glibc_ok = glibc_ok and subprocess.run(["gcc", "-O2", "-pie", "-fPIE", "-o", os.
 glibc_ok = glibc_ok and subprocess.run(["gcc", "-O2", "-pie", "-fPIE", "-o", os.path.join(tmp, "signals_glibc"), os.path.join(src, "signals.c")], capture_output=True).returncode == 0
 glibc_ok = glibc_ok and subprocess.run(["gcc", "-O2", "-pie", "-fPIE", "-pthread", "-o", os.path.join(tmp, "threads_glibc"), os.path.join(src, "threads.c")], capture_output=True).returncode == 0
 check(glibc_ok, "gcc builds glibc dynamic PIE programs")
-for name, flags in (("hello", ["-static-pie"]), ("files", ["-static-pie"]), ("proc", ["-static-pie"]), ("threads", ["-static-pie", "-pthread"]), ("socks", ["-static-pie"]), ("signals", ["-static-pie"]), ("procfs", ["-static-pie", "-pthread"]), ("nettest", ["-static-pie"]), ("shm", ["-static-pie"]), ("hello_dyn", ["-pie", "-fPIE"])):
+for name, flags in (("hello", ["-static-pie"]), ("files", ["-static-pie"]), ("proc", ["-static-pie"]), ("threads", ["-static-pie", "-pthread"]), ("socks", ["-static-pie"]), ("signals", ["-static-pie"]), ("procfs", ["-static-pie", "-pthread"]), ("nettest", ["-static-pie"]), ("shm", ["-static-pie"]), ("timerfd", ["-static-pie"]), ("hello_dyn", ["-pie", "-fPIE"])):
     r = subprocess.run(["musl-gcc"] + flags + ["-O2", "-o", os.path.join(tmp, name), os.path.join(src, name.replace("_dyn", "") + ".c")], capture_output=True, text=True)
     check(r.returncode == 0, "musl-gcc builds %s (%s)" % (name, " ".join(flags)))
 fsimg = os.path.join(tmp, "fs.img")
@@ -72,7 +72,7 @@ for name in ("lua",):
         r = subprocess.run([SP, "run", "--allow-read=" + tmp, "--allow-read=" + COSAPPS, "--allow-write=" + tmp, "tools/packinstall.sp", fsimg, pd, "/"], capture_output=True, text=True)
         check(r.returncode == 0 and "installed" in r.stdout, "packinstall: the %s pack passes its signature and SHA-256 checks and goes onto the disk" % name)
         if r.returncode == 0: packs.append(name)
-tool("put", os.path.join(tmp, "procfs"), "/bin/procfs"); tool("put", os.path.join(tmp, "nettest"), "/bin/nettest"); tool("put", os.path.join(tmp, "shm"), "/bin/shm"); tool("mkdir", "/etc"); open(os.path.join(tmp, "resolv.conf"), "w").write("nameserver 10.0.2.2\n"); tool("put", os.path.join(tmp, "resolv.conf"), "/etc/resolv.conf"); tool("put", os.path.join(tmp, "signals"), "/bin/signals"); tool("put", os.path.join(tmp, "socks"), "/bin/socks"); tool("mkdir", "/tmp"); tool("put", os.path.join(tmp, "threads"), "/bin/threads"); tool("put", os.path.join(tmp, "proc"), "/bin/proc"); tool("put", os.path.join(tmp, "hello_dyn"), "/bin/hello_dyn")
+tool("put", os.path.join(tmp, "procfs"), "/bin/procfs"); tool("put", os.path.join(tmp, "nettest"), "/bin/nettest"); tool("put", os.path.join(tmp, "shm"), "/bin/shm"); tool("put", os.path.join(tmp, "timerfd"), "/bin/timerfd"); tool("mkdir", "/etc"); open(os.path.join(tmp, "resolv.conf"), "w").write("nameserver 10.0.2.2\n"); tool("put", os.path.join(tmp, "resolv.conf"), "/etc/resolv.conf"); tool("put", os.path.join(tmp, "signals"), "/bin/signals"); tool("put", os.path.join(tmp, "socks"), "/bin/socks"); tool("mkdir", "/tmp"); tool("put", os.path.join(tmp, "threads"), "/bin/threads"); tool("put", os.path.join(tmp, "proc"), "/bin/proc"); tool("put", os.path.join(tmp, "hello_dyn"), "/bin/hello_dyn")
 tool("put", os.path.join(tmp, "hello"), "/bin/hello"); tool("put", os.path.join(tmp, "files"), "/bin/files"); tool("put", os.path.join(tmp, "input.txt"), "/lx/input.txt")
 ser = os.path.join(OUT, "linux.log")
 if os.path.exists(ser): os.remove(ser)
@@ -180,6 +180,7 @@ for tag, n in (("musl", 1), ("glibc", 2)):
     check(L.count("SIGSEGV handler: addr=") >= n and L.count("recovered from SIGSEGV") >= n and L.count("recovered from SIGFPE") >= n, "signals (%s): a page fault and a division by zero reach their handlers (siglongjmp out)" % tag)
     check(L.count("unhandled fault: signaled=1 sig=11") >= n and L.count("abort: sig=6") >= n, "signals (%s): an unhandled fault ends with SIGSEGV; abort() gives SIGABRT" % tag)
 check("child status 0, segment says: child wrote" in L and "shm ok" in L, "System V shared memory: shmget/shmat/shmctl(IPC_RMID)/shmdt, a forked child shares the segment")
+check("one-shot: read=8 expirations=1 waited>=80ms:1" in L and "periodic: expirations=1" in L and "disarmed: poll=0" in L and "timerfd ok" in L, "timerfd: a one-shot and a periodic timer, readable through read and poll, disarmed")
 check("cmdline: 31 bytes" in L or "cmdline:" in L and "first=/bin/procfs" in L, "/proc/self/cmdline")
 check("status: Name=procfs" in L and "cpuinfo: ok" in L and "meminfo: ok" in L and "uptime: ok" in L, "/proc/self/status, cpuinfo, meminfo, uptime")
 check("maps:" in L and "stack=1 exe=1" in L, "/proc/self/maps lists the program and the [stack]")

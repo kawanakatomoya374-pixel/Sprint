@@ -726,6 +726,8 @@ func sys_read(g, a):
         return sys_recvfrom(g, [a[0], a[1], a[2], 0, 0, 0])
     if f.kind == "eventfd":
         return eventfd_read(g, f, a[1])
+    if f.kind == "timerfd":
+        return timerfd_read(g, f, a[1])
     if f.kind == "pipe":
         if f.end != "r":
             return -EBADF
@@ -2869,6 +2871,9 @@ func fd_ready(f):
         return POLLERR if p.readers == 0 else POLLOUT
     if k == "eventfd":
         return (POLLIN if f.count > 0 else 0) | POLLOUT
+    if k == "timerfd":
+        timerfd_update(f)
+        return POLLIN if f.count > 0 else 0
     if k == "epoll":
         return POLLIN if len(epoll_ready(f, 1)) > 0 else 0
     if k == "sock":
@@ -3074,6 +3079,94 @@ func eventfd_read(g, f, buf):
         wr(g, buf, sslcore.concat([b]))
         return 8
     return block(check, -1, 0)
+
+
+# ---- timerfd: a descriptor that becomes readable when its timer expires (GLib/WebKit use it for their timeouts) ----
+let timerfds = []
+
+func sys_timerfd_create(g, a):
+    let f = {kind: "timerfd", expire: 0, interval: 0, count: 0, nonblock: (a[1] & 0o4000) != 0}
+    timerfds.append(f)
+    return g.alloc_fd(f)
+
+# fold the expirations that happened into the count
+func timerfd_update(f):
+    if f.expire == 0:
+        return nil
+    let now = now_us()
+    if f.expire <= now:
+        if f.interval > 0:
+            let n = 1 + (now - f.expire) // f.interval
+            f.count += n
+            f.expire += n * f.interval
+        else:
+            f.count += 1
+            f.expire = 0
+
+# milliseconds until the earliest armed timer fires (0: none)
+func timerfd_deadline():
+    let best = 0
+    for f in timerfds:
+        if f.expire != 0:
+            let d = imax(1, (f.expire - now_us() + 999) // 1000)
+            if best == 0 or d < best:
+                best = d
+    return best
+
+func timerfd_spec(g, addr, interval_us, value_us):
+    let b = []
+    for i in range(32):
+        b.append(0)
+    put64(b, 0, interval_us // 1000000)
+    put64(b, 8, (interval_us % 1000000) * 1000)
+    put64(b, 16, value_us // 1000000)
+    put64(b, 24, (value_us % 1000000) * 1000)
+    return wr(g, addr, sslcore.concat([b]))
+
+func sys_timerfd_settime(g, a):
+    let f = g.fds[i32(a[0])]
+    if f == nil or f.kind != "timerfd":
+        return -EBADF
+    let raw = rd(g, a[2], 32)
+    if raw == nil:
+        return -EFAULT
+    if a[3] != 0:
+        timerfd_update(f)
+        let left = imax(0, f.expire - now_us()) if f.expire != 0 else 0
+        let e = timerfd_spec(g, a[3], f.interval, left)
+        if e < 0:
+            return e
+    let interval = u64(raw, 0) * 1000000 + u64(raw, 8) // 1000
+    let value = u64(raw, 16) * 1000000 + u64(raw, 24) // 1000
+    f.count = 0
+    if value == 0:
+        f.expire = 0
+        f.interval = 0
+    else:
+        f.expire = value if (a[1] & 1) != 0 else now_us() + value
+        f.interval = interval
+    return 0
+
+func sys_timerfd_gettime(g, a):
+    let f = g.fds[i32(a[0])]
+    if f == nil or f.kind != "timerfd":
+        return -EBADF
+    timerfd_update(f)
+    return timerfd_spec(g, a[1], f.interval, imax(0, f.expire - now_us()) if f.expire != 0 else 0)
+
+func timerfd_read(g, f, buf):
+    func check():
+        timerfd_update(f)
+        if f.count == 0:
+            return nil
+        let b = []
+        for i in range(8):
+            b.append(0)
+        put64(b, 0, f.count)
+        f.count = 0
+        wr(g, buf, sslcore.concat([b]))
+        return 8
+    return block(check, 0 if f.nonblock else -1, -11)
 
 func eventfd_write(g, f, b):
     if len(b) < 8:
@@ -4213,6 +4306,9 @@ func setup():
     table[334] = sys_rseq
     table[161] = sys_eperm
     table[27] = sys_mincore
+    table[283] = sys_timerfd_create
+    table[286] = sys_timerfd_settime
+    table[287] = sys_timerfd_gettime
     table[118] = sys_getres
     table[120] = sys_getres
     table[86] = sys_link
@@ -4460,6 +4556,9 @@ while running:
         let ad = alarm_deadline()
         if ad != 0 and (wd == 0 or ad < wd):
             wd = ad
+        let td = timerfd_deadline()
+        if td != 0 and (wd == 0 or td < wd):
+            wd = td
         if wd != 0 and (tmo == 0 or wd < tmo):
             tmo = wd
         if verbose == "beat":
