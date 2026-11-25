@@ -87,6 +87,17 @@ export class Process:
         self.ports = []
     func owner(self):
         return self if self.mm == nil else self.mm
+    # the regions are kept sorted by start and never overlap: first_after(v) is the index of the first one that ends after v (binary search; a program like WebKit has thousands)
+    func first_after(self, v):
+        let lo = 0
+        let hi = len(self.regions)
+        while lo < hi:
+            let mid = (lo + hi) // 2
+            if self.regions[mid].end <= v:
+                lo = mid + 1
+            else:
+                hi = mid
+        return lo
     func add_region(self, start, end, flags):
         if self.mm != nil:
             return self.mm.add_region(start, end, flags)
@@ -94,13 +105,13 @@ export class Process:
         r.start = start
         r.end = end
         r.flags = flags
-        self.regions.append(r)
+        self.regions.insert(self.first_after(start), r)
     func find_region(self, v):
         if self.mm != nil:
             return self.mm.find_region(v)
-        for r in self.regions:
-            if v >= r.start and v < r.end:
-                return r
+        let i = self.first_after(v)
+        if i < len(self.regions) and self.regions[i].start <= v:
+            return self.regions[i]
         return nil
     # handle a user page fault: back the page when it lies in a region. false = a real fault
     func fault(self, addr):
@@ -175,12 +186,13 @@ export class Process:
                 return at
             at = r.end + 4096
         return at if top - at >= need else 0
-    func munmap(self, a, len):
-        let end = a + ((len + 4095) & ~4095)
-        let keep = []
-        for r in self.regions:
-            if r.start >= a and r.end <= end:
-                continue   # whole region goes
+    func munmap(self, a, size):
+        let end = a + ((size + 4095) & ~4095)
+        let i = self.first_after(a)
+        let j = i
+        let pieces = []
+        while j < len(self.regions) and self.regions[j].start < end:
+            let r = self.regions[j]
             if r.start < a and r.end > end:
                 # a hole in the middle: the region is split in two
                 let tail = Region()
@@ -189,16 +201,19 @@ export class Process:
                 tail.flags = r.flags
                 tail.lazy = r.lazy
                 r.end = a
-                keep.append(r)
-                keep.append(tail)
-                continue
-            if r.start < end and r.end > a:
-                if r.start < a:
-                    r.end = a
-                else:
-                    r.start = end
-            keep.append(r)
-        self.regions = keep
+                pieces.append(r)
+                pieces.append(tail)
+            elif r.start < a:
+                r.end = a
+                pieces.append(r)
+            elif r.end > end:
+                r.start = end
+                pieces.append(r)
+            j += 1
+        for k in range(j - i):
+            self.regions.remove_at(i)
+        for k in range(len(pieces)):
+            self.regions.insert(i + k, pieces[k])
         self.space.unmap_free(a, end - a)
         if end + 4096 == self.mmap_next and a >= MMAP_BASE:
             self.mmap_next = a
@@ -213,13 +228,13 @@ export class Process:
         setup_user(self, 0, 0)
         hw.poke64(self.ctx + CTX_FSB, 0)
     # change the protection of [a, a + len): regions are split at the edges and mapped pages get their new flags
-    func mprotect(self, a, len, flags):
-        let end = a + ((len + 4095) & ~4095)
+    func mprotect(self, a, size, flags):
+        let end = a + ((size + 4095) & ~4095)
+        let i = self.first_after(a)
+        let j = i
         let out = []
-        for r in self.regions:
-            if r.end <= a or r.start >= end:
-                out.append(r)
-                continue
+        while j < len(self.regions) and self.regions[j].start < end:
+            let r = self.regions[j]
             if r.start < a:
                 let left = Region()
                 left.start = r.start
@@ -227,6 +242,12 @@ export class Process:
                 left.flags = r.flags
                 left.lazy = r.lazy
                 out.append(left)
+            let mid = Region()
+            mid.start = imax(r.start, a)
+            mid.end = imin(r.end, end)
+            mid.flags = flags
+            mid.lazy = r.lazy
+            out.append(mid)
             if r.end > end:
                 let right = Region()
                 right.start = end
@@ -234,13 +255,11 @@ export class Process:
                 right.flags = r.flags
                 right.lazy = r.lazy
                 out.append(right)
-            let mid = Region()
-            mid.start = imax(r.start, a)
-            mid.end = imin(r.end, end)
-            mid.flags = flags
-            mid.lazy = r.lazy
-            out.append(mid)
-        self.regions = out
+            j += 1
+        for k in range(j - i):
+            self.regions.remove_at(i)
+        for k in range(len(out)):
+            self.regions.insert(i + k, out[k])
         let v = a & ~4095
         while v < end:
             let sk = self.space.skip_for(v)
@@ -343,7 +362,7 @@ export func fork(src, pid):
     c.mmap_next = o.mmap_next
     for r in o.regions:
         c.add_region(r.start, r.end, r.flags)
-        c.regions[len(c.regions) - 1].lazy = r.lazy
+        c.find_region(r.start).lazy = r.lazy
         let a = r.start
         while a < r.end:
             let sk = o.space.skip_for(a)              # (a region that was only reserved has no page tables: nothing to share)

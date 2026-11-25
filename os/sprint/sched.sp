@@ -310,7 +310,7 @@ func lx_syscall(p, nr):
         m.munmap(a1, a2)
         m.add_region(a1, a1 + ((a2 + 4095) & ~4095), flags)
         if (a3 & 4) != 0:
-            m.regions[len(m.regions) - 1].lazy = true
+            m.find_region(a1).lazy = true
         set_ret(p, 0)
         return true
     if nr == 1042:   # lx_unmap(pid, addr, len)
