@@ -521,9 +521,7 @@ func syscall(p):
             if lx_fast(p, nr):
                 return true
         # a Linux program: the system call goes to its server as a message "nr<TAB>a0 ... a5", and the program waits for lx_reply
-        let m = to_string(nr)
-        for r in [kproc.CTX_RDI, kproc.CTX_RSI, kproc.CTX_RDX, kproc.CTX_R10, kproc.CTX_R8, kproc.CTX_R9]:
-            m = m .. "\t" .. to_string(hw.peek64(p.ctx + r))
+        let m = hw.sysmsg(p.ctx)
         if send_to(p.handler, p.pid, m):
             p.state = "lxwait"
             return false

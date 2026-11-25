@@ -4559,11 +4559,10 @@ func setup():
     table[452] = sys_noop_ok
 
 # one forwarded system call of guest `g`
-func serve_call(g, q):
-    let nr = to_int(q[0])
-    let a = []
-    for i in range(1, 7):
-        a.append(to_int(q[i]))
+func serve_call(g, text):
+    let v = lx.parse7(text)
+    let nr = v[0]
+    let a = v.slice(1, 7)
     g.calls += 1
     let f = table[nr]
     let t_start = psys.ms()
@@ -4674,6 +4673,16 @@ while running:
                 for i in range(imin(8, len(top))):
                     tl = tl .. " " .. to_string(top[i][1]) .. ":" .. to_string(top[i][2]) .. "x/" .. to_string(top[i][0]) .. "ms"
                 log("prof: " .. to_string(prof_busy) .. " ms inside system calls (of " .. to_string(psys.ms()) .. " ms); top by time:" .. tl)
+                let byc = []
+                let total = 0
+                for nr in keys(prof):
+                    byc.append([prof[nr][0], nr, prof[nr][1]])
+                    total += prof[nr][0]
+                byc.sort((x, y) => x[0] > y[0])
+                let cl = ""
+                for i in range(imin(12, len(byc))):
+                    cl = cl .. " " .. to_string(byc[i][1]) .. ":" .. to_string(byc[i][0]) .. "x"
+                log("prof: " .. to_string(total) .. " calls; top by count:" .. cl)
             if beat_n % 3 == 0:                      # keep the files behind shared mappings (the X screen) up to date on the volume, so a run that gets cut off still leaves its picture
                 for path in keys(sharedfiles):
                     shared_writeback(path)
@@ -4706,7 +4715,7 @@ while running:
                 ended(g, 11 if code == 139 else code)
             else:
                 cur_tid = src
-                serve_call(g, text.split("\t"))
+                serve_call(g, text)
         elif text.starts_with("X\t"):
             pass          # a program we already finished
         else:

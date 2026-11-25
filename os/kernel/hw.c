@@ -479,6 +479,26 @@ static SpStatus h_copy_user(SpVM *vm, int argc, const SpValue *argv, SpValue *re
     *ret = sp_int(done);
     return SP_OK;
 }
+/* sysmsg(ctx) -> "nr<TAB>a0<TAB>...<TAB>a5": the system call of the Linux program saved in that context, as the text its server reads (one native call instead of seven number
+   conversions and concatenations in the interpreter) */
+static SpStatus h_sysmsg(SpVM *vm, int argc, const SpValue *argv, SpValue *ret) {
+    (void)argc;
+    ARG_INT(0, ctx);
+    const uint64_t *c = (const uint64_t *)(uintptr_t)ctx;
+    static const int offs[7] = {0, 40, 32, 24, 72, 56, 64};   /* rax rdi rsi rdx r10 r8 r9 */
+    char b[160];
+    size_t n = 0;
+    for (int i = 0; i < 7; i++) {
+        uint64_t v = c[offs[i] / 8];
+        char t[24];
+        int k = 0;
+        if (v == 0) t[k++] = '0';
+        while (v) { t[k++] = (char)('0' + v % 10); v /= 10; }
+        while (k) b[n++] = t[--k];
+        if (i < 6) b[n++] = '\t';
+    }
+    return sp_new_string(vm, b, n, ret);
+}
 /* str_at(addr, len) -> string with the bytes at addr (raw; not validated as UTF-8 by the caller's text) */
 static SpStatus h_str_at(SpVM *vm, int argc, const SpValue *argv, SpValue *ret) {
     (void)argc;
@@ -612,7 +632,7 @@ static const SpNativeDesc hw_fns[] = {
     {"ctx_new", 0, 0, 0, 0, h_ctx_new}, {"ctx_free", 1, 1, 0, 0, h_ctx_free}, {"enter", 1, 1, 0, 0, h_enter},
     {"kernel_cr3", 0, 0, 0, 0, h_kernel_cr3}, {"iopb_set", 4, 4, 0, 0, h_iopb_set}, {"set_ioapic", 1, 1, 0, 0, h_set_ioapic}, {"ioapic_rd", 1, 1, 0, 0, h_ioapic_rd}, {"ioapic_wr", 2, 2, 0, 0, h_ioapic_wr}, {"irq_mask", 2, 2, 0, 0, h_irq_mask}, {"irq_take", 0, 0, 0, 0, h_irq_take}, {"cpu_id", 0, 0, 0, 0, h_cpu_id}, {"invlpg", 1, 1, 0, 0, h_invlpg},
     {"idle", 0, 0, 0, 0, h_idle}, {"irq_count", 1, 1, 0, 0, h_irq_count}, {"set_lapic", 1, 1, 0, 0, h_set_lapic},
-    {"copy_user", 5, 5, 0, 0, h_copy_user}, {"memset", 3, 3, 0, 0, h_memset}, {"memcpy", 3, 3, 0, 0, h_memcpy}, {"str_at", 2, 2, 0, SP_NATIVE_ALLOCATES, h_str_at},
+    {"copy_user", 5, 5, 0, 0, h_copy_user}, {"sysmsg", 1, 1, 0, SP_NATIVE_ALLOCATES, h_sysmsg}, {"memset", 3, 3, 0, 0, h_memset}, {"memcpy", 3, 3, 0, 0, h_memcpy}, {"str_at", 2, 2, 0, SP_NATIVE_ALLOCATES, h_str_at},
     {"poke_str", 2, 2, 0, 0, h_poke_str}, {"user_mem", 0, 0, 0, SP_NATIVE_ALLOCATES, h_user_mem},
     {"poweroff", 0, 0, 0, 0, h_poweroff}, {"reboot", 0, 0, 0, 0, h_reboot},
 };

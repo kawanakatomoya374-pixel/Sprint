@@ -587,6 +587,33 @@ static SpStatus l_shm_drop(SpVM *vm, int argc, const SpValue *argv, SpValue *ret
     *ret = sp_int(sc3(1061, (long)id, 0, 0));
     return SP_OK;
 }
+/* parse7(text) -> [nr, a0 .. a5] as integers, from a system call message "nr<TAB>a0 ... a5" (unsigned 64-bit values wrap into the signed range as the registers do);
+   nil when the text is not of that form */
+static SpStatus l_parse7(SpVM *vm, int argc, const SpValue *argv, SpValue *ret) {
+    (void)argc;
+    if (argv[0].type != SP_T_STRING) { *ret = sp_nil(); return SP_OK; }
+    size_t n;
+    const char *s = sp_string_data(argv[0], &n);
+    uint64_t v[7];
+    int idx = 0;
+    uint64_t cur = 0;
+    int have = 0, neg = 0;
+    for (size_t i = 0; i <= n; i++) {
+        char ch = i < n ? s[i] : '\t';
+        if (ch >= '0' && ch <= '9') { cur = cur * 10u + (uint64_t)(ch - '0'); have = 1; }
+        else if (ch == '-' && !have) neg = 1;
+        else if (ch == '\t') {
+            if (!have || idx >= 7) { *ret = sp_nil(); return SP_OK; }
+            v[idx++] = neg ? (uint64_t)0 - cur : cur;
+            cur = 0; have = 0; neg = 0;
+        } else { *ret = sp_nil(); return SP_OK; }
+    }
+    if (idx != 7) { *ret = sp_nil(); return SP_OK; }
+    SpStatus st = sp_new_array(vm, 7, ret);
+    if (st != SP_OK) return st;
+    for (int i = 0; i < 7; i++) (void)sp_array_push(vm, *ret, sp_int((int64_t)v[i]));
+    return SP_OK;
+}
 static SpStatus l_start(SpVM *vm, int argc, const SpValue *argv, SpValue *ret) { (void)argc; return l_call3(vm, argv, 1046, ret); }
 static SpStatus l_reply(SpVM *vm, int argc, const SpValue *argv, SpValue *ret) { (void)argc; return l_call3(vm, argv, 1047, ret); }
 static SpStatus l_kill(SpVM *vm, int argc, const SpValue *argv, SpValue *ret) { (void)argc; return l_call3(vm, argv, 1048, ret); }
@@ -594,7 +621,7 @@ static SpStatus l_setfs(SpVM *vm, int argc, const SpValue *argv, SpValue *ret) {
 static const SpNativeDesc lx_fns[] = {
     {"create", 0, 0, 0, 0, l_create}, {"map", 4, 4, 0, 0, l_map}, {"unmap", 3, 3, 0, 0, l_unmap}, {"protect", 4, 4, 0, 0, l_protect},
     {"write", 3, 5, 0, 0, l_write}, {"read", 3, 3, 0, SP_NATIVE_ALLOCATES, l_read}, {"start", 3, 3, 0, 0, l_start},
-    {"reply", 2, 2, 0, 0, l_reply}, {"fork", 1, 1, 0, 0, l_fork}, {"shm_attach", 3, 5, 0, 0, l_shm_attach}, {"shm_new", 1, 1, 0, 0, l_shm_new}, {"shm_drop", 1, 1, 0, 0, l_shm_drop}, {"shm_detach", 2, 2, 0, 0, l_shm_detach}, {"getctx", 1, 1, 0, SP_NATIVE_ALLOCATES, l_getctx}, {"setctx", 2, 2, 0, 0, l_setctx}, {"sigpend", 2, 2, 0, 0, l_sigpend}, {"clone", 2, 2, 0, 0, l_clone}, {"resume", 1, 1, 0, 0, l_resume}, {"setsp", 2, 2, 0, 0, l_setsp}, {"reset", 1, 1, 0, 0, l_reset}, {"kill", 2, 2, 0, 0, l_kill}, {"setfs", 2, 2, 0, 0, l_setfs},
+    {"reply", 2, 2, 0, 0, l_reply}, {"fork", 1, 1, 0, 0, l_fork}, {"shm_attach", 3, 5, 0, 0, l_shm_attach}, {"parse7", 1, 1, 0, SP_NATIVE_ALLOCATES, l_parse7}, {"shm_new", 1, 1, 0, 0, l_shm_new}, {"shm_drop", 1, 1, 0, 0, l_shm_drop}, {"shm_detach", 2, 2, 0, 0, l_shm_detach}, {"getctx", 1, 1, 0, SP_NATIVE_ALLOCATES, l_getctx}, {"setctx", 2, 2, 0, 0, l_setctx}, {"sigpend", 2, 2, 0, 0, l_sigpend}, {"clone", 2, 2, 0, 0, l_clone}, {"resume", 1, 1, 0, 0, l_resume}, {"setsp", 2, 2, 0, 0, l_setsp}, {"reset", 1, 1, 0, 0, l_reset}, {"kill", 2, 2, 0, 0, l_kill}, {"setfs", 2, 2, 0, 0, l_setfs},
 };
 
 
