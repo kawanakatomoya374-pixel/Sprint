@@ -569,6 +569,14 @@ let cur = {}      # cpu -> process running there
 let rr = 0
 let t_start = 0
 
+# what the processes of this CPU are doing (for the logs of a machine that seems stuck)
+func proc_states():
+    let line = ""
+    for pid in order:
+        let q = procs[pid]
+        line = line .. " " .. to_string(q.pid) .. ":" .. q.name .. "/" .. q.state .. ("(" .. to_string(len(q.inbox)) .. " msgs)" if len(q.inbox) > 0 else "")
+    return line
+
 # wake any sleeper whose time has come; true when some process is runnable now
 func ready(now):
     let n = len(order)
@@ -614,11 +622,7 @@ export func pick(cpu):
     idle_picks += 1
     if idle_picks >= 4000:                    # idle for a long time: say what everybody here is waiting for
         idle_picks = 0
-        let line = ""
-        for pid in order:
-            let q = procs[pid]
-            line = line .. " " .. to_string(q.pid) .. ":" .. q.name .. "/" .. q.state .. ("(" .. to_string(len(q.inbox)) .. " msgs)" if len(q.inbox) > 0 else "")
-        log("idle cpu " .. to_string(cpu) .. ":" .. line)
+        log("idle cpu " .. to_string(cpu) .. ":" .. proc_states())
     if k.flag_get(1) != 0 and k.nproc() == 0:
         done()
     return 0
@@ -659,7 +663,7 @@ export func trap(cpu, v):
         hb_ticks += 1
         if hb_ticks >= 1500:                      # a sign of life and where each CPU is (a silent hang shows up as the same rip again and again)
             hb_ticks = 0
-            log("hb cpu " .. to_string(cpu) .. " pid " .. to_string(p.pid) .. " (" .. p.name .. ") rip " .. to_string(hw.peek64(p.ctx + kproc.CTX_RIP)))
+            log("hb cpu " .. to_string(cpu) .. " pid " .. to_string(p.pid) .. " (" .. p.name .. ") rip " .. to_string(hw.peek64(p.ctx + kproc.CTX_RIP)) .. " |" .. proc_states())
         k.stat_set(cpu, 1, preemptions)
     elif v == PF and p.handler != 0 and p.lazy_miss(hw.peek64(p.ctx + kproc.CTX_CR2)):
         # a page of a file mapping: the server reads it from the file, then lets the instruction run again
