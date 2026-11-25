@@ -110,7 +110,7 @@ int main(int argc, char **argv) {
     SpConfig cfg;
     sp_config_init(&cfg);
     cfg.capabilities = SP_CAP_STDIO_WRITE | SP_CAP_CLOCK;
-    cfg.limits.max_heap_bytes = 64u << 20;
+    cfg.limits.max_heap_bytes = 512u << 20; /* linuxd caches files and holds big buffers for programs like WebKit; the pages come from the machine's memory */
     cfg.write = write_out;
     cfg.loader = load_source;
     SpVM *vm;
