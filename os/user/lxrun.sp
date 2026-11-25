@@ -48,6 +48,12 @@ let lines = fs.read_file("/run.list").split("\n")
 for line in lines:
     if line.trim() == "":
         continue
+    if line.starts_with("SNAP:"):
+        ipc.send(srv, "snap\t" .. line.slice(5))
+        let sr = ipc.recv_from()
+        print("lxrun: snapshot of " .. line.slice(5) .. ": " .. sr[1])
+        io.flush()
+        continue
     if line.starts_with("VERBOSE:"):
         ipc.send(srv, "verbose\t" .. line.slice(8))
         ipc.recv_from()

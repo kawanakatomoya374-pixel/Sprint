@@ -39,15 +39,17 @@ export func attach(p, id):
     p.shm.append([id, va])
     return va
 
-# map segment `id` into p at the given address (a Linux program's shmat); returns va, or a negative errno
-export func attach_at(p, va, id):
+# map pages [first, first + count) of segment `id` into p at the given address (a Linux program's shmat, or a shared file mapping); returns va, or a negative errno
+export func attach_at(p, va, id, first = 0, count = -1):
     let n = k.shm_n(id)
-    if n == 0:
+    if n == 0 or first < 0 or first >= n:
         return -22
-    for i in range(n):
-        p.space.map(va + i * 4096, k.shm_page(id, i), vmm.W | vmm.U | vmm.DEVICE)
+    if count <= 0 or first + count > n:
+        count = n - first
+    for i in range(count):
+        p.space.map(va + i * 4096, k.shm_page(id, first + i), vmm.W | vmm.U | vmm.DEVICE)
     k.shm_ref(id, 1)
-    p.shm.append([id, va])
+    p.shm.append([id, va, count, first])
     return va
 
 export func size_of(id):
@@ -59,8 +61,9 @@ export func detach(p, va):
         let e = p.shm[i]
         if e[1] == va:
             p.shm.remove_at(i)
-            p.space.unmap_free(va, k.shm_n(e[0]) * 4096)
-            p.munmap(va, k.shm_n(e[0]) * 4096)
+            let bytes = (e[2] if len(e) > 2 else k.shm_n(e[0])) * 4096
+            p.space.unmap_free(va, bytes)
+            p.munmap(va, bytes)
             k.shm_ref(e[0], -1)
             return 0
         i += 1

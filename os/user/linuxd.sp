@@ -1198,6 +1198,22 @@ func sys_mmap(g, a):
         f = g.fds[i32(fd)]
         if f == nil or f.kind != "file":
             return -EBADF
+    if f != nil and f.kind == "file" and (flags & 0x03) == 1 and (prot & 2) != 0 and (off & 4095) == 0:
+        # writable and shared: the pages are the file's segment, not a private copy
+        let size = 0
+        try:
+            size = fs.stat(f.path).size
+        catch err:
+            size = 0
+        let e = shared_file(f.path, align_up(imax(size, off + length)))
+        lx.unmap(g.pid, addr, n)
+        let r = lx.shm_attach(g.pid, addr, e[0], off // 4096, n // 4096)
+        if r < 0:
+            return -ENOMEM
+        lazy_remove(g, addr, addr + n)
+        vm_remove(g, addr, addr + n)
+        vm_add(g, addr, addr + n, prot & 7, f.path)
+        return addr
     if f != nil and f.kind == "file" and n >= (1 << 20) and (flags & 0x03) != 0:
         # a big file (the JVM's 130 MB class library): pages are read when the program touches them
         if lx.map(g.pid, addr, n, (3 if (prot & 2) != 0 else 1) | 4) != 0:
@@ -1240,6 +1256,42 @@ func lazy_remove(g, a, b):
             out.append([e[0], a, e[2], e[3], e[4], e[5]])
             out.append([b, e[1], e[2], e[3] + (b - e[0]), e[4], e[5]])
     g.lazy = out
+    return 0
+
+# ---- MAP_SHARED, writable file mappings (the X server's screen in /dev/shm, MIT-SHM images): one kernel segment per file, so every program that maps the file sees the same memory ----
+let sharedfiles = {}      # path -> [kernel segment id, linuxd's own address of it, bytes]
+
+func shared_file(path, bytes):
+    let e = sharedfiles[path]
+    if e != nil and e[2] >= bytes:
+        return e
+    let seg = ipc.shm_create(bytes)
+    try:
+        let st = fs.stat(path)
+        if st.size > 0:
+            ipc.shm_put(seg[1], 0, fs.read_bytes(path, 0, imin(st.size, seg[2])))
+    catch err:
+        pass
+    e = [seg[0], seg[1], seg[2]]
+    sharedfiles[path] = e
+    return e
+
+# the memory of a shared file mapping back into the file
+func shared_writeback(path):
+    let e = sharedfiles[path]
+    if e == nil:
+        return -ENOENT
+    try:
+        let size = fs.stat(path).size
+        fs.write_bytes(path, ipc.shm_bytes(e[1], 0, imin(size, e[2])), 0, false)
+        return 0
+    catch err:
+        return -errno_of(err.kind)
+
+func sys_msync(g, a):
+    let r = vm_find(g, a[0])
+    if r != nil and sharedfiles[r[3]] != nil:
+        return shared_writeback(r[3])
     return 0
 
 # a first touch of a page of a big file mapping: read the next 64 KB window (pages not filled before) from the file, then let the instruction run again
@@ -4261,7 +4313,7 @@ func setup():
     table[7] = sys_poll
     table[19] = sys_readv
     table[23] = sys_select
-    table[26] = sys_noop_ok
+    table[26] = sys_msync
     table[40] = sys_sendfile
     table[73] = sys_noop_ok
     table[74] = sys_noop_ok
@@ -4377,6 +4429,8 @@ func serve_request(src, text):
     elif q[0] == "verbose":
         verbose = q[1] if len(q) > 1 else true
         ipc.send(src, "ok")
+    elif q[0] == "snap":                       # write a shared file mapping back into its file (to look at what a program drew)
+        ipc.send(src, "ok\t" .. to_string(shared_writeback(q[1])))
     elif q[0] == "quit":
         if verbose == "prof":
             log("prof: lx.write " .. to_string(prof_wr) .. " ms for " .. to_string(prof_wrn) .. " bytes; do_read " .. to_string(prof_rd) .. " ms")

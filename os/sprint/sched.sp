@@ -386,7 +386,8 @@ func lx_syscall(p, nr):
         set_ret(p, 0)
         return true
     if nr == 1058:   # lx_shm_attach(pid, addr, id): map shared segment `id` into the program at addr (System V shmat, shared mappings)
-        set_ret(p, shm.attach_at(m, a1, a2))
+        set_ret(p, shm.attach_at(m, a1, a2, a3 & 0xFFFFFFFF, a3 >> 32))     # a3: first page | count << 32 (count 0 = all)
+
         return true
     if nr == 1059:   # lx_shm_detach(pid, addr)
         set_ret(p, shm.detach(m, a1))

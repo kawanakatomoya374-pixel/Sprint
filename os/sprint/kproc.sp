@@ -328,7 +328,7 @@ export func fork(src, pid):
                 c.space.map(a, q, o.space.flags_of(a) & 0xFFF & ~vmm.P)
             a += 4096
     for e in o.shm:                       # attached shared segments are inherited
-        shm.attach_at(c, e[1], e[0])
+        shm.attach_at(c, e[1], e[0], e[3] if len(e) > 3 else 0, e[2] if len(e) > 2 else -1)
     hw.memcpy(c.ctx, src.ctx, 768)
     hw.poke64(c.ctx + CTX_CR3, c.space.pml4)
     return c
